@@ -1,0 +1,15 @@
+{
+  "source": "",
+  "output_dir": "outputs/run",
+  "device": "cpu",
+  "execution_mode": "serial",
+  "pose_backend": "mmpose",
+  "pose_config": "tools/mmpose/configs/rtmpose-s_8xb256-420e_coco-256x192.py",
+  "pose_weight": "assets/weights/pose/rtmpose-s_8xb256-420e_coco-256x192.pth",
+  "pose_bbox_mode": "whole_image",
+  "track_weight": "assets/weights/track/model_best.pt",
+  "save_json": true,
+  "save_csv": true,
+  "save_npy": true,
+  "save_vis": true
+}
