@@ -11,6 +11,7 @@ import cv2
 import torch
 
 from src.models.track_branch import TrackBranch
+from src.postprocess.track_filter import BallTrackFilter
 
 
 def get_available_devices():
@@ -88,11 +89,13 @@ def main():
     ema_fps = 0.0
     tick_frequency = cv2.getTickFrequency()
     frame_count = 0
+    track_filter = BallTrackFilter(fps=fps)
 
     while True:
         start_tick = cv2.getTickCount()
 
-        _, track = track_branch.infer([prev_frame, curr_frame, next_frame])
+        _, raw_track = track_branch.infer([prev_frame, curr_frame, next_frame])
+        track = track_filter.update(raw_track)
 
         vis_frame = curr_frame.copy()
         if track.visible:

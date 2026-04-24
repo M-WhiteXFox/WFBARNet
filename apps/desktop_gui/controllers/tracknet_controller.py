@@ -8,7 +8,6 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
-import torch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -16,8 +15,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from src.models.track_branch import TrackBranch
+from src.utils.device import resolve_device
 from src.utils.exporters import export_csv, export_json, export_npy
 from src.utils.structures import FrameResult
+from src.utils.video import iter_video_frame_windows
 from src.utils.visualize import draw_result
 
 
@@ -55,16 +56,7 @@ class TrackTaskResult:
 
 
 def _resolve_device(device: str) -> str:
-    normalized = device.strip().lower()
-    if normalized in {"", "auto"}:
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
-    if normalized.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError("当前环境不可用 CUDA，请切换到自动或 CPU。")
-    if normalized == "mps":
-        mps_backend = getattr(torch.backends, "mps", None)
-        if mps_backend is None or not torch.backends.mps.is_available():
-            raise RuntimeError("当前环境不可用 MPS，请切换到自动或 CPU。")
-    return device
+    return resolve_device(device)
 
 
 def _emit(progress_callback: ProgressCallback | None, payload: dict[str, Any]) -> None:
@@ -187,50 +179,24 @@ def run_tracknet_task(
         )
         output_files["可视化视频"] = str(vis_path)
 
-    all_frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        all_frames.append(frame)
-        if config.max_frames and len(all_frames) >= config.max_frames:
-            break
-
     cap.release()
-
-    if len(all_frames) < 3:
-        if writer is not None:
-            writer.release()
-        raise RuntimeError("视频帧数不足，无法进行 TrackNet 推理。")
-
-    frame_windows = []
-    for i in range(len(all_frames) - 2):
-        prev_frame = all_frames[i]
-        curr_frame = all_frames[i + 1]
-        next_frame = all_frames[i + 2]
-        frame_windows.append([prev_frame, curr_frame, next_frame])
 
     results: list[FrameResult] = []
     track_results: dict[int, dict[str, Any]] = {}
     last_frame: np.ndarray | None = None
     stopped = False
     start_time = time.perf_counter()
+    batch_ids: list[int] = []
+    batch_frames: list[np.ndarray] = []
+    batch_windows: list[list[np.ndarray]] = []
 
-    for batch_start in range(0, len(frame_windows), batch_size):
-        if stop_requested is not None and stop_requested():
-            stopped = True
-            break
-
-        batch_end = min(batch_start + batch_size, len(frame_windows))
-        batch_windows = frame_windows[batch_start:batch_end]
-
+    def _flush_batch() -> None:
+        nonlocal last_frame
+        if not batch_windows:
+            return
         _, batch_tracks = branch.infer_batch(batch_windows)
 
-        for i, track in enumerate(batch_tracks):
-            frame_idx = batch_start + i
-            frame_id = frame_idx
-            curr_frame = all_frames[frame_idx + 1]
-
+        for frame_id, curr_frame, track in zip(batch_ids, batch_frames, batch_tracks):
             frame_result = FrameResult(frame_id=frame_id, pose=[], track=track)
             results.append(frame_result)
             track_results[frame_id] = {
@@ -258,8 +224,28 @@ def run_tracknet_task(
                 },
             )
 
+        batch_ids.clear()
+        batch_frames.clear()
+        batch_windows.clear()
+
+    for frame_id, curr_frame, window in iter_video_frame_windows(config.source, max_frames=config.max_frames):
+        if stop_requested is not None and stop_requested():
+            stopped = True
+            break
+
+        batch_ids.append(frame_id)
+        batch_frames.append(curr_frame)
+        batch_windows.append(window)
+        if len(batch_windows) >= batch_size:
+            _flush_batch()
+
+    _flush_batch()
+
     if writer is not None:
         writer.release()
+
+    if not results:
+        raise RuntimeError("视频分析没有产生任何结果。")
 
     duration_seconds = time.perf_counter() - start_time
     output_files.update(_export_results(config, results))

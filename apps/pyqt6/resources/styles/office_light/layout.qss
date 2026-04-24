@@ -41,7 +41,6 @@ QFrame#videoControlsBar {
 QWidget#timelineBar {
     background: transparent;
     border: none;
-    border-top: 1px solid #D9D9D9;
     padding: 0px;
 }
 

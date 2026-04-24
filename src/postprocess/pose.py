@@ -31,10 +31,12 @@ def build_pose_result(
     bbox: list[float],
     keypoints: list[list[float]],
     scores: list[float],
-    meta: PosePreprocessMeta,
+    meta: PosePreprocessMeta | None = None,
 ) -> PersonPoseResult:
-    restored_bbox = restore_bbox(bbox, meta)
-    restored_kpts = restore_keypoints(keypoints, meta)
+    restored_bbox = restore_bbox(bbox, meta) if meta is not None else [float(x) for x in bbox]
+    restored_kpts = restore_keypoints(keypoints, meta) if meta is not None else [
+        [float(x), float(y)] for x, y in keypoints
+    ]
     person_score = float(sum(scores) / max(len(scores), 1))
     return PersonPoseResult(
         person_id=person_id,

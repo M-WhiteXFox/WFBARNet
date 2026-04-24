@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from apps.pyqt6.views.components.video_player_panel_clean import (
+from apps.pyqt6.views.components.video_player_panel_runtime import (
     VideoPlayerWidget,
     VideoTimelineWidget,
 )
@@ -181,7 +181,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.video_player.path_edit, stretch=1)
         controls_layout.addWidget(self.video_player.btn_force_stop)
 
-        self.video_timeline = VideoTimelineWidget(self.video_player.player)
+        self.video_timeline = VideoTimelineWidget()
         timeline_bar = QWidget()
         timeline_bar.setObjectName("timelineBar")
         timeline_bar.setSizePolicy(
@@ -189,15 +189,14 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Fixed,
         )
         timeline_bar_layout = QVBoxLayout(timeline_bar)
-        timeline_bar_layout.setContentsMargins(0, 8, 0, 0)
         timeline_bar_layout.setSpacing(0)
         timeline_bar_layout.addWidget(self.video_timeline)
 
         preview_layout.addLayout(preview_header)
         preview_layout.addWidget(self.progress_bar)
         preview_layout.addWidget(video_controls, 0)
-        preview_layout.addWidget(self.video_player, 0)
-        # preview_layout.addWidget(timeline_bar, 0)
+        preview_layout.addWidget(self.video_player, 1)
+        preview_layout.addWidget(timeline_bar, 0)
 
         body_layout.addWidget(preview_panel, stretch=6)
 
@@ -327,11 +326,17 @@ class MainWindow(QMainWindow):
     def set_video_path(self, path: str) -> None:
         self.video_player.set_video_path(path)
 
+    def show_video_frame(self, image, position_ms: int, duration_ms: int) -> None:
+        self.video_player.display_image(image)
+        self.video_timeline.set_duration(duration_ms)
+        self.video_timeline.set_position(position_ms)
+
     def stop_video(self) -> None:
         self.video_player.stop()
 
     def clear_video(self) -> None:
         self.video_player.clear_video()
+        self.video_timeline.reset()
 
     def set_status_state(self, state: str) -> None:
         self.status_label.setProperty("state", state)

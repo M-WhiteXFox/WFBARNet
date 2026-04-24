@@ -7,9 +7,10 @@ import cv2
 from tqdm import tqdm
 
 from src.models.track_branch import TrackBranch
+from src.postprocess.track_filter import BallTrackFilter
 from src.utils.exporters import export_csv, export_json, export_npy
 from src.utils.structures import FrameResult
-from src.utils.video import iter_frame_windows, load_frames
+from src.utils.video import iter_frame_windows, iter_video_frame_windows, load_frames, probe_video
 from src.utils.visualize import draw_result, save_visualization_video
 
 
@@ -62,8 +63,10 @@ class TrackVideoRunner:
         if max_frames is not None:
             frames = frames[:max_frames]
         results: list[FrameResult] = []
+        track_filter = BallTrackFilter()
         for frame_id, _, window in tqdm(list(iter_frame_windows(frames)), desc="Track inference"):
-            _, track = self.track_branch.infer(window)
+            _, raw_track = self.track_branch.infer(window)
+            track = track_filter.update(raw_track)
             results.append(FrameResult(frame_id=frame_id, pose=[], track=track))
 
         self._export_results(results, save_json, save_csv, save_npy)
@@ -80,78 +83,39 @@ class TrackVideoRunner:
         save_vis: bool,
         max_frames: int | None,
     ) -> list[FrameResult]:
-        cap = cv2.VideoCapture(str(source))
-        if not cap.isOpened():
-            raise FileNotFoundError(f"Unable to open video source: {source}")
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if not fps or fps <= 0:
-            fps = 25.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        metadata = probe_video(source)
 
         writer = None
         if save_vis:
             writer = cv2.VideoWriter(
                 str(self.output_dir / "track_vis.mp4"),
                 cv2.VideoWriter_fourcc(*"mp4v"),
-                fps,
-                (width, height),
+                metadata.fps,
+                (metadata.width, metadata.height),
             )
 
         results: list[FrameResult] = []
-        ok, first_frame = cap.read()
-        if not ok:
-            cap.release()
+        track_filter = BallTrackFilter(fps=metadata.fps)
+        progress_total = metadata.frame_count if metadata.frame_count > 0 else None
+        if max_frames is not None:
+            progress_total = min(progress_total, max_frames) if progress_total is not None else max_frames
+        progress = tqdm(total=progress_total, desc="Track inference")
+        try:
+            for frame_id, curr_frame, window in iter_video_frame_windows(source, max_frames=max_frames):
+                _, raw_track = self.track_branch.infer(window)
+                track = track_filter.update(raw_track)
+                result = FrameResult(frame_id=frame_id, pose=[], track=track)
+                results.append(result)
+                if writer is not None:
+                    writer.write(draw_result(curr_frame, result))
+                progress.update(1)
+        finally:
+            progress.close()
             if writer is not None:
                 writer.release()
+
+        if not results:
             raise RuntimeError("The video opened but returned no frames.")
-
-        ok, second_frame = cap.read()
-        if not ok:
-            second_frame = first_frame.copy()
-
-        prev_frame = first_frame.copy()
-        curr_frame = first_frame
-        next_frame = second_frame
-        frame_id = 0
-
-        progress_total = total_frames if total_frames > 0 else None
-        if max_frames is not None:
-            progress_total = max_frames
-        progress = tqdm(total=progress_total, desc="Track inference")
-        while True:
-            _, track = self.track_branch.infer([prev_frame, curr_frame, next_frame])
-            result = FrameResult(frame_id=frame_id, pose=[], track=track)
-            results.append(result)
-            if writer is not None:
-                writer.write(draw_result(curr_frame, result))
-            progress.update(1)
-            if max_frames is not None and len(results) >= max_frames:
-                break
-
-            prev_frame = curr_frame
-            curr_frame = next_frame
-            ok, incoming = cap.read()
-            if not ok:
-                if frame_id > 0:
-                    frame_id += 1
-                    next_frame = curr_frame.copy()
-                    _, final_track = self.track_branch.infer([prev_frame, curr_frame, next_frame])
-                    final_result = FrameResult(frame_id=frame_id, pose=[], track=final_track)
-                    results.append(final_result)
-                    if writer is not None:
-                        writer.write(draw_result(curr_frame, final_result))
-                    progress.update(1)
-                break
-            next_frame = incoming
-            frame_id += 1
-
-        progress.close()
-        cap.release()
-        if writer is not None:
-            writer.release()
 
         self._export_results(results, save_json, save_csv, save_npy)
         return results

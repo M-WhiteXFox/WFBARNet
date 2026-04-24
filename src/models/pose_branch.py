@@ -7,6 +7,7 @@ import numpy as np
 from src.models.mmpose_backend import MMPoseBackend
 from src.postprocess.pose import build_pose_result
 from src.preprocess.pose import preprocess_pose_frame
+from src.utils.device import resolve_device
 from src.utils.structures import PersonPoseResult
 
 
@@ -24,6 +25,10 @@ class PoseBranch:
     max_persons: int = 2
 
     def __post_init__(self) -> None:
+        self.device = resolve_device(self.device)
+        backend = self.backend.strip().lower()
+        if backend not in {"mmpose", "dummy"}:
+            raise ValueError(f"Unsupported pose backend: {self.backend!r}. Supported values are 'mmpose' and 'dummy'.")
         self.backend_impl = MMPoseBackend(
             model_config=self.model_config,
             model_weight=self.model_weight,
@@ -33,6 +38,7 @@ class PoseBranch:
             det_weight=self.det_weight,
             conf_thr=self.conf_thr,
             max_persons=self.max_persons,
+            allow_dummy=backend == "dummy",
         )
 
     def infer(self, image: np.ndarray) -> list[PersonPoseResult]:
@@ -46,7 +52,7 @@ class PoseBranch:
                     bbox=item.bbox,
                     keypoints=item.keypoints,
                     scores=item.scores,
-                    meta=meta,
+                    meta=meta if item.coordinate_space == "resized" else None,
                 )
             )
         return outputs

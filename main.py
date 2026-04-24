@@ -10,6 +10,7 @@ from src.runners.pose_video_runner import PoseVideoRunner
 from src.runners.tracknet_realtime_runner import TrackNetRealtimeRunner
 from src.runners.track_video_runner import TrackVideoRunner
 from src.runners.unified_runner import UnifiedRunner
+from src.utils.device import resolve_device
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -20,7 +21,7 @@ class RuntimeConfig:
     pipeline: str = "track_only"
     source: str = ""
     output_dir: str = str(PROJECT_ROOT / "outputs" / "run")
-    device: str = "cpu"
+    device: str = "auto"
     execution_mode: str = "serial"
     save_json: bool = True
     save_csv: bool = True
@@ -55,9 +56,10 @@ USER_CONFIG = RuntimeConfig(
 
 
 def build_runner(config: RuntimeConfig) -> UnifiedRunner:
+    device = resolve_device(config.device)
     pose_branch = PoseBranch(
         backend=config.pose_backend,
-        device=config.device,
+        device=device,
         model_config=config.pose_config,
         model_weight=config.pose_weight,
         det_config=config.pose_det_config,
@@ -69,7 +71,7 @@ def build_runner(config: RuntimeConfig) -> UnifiedRunner:
     )
     track_branch = TrackBranch(
         model_weight=config.track_weight,
-        device=config.device,
+        device=device,
         input_size=config.track_input_size,
         score_thr=config.track_score_thr,
     )
@@ -77,15 +79,16 @@ def build_runner(config: RuntimeConfig) -> UnifiedRunner:
         pose_branch=pose_branch,
         track_branch=track_branch,
         output_dir=Path(config.output_dir),
-        device=config.device,
+        device=device,
         execution_mode=config.execution_mode,
     )
 
 
 def build_track_realtime_runner(config: RuntimeConfig) -> TrackNetRealtimeRunner:
+    device = resolve_device(config.device)
     track_branch = TrackBranch(
         model_weight=config.track_weight,
-        device=config.device,
+        device=device,
         input_size=config.track_input_size,
         score_thr=config.track_score_thr,
     )
@@ -100,9 +103,10 @@ def build_track_realtime_runner(config: RuntimeConfig) -> TrackNetRealtimeRunner
 
 
 def build_pose_runner(config: RuntimeConfig) -> PoseVideoRunner:
+    device = resolve_device(config.device)
     pose_branch = PoseBranch(
         backend=config.pose_backend,
-        device=config.device,
+        device=device,
         model_config=config.pose_config,
         model_weight=config.pose_weight,
         det_config=config.pose_det_config,
@@ -119,9 +123,10 @@ def build_pose_runner(config: RuntimeConfig) -> PoseVideoRunner:
 
 
 def build_track_runner(config: RuntimeConfig) -> TrackVideoRunner:
+    device = resolve_device(config.device)
     track_branch = TrackBranch(
         model_weight=config.track_weight,
-        device=config.device,
+        device=device,
         input_size=config.track_input_size,
         score_thr=config.track_score_thr,
     )

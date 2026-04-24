@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
 
@@ -19,7 +20,7 @@ from apps.pyqt6.utils.style import load_stylesheet
 
 
 def main() -> int:
-    from apps.pyqt6.controllers.analysis_controller_refined import MainController
+    from apps.pyqt6.controllers.analysis_controller_runtime import MainController
     from apps.pyqt6.views.main_window_refined import MainWindow
 
     app = QApplication(sys.argv)
@@ -27,10 +28,19 @@ def main() -> int:
     app.setEffectEnabled(Qt.UIEffect.UI_AnimateCombo, False)
     app.setEffectEnabled(Qt.UIEffect.UI_AnimateTooltip, False)
 
+    # 设置应用图标
+    icon_path = PROJECT_ROOT / "apps" / "pyqt6" / "resources" / "icons" / "app.ico"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
+
     load_stylesheet(app, "office_light")
 
     window = MainWindow()
     controller = MainController(window)
+    
+    # 设置窗口图标
+    if icon_path.exists():
+        window.setWindowIcon(QIcon(str(icon_path)))
 
     window.show()
     return app.exec()

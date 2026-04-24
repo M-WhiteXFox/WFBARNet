@@ -15,8 +15,11 @@ import numpy as np
 from src.builders.bst_input_builder import BSTInputBuilder
 from src.models.pose_branch import PoseBranch
 from src.models.track_branch import TrackBranch
+from src.postprocess.track_filter import BallTrackFilter
 from src.preprocess.track import preprocess_track_batch
+from src.utils.device import resolve_device
 from src.utils.structures import FrameResult
+from src.utils.video import iter_video_frame_windows
 
 from apps.pyqt6.models.analysis_types import AnalysisAction, AnalysisResult
 
@@ -55,10 +58,7 @@ class AnalysisService:
         path = Path(config_path) if config_path is not None else self.project_root / "configs" / "default_infer.json"
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
-            device = str(data.get("device", "auto"))
-            if device == "auto":
-                import torch
-                device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = resolve_device(str(data.get("device", "auto")))
             return AnalysisConfig(
                 source=str(data.get("source", "")),
                 output_dir=str(data.get("output_dir", "outputs/run")),
@@ -75,8 +75,7 @@ class AnalysisService:
                 save_vis=bool(data.get("save_vis", False)),
                 pose_stride=int(data.get("pose_stride", 3)),
             )
-        import torch
-        return AnalysisConfig(device="cuda" if torch.cuda.is_available() else "cpu")
+        return AnalysisConfig(device=resolve_device("auto"))
 
     def _resolve_path(self, raw_path: str | None) -> str | None:
         if not raw_path:
@@ -173,14 +172,10 @@ class AnalysisService:
                 )
 
         start_time = time.perf_counter()
-        cap = cv2.VideoCapture(str(source))
-        if not cap.isOpened():
-            raise RuntimeError(f"无法打开视频文件: {video_path}")
 
         self._emit(progress_callback, {"type": "stage", "stage": "正在执行逐帧分析...", "progress": 0.08})
 
         BATCH = 16
-        frame_buffer: list[np.ndarray] = []
         batch_frames: list[np.ndarray] = []
         batch_windows: list[list[np.ndarray]] = []
         frame_id = 0
@@ -189,6 +184,7 @@ class AnalysisService:
         last_pose: list = []
         last_progress_time = 0.0
         PROGRESS_INTERVAL = 0.3  # 进度回调最小间隔（秒）
+        track_filter = BallTrackFilter(fps=fps)
 
         # 预处理线程池：在 GPU 推理当前 batch 时，CPU 预处理下一个 batch
         preprocess_executor = ThreadPoolExecutor(max_workers=1)
@@ -218,7 +214,8 @@ class AnalysisService:
                 tensor = tensor.half()
             with torch.no_grad():
                 heatmaps = track_branch.model(tensor).float().detach().cpu().numpy()
-            track_results = decode_track_heatmap_batch(heatmaps, metas, track_branch.score_thr)
+            raw_track_results = decode_track_heatmap_batch(heatmaps, metas, track_branch.score_thr)
+            track_results = [track_filter.update(track) for track in raw_track_results]
 
             batch_start = frame_id - len(batch_frames)
             for i, (frame, track) in enumerate(zip(batch_frames, track_results)):
@@ -254,30 +251,14 @@ class AnalysisService:
             batch_windows.clear()
 
         try:
-            while True:
+            stream_limit = max_frames if max_frames > 0 else None
+            for fid, frame, window in iter_video_frame_windows(str(source), max_frames=stream_limit):
                 if stop_requested is not None and stop_requested():
                     break
-                if max_frames > 0 and frame_id >= max_frames:
-                    break
-
-                ok, frame = cap.read()
-                if not ok:
-                    break
-
-                frame_buffer.append(frame)
-                if len(frame_buffer) > 3:
-                    frame_buffer.pop(0)
-
-                buf_len = len(frame_buffer)
-                window = [
-                    frame_buffer[max(0, buf_len - 3)],
-                    frame_buffer[max(0, buf_len - 2)],
-                    frame_buffer[buf_len - 1],
-                ]
 
                 batch_frames.append(frame)
                 batch_windows.append(window)
-                frame_id += 1
+                frame_id = fid + 1
 
                 if len(batch_frames) >= BATCH:
                     # 提前提交预处理到后台线程（如果还没有 pending 的话）
@@ -289,7 +270,6 @@ class AnalysisService:
 
             _flush_batch()
         finally:
-            cap.release()
             preprocess_executor.shutdown(wait=False)
             if vis_writer is not None:
                 vis_writer.release()
@@ -402,4 +382,3 @@ class AnalysisService:
                 )
             )
         return actions
-
