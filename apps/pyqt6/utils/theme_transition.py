@@ -49,7 +49,7 @@ class ThemeRippleOverlay(QWidget):
         )
         return (
             max(math.hypot(origin.x() - point.x(), origin.y() - point.y()) for point in corners)
-            + 24.0
+            + 72.0
         )
 
     def _build_animation(self, duration_ms: int) -> QPropertyAnimation:
@@ -85,9 +85,10 @@ class ThemeRippleOverlay(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
+        edge_path = self._edge_path(self._radius)
         cover = QPainterPath()
         cover.addRect(QRectF(self.rect()))
-        cover = cover.subtracted(self._circle_path(self._radius))
+        cover = cover.subtracted(edge_path)
 
         painter.setClipPath(cover)
         painter.drawPixmap(self.rect(), self._snapshot)
@@ -109,6 +110,47 @@ class ThemeRippleOverlay(QWidget):
         path.addEllipse(self._circle_rect(radius))
         return path
 
+    def _edge_path(self, radius: float) -> QPainterPath:
+        radius = max(float(radius), 0.0)
+        path = QPainterPath()
+        if radius <= 0:
+            path.addEllipse(self._circle_rect(0.0))
+            return path
+
+        progress = min(radius / self._max_radius, 1.0) if self._max_radius > 0 else 1.0
+        amplitude = self._edge_amplitude(radius)
+        segments = 144
+        for index in range(segments):
+            angle = (math.tau * index) / segments
+            local_radius = max(radius + self._edge_offset(angle, progress, amplitude), 0.0)
+            point = QPointF(
+                self._origin.x() + math.cos(angle) * local_radius,
+                self._origin.y() + math.sin(angle) * local_radius,
+            )
+            if index == 0:
+                path.moveTo(point)
+            else:
+                path.lineTo(point)
+        path.closeSubpath()
+        return path
+
+    def _edge_amplitude(self, radius: float) -> float:
+        if radius <= 0 or self._max_radius <= 0:
+            return 0.0
+
+        progress = min(radius / self._max_radius, 1.0)
+        envelope = math.sin(progress * math.pi) ** 0.65
+        return min(42.0, max(9.0, radius * 0.066)) * envelope
+
+    @staticmethod
+    def _edge_offset(angle: float, progress: float, amplitude: float) -> float:
+        ripple = math.sin(angle * 4.0 + progress * 9.0) * amplitude * 0.34
+        ripple += math.sin(angle * 7.0 - progress * 6.0) * amplitude * 0.28
+        ripple += math.sin(angle * 13.0 + progress * 14.0) * amplitude * 0.18
+        ripple += math.sin(angle * 23.0 - progress * 18.0) * amplitude * 0.10
+        ripple += math.sin(angle * 31.0 + progress * 11.0) * amplitude * 0.06
+        return ripple
+
     def _draw_feathered_edge(self, painter: QPainter) -> None:
         if self._radius < 8.0:
             return
@@ -124,7 +166,7 @@ class ThemeRippleOverlay(QWidget):
             if outer <= 0:
                 continue
 
-            band = self._circle_path(outer).subtracted(self._circle_path(inner))
+            band = self._edge_path(outer).subtracted(self._edge_path(inner))
             opacity = 0.62 * ((layers - index) / layers) ** 1.5
             painter.setOpacity(opacity)
             painter.setClipPath(band)
@@ -139,8 +181,6 @@ class ThemeRippleOverlay(QWidget):
 
         progress = min(self._radius / self._max_radius, 1.0)
         fade = (1.0 - progress) ** 0.65
-        center = QPointF(self._origin)
-
         rings = (
             (self._radius, 92, 1.8),
             (self._radius - 18.0, 58, 1.2),
@@ -152,7 +192,7 @@ class ThemeRippleOverlay(QWidget):
             color = QColor(255, 255, 255, int(alpha * fade))
             painter.setPen(QPen(color, width))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(center, radius, radius)
+            painter.drawPath(self._edge_path(radius))
 
         self._draw_edge_pattern(painter, fade)
 
@@ -161,8 +201,8 @@ class ThemeRippleOverlay(QWidget):
             return
 
         painter.save()
-        center = QPointF(self._origin)
         progress = min(self._radius / self._max_radius, 1.0)
+        amplitude = self._edge_amplitude(self._radius)
 
         dashed_pen = QPen(QColor(255, 255, 255, int(52 * fade)), 1.15)
         dashed_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -171,7 +211,7 @@ class ThemeRippleOverlay(QWidget):
         painter.setPen(dashed_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         if self._radius > 12.0:
-            painter.drawEllipse(center, self._radius - 7.0, self._radius - 7.0)
+            painter.drawPath(self._edge_path(self._radius - 7.0))
 
         wavy = QPainterPath()
         segments = 96
@@ -179,6 +219,7 @@ class ThemeRippleOverlay(QWidget):
             angle = (math.tau * index) / segments
             ripple = math.sin(angle * 7.0 + progress * 8.0) * 3.2
             ripple += math.sin(angle * 13.0 - progress * 5.0) * 1.5
+            ripple += self._edge_offset(angle, progress, amplitude * 0.75)
             radius = max(self._radius - 2.5 + ripple, 0.0)
             point = QPointF(
                 self._origin.x() + math.cos(angle) * radius,
@@ -200,7 +241,9 @@ class ThemeRippleOverlay(QWidget):
             angle = (math.tau * index) / 40.0 + progress * 0.9
             if (index + int(progress * 10)) % 3 == 0:
                 continue
-            radius = self._radius - 14.0 + math.sin(angle * 5.0) * 6.0
+            radius = self._radius - 14.0
+            radius += self._edge_offset(angle, progress, amplitude * 0.68)
+            radius += math.sin(angle * 5.0) * 6.0
             if radius <= 0:
                 continue
             size = 1.4 + ((index % 4) * 0.35)
@@ -219,7 +262,7 @@ def start_theme_ripple_transition(
     apply_change: Callable[[], None],
     *,
     origin_widget: QWidget | None = None,
-    duration_ms: int = 560,
+    duration_ms: int = 1400,
 ) -> None:
     if not root.isVisible() or root.width() <= 0 or root.height() <= 0:
         apply_change()

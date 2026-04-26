@@ -1,6 +1,5 @@
-# ========================================
-# 视频文件（主要忽略项）
-# ========================================
+# Video inputs and generated media
+videos/
 *.mp4
 *.avi
 *.mov
@@ -18,57 +17,94 @@
 *.vob
 *.ogv
 
-# ========================================
-# Python 缓存和编译文件
-# ========================================
+# Python caches and build artifacts
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
 *.egg-info/
 *.egg
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
-# Virtual Environment
+# Virtual environments
 venv/
 env/
 ENV/
-.venv
+.venv/
+*.env
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Jupyter
+.ipynb_checkpoints/
 
-# ========================================
-# 模型权重文件（可选）
-# ========================================
+# Model weights and exported runtime artifacts
 *.pth
 *.pt
+*.onnx
+*.engine
+*.calib.cache
+*.ckpt
+*.safetensors
+*.tflite
+*.pb
 
-# ========================================
-# 输出文件和日志
-# ========================================
+# Datasets and large local assets
+datasets/
+data/
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Runtime outputs and logs
 outputs/
 logs/
+results/
+runs/
 .ultralytics/
 *.log
+*.log.*
 
-# ========================================
-# IDE 和编辑器配置
-# ========================================
+# Local IDE and shell caches
 .vscode/
 .idea/
+Microsoft/
 *.swp
 *.swo
 *~
 
-# OS 特定文件
+# OS files
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# ========================================
-# 敏感文件
-# ========================================
+# Secrets
 .env
 .env.local
+.env.*.local
 *.pem
 *.key

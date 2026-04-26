@@ -1,55 +1,63 @@
-# TrackNet Demo
+# Demo Scripts
 
-TrackNet 实时推理演示程序 - 直接对视频进行乒乓球轨迹跟踪。
+This folder contains small standalone demos for local experiments.
 
-## 功能特性
+## Court Keypoint Detection
 
-- TrackNet 实时乒乓球检测与跟踪
-- 检测结果可视化（红色圆点标记球位置）
-- 实时显示 FPS 和跟踪状态
-- **自动 GPU 加速**（支持 CUDA GPU）
-- 复用车项目核心推理代码
+`run_court_keypoints_yolo.py` detects four badminton court corner points with a YOLO keypoint model.
 
-## 前提条件
+Expected model output:
 
-确保已下载 TrackNet 模型权重文件：
-- 权重文件路径: `assets/weights/track/model_best.pt`
-- 如需下载，请参考: [WFBARNet 下载指南](https://github.com/your-repo/WFBARNet#download-models)
+- one court object
+- at least four keypoints
+- default keypoint order: `0,1,2,3`
 
-## 安装依赖
+Run on an image:
 
-```bash
-pip install opencv-python torch numpy
+```powershell
+python tools/demo/run_court_keypoints_yolo.py `
+  --source path/to/frame.jpg `
+  --weights assets/weights/court/court_yolo_keypoints.pt
 ```
 
-## 运行
+Run on a video and correct the court points every 150 frames:
 
-```bash
-cd tools/demo
-python tracknet_demo.py
+```powershell
+python tools/demo/run_court_keypoints_yolo.py `
+  --source path/to/video.mp4 `
+  --weights assets/weights/court/court_yolo_keypoints.pt `
+  --detect-every 150 `
+  --smooth-alpha 0.25
 ```
 
-## 使用方法
+Outputs are written to `outputs/court_keypoints_demo/`:
 
-1. 程序会自动加载 `videos/test3.mp4` 视频
-2. 自动检测并使用可用的 GPU（优先 CUDA）
-3. 实时显示跟踪结果
-4. 按 `q` 或 `ESC` 退出
+- `*_court_keypoints.json`
+- `*_court_keypoints.jpg` for images
+- `*_court_keypoints.mp4` for videos unless `--no-video` is used
 
-## 技术细节
+The saved corner order is:
 
-- 使用 TrackNet V3 模型进行球轨迹跟踪
-- 直接复用 `src.models.track_branch.TrackBranch` 后端代码
-- 自动 GPU 加速检测（CUDA）
-- 输入尺寸: 512x288
-- 检测阈值: 0.35
+```text
+top-left, top-right, bottom-right, bottom-left
+```
 
-## 显示信息
+If your model uses a different keypoint order, pass:
 
-| 信息 | 说明 |
-|------|------|
-| FPS | 实时帧率 |
-| Frame | 当前帧/总帧数 |
-| Track | 球位置 (x, y) 和置信度 |
-| 红色圆点 | 检测到的球位置 |
-| 黄色圆圈 | 球周围的高亮框 |
+```powershell
+--keypoint-indices 3,2,1,0
+```
+
+If your model already returns ordered corners, pass:
+
+```powershell
+--order model
+```
+
+## Existing Runtime Demos
+
+- `run_pose_only.py`
+- `run_track_only.py`
+- `run_tracknet_realtime.py`
+- `run_unified_infer.py`
+- `tracknet_demo.py`
