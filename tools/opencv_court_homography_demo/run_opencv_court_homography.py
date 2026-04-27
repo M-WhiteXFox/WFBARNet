@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
 import cv2
 import numpy as np
 
@@ -1635,7 +1634,7 @@ def update_tracking_state(
 
 
 def should_redetect(state: TrackingState, frame_id: int, timestamp: float, args: argparse.Namespace) -> bool:
-    if frame_id == 0:
+    if frame_id == 0 or state.current is None:
         return True
     interval = max(0.1, float(args.redetect_interval))
     return (timestamp - state.last_attempt_time) >= interval
@@ -2300,17 +2299,7 @@ def snap_corners_to_white_intersections(
     resorted = order_quad_points(snapped)
     if resorted is None:
         return ordered, [False, False, False, False]
-    max_shift = max(6.0, float(args.corner_snap_max_shift))
-    clamped = resorted.copy()
-    clamped_flags = list(flags)
-    for index in range(4):
-        if float(np.linalg.norm(clamped[index] - ordered[index])) > max_shift:
-            clamped[index] = ordered[index]
-            clamped_flags[index] = False
-    final_ordered = order_quad_points(clamped)
-    if final_ordered is None:
-        return ordered, [False, False, False, False]
-    return final_ordered, clamped_flags
+    return resorted, flags
 
 
 def snap_editor_points_to_frame(frame: np.ndarray, editor: FourPointEditor, args: argparse.Namespace) -> int:
@@ -2465,7 +2454,7 @@ def main() -> None:
     print("=" * 76)
     print("OpenCV badminton court four-point calibration demo")
     print(f"source   : {args.source}")
-    print(f"redetect : every {max(0.1, float(args.redetect_interval)):.1f}s; manual/confirmed points keep priority")
+    print(f"redetect : every {float(args.redetect_interval):.1f}s; manual/confirmed points keep priority")
     print("template : 610 x 1340 standard court coordinates")
     print("H        : image_to_court_h maps image pixels to template coordinates")
     print("keys     : Drag points | a snap | r redetect | m manual | Enter confirm | s save | l load | v preview | q quit")
