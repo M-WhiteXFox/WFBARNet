@@ -21,6 +21,7 @@ from apps.pyqt6.utils.style import load_stylesheet
 
 def main() -> int:
     from apps.pyqt6.controllers.analysis_controller_runtime import MainController
+    from apps.pyqt6.services.court_detection_service import create_court_detection_service
     from apps.pyqt6.views.main_window_refined import MainWindow
 
     app = QApplication(sys.argv)
@@ -36,7 +37,9 @@ def main() -> int:
     load_stylesheet(app, "office_light")
 
     window = MainWindow()
-    controller = MainController(window)
+    court_service = create_court_detection_service()
+    controller = MainController(window, court_service=court_service)
+    app.aboutToQuit.connect(controller.shutdown)
     
     # 设置窗口图标
     if icon_path.exists():

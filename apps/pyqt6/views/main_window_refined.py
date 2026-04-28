@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
     modelSettingsApplyRequested = pyqtSignal(str, str)
     modelSettingsDefaultsRequested = pyqtSignal()
     modelSwitchesChanged = pyqtSignal(bool, bool)
+    courtRedetectRequested = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -257,14 +258,28 @@ class MainWindow(QMainWindow):
         preview_header.addWidget(self.btn_camera_mode)
         preview_header.addStretch(1)
 
-        self.progress_bar = QProgressBar()
+        self.progress_bar = QProgressBar(preview_panel)
         self.progress_bar.setObjectName("topProgress")
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFixedHeight(16)
+        self.progress_bar.setVisible(False)
 
         self.video_player = VideoPlayerWidget()
         self.video_player.setMinimumHeight(360)
+
+        court_controls = QFrame()
+        court_controls.setObjectName("courtControlsBar")
+        court_controls_layout = QHBoxLayout(court_controls)
+        court_controls_layout.setContentsMargins(0, 0, 0, 0)
+        court_controls_layout.setSpacing(8)
+        court_controls_layout.addStretch(1)
+
+        self.btn_redetect_court = QPushButton("重新预测球场线")
+        self.btn_redetect_court.setObjectName("btnRedetectCourt")
+        self.btn_redetect_court.setEnabled(False)
+        self.btn_redetect_court.clicked.connect(self.courtRedetectRequested.emit)
+        court_controls_layout.addWidget(self.btn_redetect_court)
 
         video_controls = QFrame()
         video_controls.setObjectName("videoControlsBar")
@@ -297,7 +312,7 @@ class MainWindow(QMainWindow):
         timeline_bar_layout.setSpacing(0)
         timeline_bar_layout.addWidget(self.video_timeline)
 
-        preview_layout.addWidget(self.progress_bar)
+        preview_layout.addWidget(court_controls, 0)
         preview_layout.addWidget(video_controls, 0)
         preview_layout.addWidget(self.video_player, 1)
         preview_layout.addWidget(timeline_bar, 0)
@@ -320,7 +335,7 @@ class MainWindow(QMainWindow):
 
         card1, self.lbl_realtime_fps = self._create_metric_card("实时帧数", "0.0 FPS")
         card2, self.lbl_avg_conf = self._create_metric_card("平均置信度", "0.0%")
-        card3, self.lbl_valid_pose = self._create_metric_card("有效姿态帧数", "0")
+        card3, self.lbl_valid_pose = self._create_metric_card("推理 FPS", "0.0 FPS")
         card4, self.lbl_valid_track = self._create_metric_card("有效轨迹帧数", "0")
 
         metrics_grid.addWidget(card1, 0, 0)
@@ -630,5 +645,5 @@ class MainWindow(QMainWindow):
         self.table_actions.setRowCount(0)
         self.lbl_realtime_fps.setText("0.0 FPS")
         self.lbl_avg_conf.setText("0.0%")
-        self.lbl_valid_pose.setText("0")
+        self.lbl_valid_pose.setText("0.0 FPS")
         self.lbl_valid_track.setText("0")

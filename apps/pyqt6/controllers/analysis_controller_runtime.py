@@ -23,9 +23,12 @@ from src.models.pose_branch import PoseBranch
 from src.models.track_branch import TrackBranch
 from src.utils.structures import FrameResult, TrackResult
 from src.utils.visualize import TrackTrailRenderer
+from src.court.opencv_court_detector import draw_court_prediction
 
 
 DISPLAY_FPS_LIMIT = 60.0
+METRICS_UPDATE_INTERVAL_S = 0.25
+PLAYBACK_LAG_TOLERANCE_FRAMES = 1.5
 
 
 @contextmanager
@@ -192,6 +195,7 @@ class TrackNetPlaybackWorker(QThread):
         track_enabled: bool = True,
         pose_enabled: bool = True,
         display_fps_limit: float = DISPLAY_FPS_LIMIT,
+        court_service: Any | None = None,
     ) -> None:
         super().__init__()
         self._video_path = video_path
@@ -202,6 +206,7 @@ class TrackNetPlaybackWorker(QThread):
         self._track_enabled = track_enabled
         self._pose_enabled = pose_enabled
         self._display_fps_limit = max(1.0, float(display_fps_limit))
+        self._court_service = court_service
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -270,6 +275,7 @@ class TrackNetPlaybackWorker(QThread):
         prev_frame = current_frame.copy()
         base_ms = current_ms
         processed_frames = 0
+        dropped_source_frames = 0
         visible_frames = 0
         pose_frames = 0
         score_sum = 0.0
@@ -305,20 +311,21 @@ class TrackNetPlaybackWorker(QThread):
                 infer_fps = 1.0 / infer_elapsed
                 ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
 
+                court_prediction = None
+                if self._court_service is not None:
+                    self._court_service.submit_frame(current_frame, frame_id, current_ms)
+                    court_prediction = self._court_service.latest_prediction()
+
                 should_emit = display_every_frame or final_pass or current_ms >= next_display_ms
                 image = None
                 if should_emit:
                     frame_result = FrameResult(frame_id=frame_id, pose=last_pose, track=track)
-                    vis_frame = trail_renderer.draw(current_frame, frame_result, timestamp_ms=current_ms)
-                    cv2.putText(
-                        vis_frame,
-                        f"{self._pipeline_label()} {ema_infer_fps:.1f} FPS",
-                        (16, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 255),
-                        2,
+                    display_frame = (
+                        draw_court_prediction(current_frame, court_prediction)
+                        if court_prediction is not None
+                        else current_frame
                     )
+                    vis_frame = trail_renderer.draw(display_frame, frame_result, timestamp_ms=current_ms)
                     image = frame_to_qimage(vis_frame)
 
                 target_ms = max(0, current_ms - base_ms)
@@ -346,6 +353,8 @@ class TrackNetPlaybackWorker(QThread):
                         "person_count": len(last_pose),
                         "avg_score": avg_score,
                         "processed_frames": processed_frames,
+                        "infer_fps": ema_infer_fps,
+                        "court": court_prediction.to_dict() if court_prediction is not None else None,
                     }
                     self.frameReady.emit(payload)
                     if not display_every_frame:
@@ -367,6 +376,29 @@ class TrackNetPlaybackWorker(QThread):
                     next_frame = current_frame.copy()
                     next_ms = current_ms + frame_interval_ms
                     final_pass = True
+
+                lag_ms = clock.elapsed() - max(0, current_ms - base_ms)
+                max_lag_ms = frame_interval_ms * PLAYBACK_LAG_TOLERANCE_FRAMES
+                while not final_pass and lag_ms > max_lag_ms:
+                    prev_frame = current_frame
+                    current_frame = next_frame
+                    current_ms = next_ms
+                    dropped_source_frames += 1
+
+                    ok, incoming_frame, incoming_ms = self._read_frame(
+                        cap,
+                        processed_frames + dropped_source_frames + 1,
+                        fps,
+                    )
+                    if ok:
+                        next_frame = incoming_frame
+                        next_ms = incoming_ms
+                    else:
+                        next_frame = current_frame.copy()
+                        next_ms = current_ms + frame_interval_ms
+                        final_pass = True
+                        break
+                    lag_ms = clock.elapsed() - max(0, current_ms - base_ms)
         finally:
             cap.release()
 
@@ -374,6 +406,7 @@ class TrackNetPlaybackWorker(QThread):
             {
                 "stopped": self._stop_requested,
                 "processed_frames": processed_frames,
+                "dropped_source_frames": dropped_source_frames,
                 "visible_frames": visible_frames,
                 "pose_frames": pose_frames,
                 "avg_score": (score_sum / processed_frames) if processed_frames else 0.0,
@@ -396,6 +429,7 @@ class CameraInferenceWorker(QThread):
         track_enabled: bool = True,
         pose_enabled: bool = True,
         display_fps_limit: float = DISPLAY_FPS_LIMIT,
+        court_service: Any | None = None,
     ) -> None:
         super().__init__()
         self._camera_index = camera_index
@@ -405,6 +439,7 @@ class CameraInferenceWorker(QThread):
         self._track_enabled = track_enabled
         self._pose_enabled = pose_enabled
         self._display_fps_limit = max(1.0, float(display_fps_limit))
+        self._court_service = court_service
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -473,28 +508,30 @@ class CameraInferenceWorker(QThread):
                 infer_fps = 1.0 / infer_elapsed
                 ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
 
+                current_frame_id = processed_frames
+                position_ms = clock.elapsed()
+                court_prediction = None
+                if self._court_service is not None:
+                    self._court_service.submit_frame(current_frame, current_frame_id, position_ms)
+                    court_prediction = self._court_service.latest_prediction()
+
                 processed_frames += 1
                 visible_frames += int(bool(track.visible))
                 score_sum += float(track.score)
                 avg_score = score_sum / max(processed_frames, 1)
-                position_ms = clock.elapsed()
                 if position_ms >= next_display_ms:
-                    frame_result = FrameResult(frame_id=processed_frames - 1, pose=last_pose, track=track)
-                    vis_frame = trail_renderer.draw(current_frame, frame_result, timestamp_ms=position_ms)
-                    cv2.putText(
-                        vis_frame,
-                        f"Camera {self._camera_index} ({backend_name}) | {self._pipeline_label()} {ema_infer_fps:.1f} FPS",
-                        (16, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 255),
-                        2,
+                    frame_result = FrameResult(frame_id=current_frame_id, pose=last_pose, track=track)
+                    display_frame = (
+                        draw_court_prediction(current_frame, court_prediction)
+                        if court_prediction is not None
+                        else current_frame
                     )
+                    vis_frame = trail_renderer.draw(display_frame, frame_result, timestamp_ms=position_ms)
                     image = frame_to_qimage(vis_frame)
 
                     payload = {
                         "image": image,
-                        "frame_id": processed_frames - 1,
+                        "frame_id": current_frame_id,
                         "position_ms": position_ms,
                         "duration_ms": 0,
                         "progress": 0.0,
@@ -509,6 +546,7 @@ class CameraInferenceWorker(QThread):
                         "avg_score": avg_score,
                         "processed_frames": processed_frames,
                         "infer_fps": ema_infer_fps,
+                        "court": court_prediction.to_dict() if court_prediction is not None else None,
                     }
                     self.frameReady.emit(payload)
                     while next_display_ms <= position_ms:
@@ -537,8 +575,9 @@ class CameraInferenceWorker(QThread):
 class MainController:
     """PyQt6 前端的多线程 TrackNetV3 预览控制器。"""
 
-    def __init__(self, view: MainWindow) -> None:
+    def __init__(self, view: MainWindow, court_service: Any | None = None) -> None:
         self.view = view
+        self._court_service = court_service
         self._project_root = Path(__file__).resolve().parents[3]
         self._settings = QSettings("WFBARNet", "PyQt6Runtime")
         self._default_pose_model_path = str(self._project_root / "assets" / "weights" / "pose" / "yolo26s-pose.pt")
@@ -558,13 +597,16 @@ class MainController:
         self._camera_worker: CameraInferenceWorker | None = None
         self._pending_seek_ms: int | None = None
         self._last_display_frame_time: float | None = None
+        self._last_metrics_update_time: float | None = None
         self._display_fps_ema = 0.0
+        self._last_court_log_frame = -1
 
         self.view.set_model_settings(self._pose_model_path, self._track_model_path)
         self.view.set_model_switches(self._pose_model_enabled, self._track_model_enabled)
         self._track_branch = self._build_track_branch()
         self._pose_branch = self._build_pose_branch()
 
+        self._bind_court_service()
         self._bind_events()
         self.view.populate_stylesheets(self._theme_dirs, self._active_theme_name)
         self.view.video_timeline.set_interactive(True)
@@ -572,6 +614,51 @@ class MainController:
         self._reset_metrics()
         self._set_idle_state()
         self.view.append_log("[系统] 界面已就绪，请选择视频开始。")
+
+    def _bind_court_service(self) -> None:
+        if self._court_service is None:
+            return
+        self._court_service.resultReady.connect(self._on_court_prediction_ready)
+        self._court_service.failed.connect(self._on_court_detection_failed)
+
+    def _reset_court_detection(self, *, request_initial_prediction: bool = False) -> None:
+        self._last_court_log_frame = -1
+        if self._court_service is not None:
+            self._court_service.reset()
+            if request_initial_prediction:
+                self._court_service.request_prediction()
+
+    def _request_court_prediction(self) -> None:
+        if self._court_service is None:
+            self.view.append_log("[Court] OpenCV court line detector is unavailable.")
+            return
+        if not self._is_inference_running():
+            self.view.append_log("[Court] 请先开始视频播放或摄像头推理，再重新预测球场线。")
+            return
+        self._last_court_log_frame = -1
+        self._court_service.request_prediction()
+        self.view.append_log("[Court] 已请求重新预测球场线，将使用下一帧画面。")
+
+    def _on_court_prediction_ready(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        frame_id = int(payload.get("frame_id", -1))
+        if frame_id == self._last_court_log_frame:
+            return
+
+        valid = bool(payload.get("valid"))
+        updated = bool(payload.get("updated"))
+        if valid and updated:
+            self._last_court_log_frame = frame_id
+            confidence = float(payload.get("confidence", 0.0))
+            detect_ms = float(payload.get("detect_ms", 0.0))
+            self.view.append_log(f"[Court] OpenCV court lines updated | frame {frame_id} | conf {confidence:.2f} | {detect_ms:.0f} ms")
+        elif not valid and self._last_court_log_frame < 0:
+            self._last_court_log_frame = frame_id
+            self.view.append_log("[Court] OpenCV court line detector is running; waiting for a valid court.")
+
+    def _on_court_detection_failed(self, message: str) -> None:
+        self.view.append_log(f"[Court] OpenCV court line detector failed: {message}")
 
     def _load_model_path(self, key: str, default_path: str) -> str:
         raw_value = self._settings.value(key, default_path)
@@ -658,6 +745,7 @@ class MainController:
         self.view.modelSettingsApplyRequested.connect(self.handle_model_settings_apply)
         self.view.modelSettingsDefaultsRequested.connect(self.handle_model_settings_defaults)
         self.view.modelSwitchesChanged.connect(self.handle_model_switches_changed)
+        self.view.courtRedetectRequested.connect(self._request_court_prediction)
 
     def _set_idle_state(self) -> None:
         has_video = self._selected_video_path is not None
@@ -668,6 +756,7 @@ class MainController:
         self.view.btn_refresh_cameras.setEnabled(self._input_mode == "camera")
         self.view.camera_device_combo.setEnabled(self._input_mode == "camera")
         self.view.video_player.btn_force_stop.setEnabled(has_video if self._input_mode == "video" else False)
+        self.view.btn_redetect_court.setEnabled(False)
         self.view.video_timeline.set_interactive(self._input_mode == "video")
         self.view.set_model_settings_enabled(True)
         self.view.set_status_state("idle")
@@ -679,6 +768,7 @@ class MainController:
         self.view.btn_refresh_cameras.setEnabled(False)
         self.view.camera_device_combo.setEnabled(False)
         self.view.video_player.btn_force_stop.setEnabled(True)
+        self.view.btn_redetect_court.setEnabled(self._court_service is not None)
         self.view.video_timeline.set_interactive(False)
         self.view.set_model_settings_enabled(False)
         self.view.set_status_state("loading")
@@ -691,6 +781,7 @@ class MainController:
 
     def _reset_display_fps(self) -> None:
         self._last_display_frame_time = None
+        self._last_metrics_update_time = None
         self._display_fps_ema = 0.0
         self.view.lbl_realtime_fps.setText("0.0 FPS")
 
@@ -708,8 +799,17 @@ class MainController:
             if self._display_fps_ema <= 0.0
             else (0.85 * self._display_fps_ema + 0.15 * instant_fps)
         )
-        self.view.lbl_realtime_fps.setText(f"{self._display_fps_ema:.1f} FPS")
         return self._display_fps_ema
+
+    def _should_update_metrics_text(self) -> bool:
+        now = perf_counter()
+        if self._last_metrics_update_time is None:
+            self._last_metrics_update_time = now
+            return True
+        if now - self._last_metrics_update_time < METRICS_UPDATE_INTERVAL_S:
+            return False
+        self._last_metrics_update_time = now
+        return True
 
     def handle_input_mode(self, mode: str) -> None:
         if mode not in {"video", "camera"}:
@@ -950,7 +1050,7 @@ class MainController:
 
         self._pending_seek_ms = None
         start_ms = int(self._video_meta.get("position_ms", 0)) if self._video_meta else 0
-        self._start_playback(start_ms=start_ms)
+        self._start_playback(start_ms=start_ms, request_court_prediction=True)
 
     def _start_camera_inference(self) -> None:
         camera_index = self.view.selected_camera_device()
@@ -959,6 +1059,7 @@ class MainController:
             return
 
         self._stop_workers(clear_pending_seek=True)
+        self._reset_court_detection(request_initial_prediction=True)
         self._set_running_state()
         self.view.video_player.set_live_source(f"摄像头 {camera_index}")
         self.view.video_player.play()
@@ -976,17 +1077,19 @@ class MainController:
             pose_stride=3,
             track_enabled=self._track_model_enabled,
             pose_enabled=self._pose_model_enabled,
+            court_service=self._court_service,
         )
         self._camera_worker.frameReady.connect(self._on_camera_frame_ready)
         self._camera_worker.inferFinished.connect(self._on_camera_finished)
         self._camera_worker.failed.connect(self._on_camera_failed)
         self._camera_worker.start()
 
-    def _start_playback(self, *, start_ms: int = 0) -> None:
+    def _start_playback(self, *, start_ms: int = 0, request_court_prediction: bool = True) -> None:
         if self._selected_video_path is None:
             return
 
         self._stop_workers(clear_pending_seek=False)
+        self._reset_court_detection(request_initial_prediction=request_court_prediction)
         self._set_running_state()
         self.view.video_player.play()
         self.view.append_log(
@@ -1003,6 +1106,7 @@ class MainController:
             pose_stride=3,
             track_enabled=self._track_model_enabled,
             pose_enabled=self._pose_model_enabled,
+            court_service=self._court_service,
         )
         self._playback_worker.frameReady.connect(self._on_frame_ready)
         self._playback_worker.playbackFinished.connect(self._on_playback_finished)
@@ -1024,20 +1128,27 @@ class MainController:
 
         progress = max(0, min(int(float(payload.get("progress", 0.0)) * 100), 100))
         self.view.update_progress(progress)
+        if not self._should_update_metrics_text():
+            return
 
         processed_frames = int(payload.get("processed_frames", 0))
         visible_frames = int(payload.get("visible_frames", 0))
-        pose_frames = int(payload.get("pose_frames", 0))
         person_count = int(payload.get("person_count", 0))
         avg_score = float(payload.get("avg_score", 0.0))
+        infer_fps = float(payload.get("infer_fps", 0.0))
         track = payload.get("track", {})
         current_score = float(track.get("score", 0.0)) if isinstance(track, dict) else 0.0
+        court = payload.get("court", {})
+        court_text = ""
+        if isinstance(court, dict) and court.get("valid"):
+            court_text = f" | Court {float(court.get('confidence', 0.0)):.2f}"
 
-        self.view.lbl_valid_pose.setText(str(pose_frames))
+        self.view.lbl_valid_pose.setText(f"{infer_fps:.1f} FPS")
         self.view.lbl_valid_track.setText(str(visible_frames))
         self.view.lbl_avg_conf.setText(f"{avg_score * 100:.1f}%")
+        self.view.lbl_realtime_fps.setText(f"{self._display_fps_ema:.1f} FPS")
         self.view.status_label.setText(
-            f"系统状态：TrackNet + YOLO26s-Pose 运行中 | 人数 {person_count} | Score {current_score:.2f}"
+            f"系统状态：TrackNet + YOLO26s-Pose 运行中 | 人数 {person_count} | Score {current_score:.2f}{court_text}"
         )
 
     def _on_camera_frame_ready(self, payload: object) -> None:
@@ -1048,21 +1159,27 @@ class MainController:
         if isinstance(image, QImage):
             self.view.video_player.display_image(image)
             self._update_display_fps()
+        if not self._should_update_metrics_text():
+            return
 
         processed_frames = int(payload.get("processed_frames", 0))
         visible_frames = int(payload.get("visible_frames", 0))
-        pose_frames = int(payload.get("pose_frames", 0))
         person_count = int(payload.get("person_count", 0))
         avg_score = float(payload.get("avg_score", 0.0))
         track = payload.get("track", {})
         current_score = float(track.get("score", 0.0)) if isinstance(track, dict) else 0.0
         infer_fps = float(payload.get("infer_fps", 0.0))
+        court = payload.get("court", {})
+        court_text = ""
+        if isinstance(court, dict) and court.get("valid"):
+            court_text = f" | Court {float(court.get('confidence', 0.0)):.2f}"
 
-        self.view.lbl_valid_pose.setText(str(pose_frames))
+        self.view.lbl_valid_pose.setText(f"{infer_fps:.1f} FPS")
         self.view.lbl_valid_track.setText(str(visible_frames))
         self.view.lbl_avg_conf.setText(f"{avg_score * 100:.1f}%")
+        self.view.lbl_realtime_fps.setText(f"{self._display_fps_ema:.1f} FPS")
         self.view.status_label.setText(
-            f"系统状态：摄像头 TrackNet + YOLO26s-Pose 推理中 | 人数 {person_count} | Score {current_score:.2f} | FPS {infer_fps:.1f}"
+            f"系统状态：摄像头 TrackNet + YOLO26s-Pose 推理中 | 人数 {person_count} | Score {current_score:.2f}{court_text}"
         )
 
     def _on_camera_finished(self, payload: object) -> None:
@@ -1124,7 +1241,7 @@ class MainController:
         if self._pending_seek_ms is not None and self._selected_video_path is not None:
             pending_seek_ms = self._pending_seek_ms
             self._pending_seek_ms = None
-            self._start_playback(start_ms=pending_seek_ms)
+            self._start_playback(start_ms=pending_seek_ms, request_court_prediction=False)
 
     def _on_playback_failed(self, message: str) -> None:
         self._playback_worker = None
@@ -1164,6 +1281,7 @@ class MainController:
 
     def handle_reset(self) -> None:
         self._stop_workers(clear_pending_seek=True)
+        self._reset_court_detection()
         self._selected_video_path = None
         self._video_meta = {}
         self.view.clear_video()
@@ -1191,7 +1309,14 @@ class MainController:
             self._camera_worker.request_stop()
             self._camera_worker.wait(1000)
         self._camera_worker = None
+        if self._court_service is not None:
+            self._court_service.clear_pending()
         self.view.set_progress_busy(False)
+
+    def shutdown(self) -> None:
+        self._stop_workers(clear_pending_seek=True)
+        if self._court_service is not None:
+            self._court_service.stop()
 
     def _on_style_action_triggered(self, action) -> None:
         theme_name = str(action.data() or action.text()).strip()
