@@ -295,7 +295,7 @@ class TrackNetPlaybackWorker(QThread):
                 loop_start = perf_counter()
                 if self._track_enabled:
                     raw_track = self._track_branch.infer_result([prev_frame, current_frame, next_frame])
-                    track = track_filter.update(raw_track)
+                    track = track_filter.update(raw_track, frame_shape=current_frame.shape)
                 else:
                     track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
 
@@ -489,7 +489,7 @@ class CameraInferenceWorker(QThread):
                 loop_start = perf_counter()
                 if self._track_enabled:
                     raw_track = self._track_branch.infer_result([prev_frame, current_frame, next_frame])
-                    track = track_filter.update(raw_track)
+                    track = track_filter.update(raw_track, frame_shape=current_frame.shape)
                 else:
                     track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
 

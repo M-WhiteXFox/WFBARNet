@@ -77,7 +77,7 @@ class UnifiedRunner:
         for frame_id, frame, window in tqdm(list(iter_frame_windows(frames)), desc="Unified inference"):
             pose = self.pose_branch.infer(frame)
             raw_track = self.track_branch.infer_result(window)
-            track = track_filter.update(raw_track)
+            track = track_filter.update(raw_track, frame_shape=frame.shape)
             outputs.append(FrameResult(frame_id=frame_id, pose=pose, track=track))
         return outputs
 
@@ -104,7 +104,7 @@ class UnifiedRunner:
             ):
                 pose = self.pose_branch.infer(frame)
                 raw_track = self.track_branch.infer_result(window)
-                track = track_filter.update(raw_track)
+                track = track_filter.update(raw_track, frame_shape=frame.shape)
                 result = FrameResult(frame_id=frame_id, pose=pose, track=track)
                 outputs.append(result)
                 if writer is not None:
@@ -128,6 +128,6 @@ class UnifiedRunner:
             with torch.cuda.stream(track_stream):
                 raw_track = self.track_branch.infer_result(window)
             torch.cuda.synchronize()
-            track = track_filter.update(raw_track)
+            track = track_filter.update(raw_track, frame_shape=frame.shape)
             outputs.append(FrameResult(frame_id=frame_id, pose=pose, track=track))
         return outputs

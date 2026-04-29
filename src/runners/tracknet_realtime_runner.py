@@ -84,7 +84,7 @@ class TrackNetRealtimeRunner:
             start_tick = cv2.getTickCount()
 
             raw_track = self.track_branch.infer_result([prev_frame, curr_frame, next_frame])
-            track = track_filter.update(raw_track)
+            track = track_filter.update(raw_track, frame_shape=curr_frame.shape)
             result = FrameResult(frame_id=frame_id, pose=[], track=track)
             results.append(result)
 
@@ -114,7 +114,7 @@ class TrackNetRealtimeRunner:
                 next_frame = curr_frame.copy()
                 frame_id += 1
                 final_raw_track = self.track_branch.infer_result([prev_frame, curr_frame, next_frame])
-                final_track = track_filter.update(final_raw_track)
+                final_track = track_filter.update(final_raw_track, frame_shape=curr_frame.shape)
                 final_result = FrameResult(frame_id=frame_id, pose=[], track=final_track)
                 results.append(final_result)
                 final_vis = self._draw_overlay(curr_frame.copy(), final_result, ema_fps, trail_renderer)

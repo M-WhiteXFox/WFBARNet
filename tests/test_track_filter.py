@@ -59,6 +59,50 @@ class BallTrackFilterTest(unittest.TestCase):
         self.assertGreater(coasted.ball_xy[0], 180.0)
         self.assertLess(coasted.score, 0.05)
 
+    def test_missing_gap_is_filled_from_parabolic_motion(self) -> None:
+        tracker = BallTrackFilter(fps=25.0)
+
+        for i in range(5):
+            tracker.update(_track(100.0 + 20.0 * i, 200.0 - 18.0 * i + 2.0 * i * i, 0.92))
+
+        coasted = tracker.update(_missing())
+
+        self.assertTrue(coasted.visible)
+        self.assertAlmostEqual(coasted.ball_xy[0], 200.0, delta=4.0)
+        self.assertAlmostEqual(coasted.ball_xy[1], 160.0, delta=4.0)
+        self.assertLess(coasted.score, 0.05)
+
+    def test_detection_outside_parabola_is_replaced_by_prediction(self) -> None:
+        tracker = BallTrackFilter(fps=25.0)
+
+        for i in range(5):
+            tracker.update(_track(100.0 + 20.0 * i, 200.0 - 18.0 * i + 2.0 * i * i, 0.92))
+
+        corrected = tracker.update(_track(200.0, 235.0, 0.95))
+
+        self.assertTrue(corrected.visible)
+        self.assertAlmostEqual(corrected.ball_xy[0], 200.0, delta=4.0)
+        self.assertAlmostEqual(corrected.ball_xy[1], 160.0, delta=4.0)
+        self.assertLess(corrected.score, 0.95)
+
+    def test_top_exit_hides_prediction_and_ignores_in_frame_hallucination(self) -> None:
+        tracker = BallTrackFilter(fps=25.0)
+        frame_shape = (180, 320, 3)
+
+        for i in range(4):
+            tracker.update(
+                _track(80.0 + 20.0 * i, 120.0 - 34.0 * i, 0.92),
+                frame_shape=frame_shape,
+            )
+
+        outside = tracker.update(_missing(), frame_shape=frame_shape)
+        hallucination = tracker.update(_track(160.0, 8.0, 0.96), frame_shape=frame_shape)
+
+        self.assertFalse(outside.visible)
+        self.assertEqual(outside.ball_xy, [-1.0, -1.0])
+        self.assertFalse(hallucination.visible)
+        self.assertEqual(hallucination.ball_xy, [-1.0, -1.0])
+
     def test_relocks_after_stable_new_cluster(self) -> None:
         tracker = BallTrackFilter(fps=25.0)
 

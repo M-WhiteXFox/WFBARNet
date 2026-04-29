@@ -64,9 +64,9 @@ class TrackVideoRunner:
             frames = frames[:max_frames]
         results: list[FrameResult] = []
         track_filter = BallTrackFilter()
-        for frame_id, _, window in tqdm(list(iter_frame_windows(frames)), desc="Track inference"):
+        for frame_id, frame, window in tqdm(list(iter_frame_windows(frames)), desc="Track inference"):
             raw_track = self.track_branch.infer_result(window)
-            track = track_filter.update(raw_track)
+            track = track_filter.update(raw_track, frame_shape=frame.shape)
             results.append(FrameResult(frame_id=frame_id, pose=[], track=track))
 
         self._export_results(results, save_json, save_csv, save_npy)
@@ -104,7 +104,7 @@ class TrackVideoRunner:
         try:
             for frame_id, curr_frame, window in iter_video_frame_windows(source, max_frames=max_frames):
                 raw_track = self.track_branch.infer_result(window)
-                track = track_filter.update(raw_track)
+                track = track_filter.update(raw_track, frame_shape=curr_frame.shape)
                 result = FrameResult(frame_id=frame_id, pose=[], track=track)
                 results.append(result)
                 if writer is not None:
