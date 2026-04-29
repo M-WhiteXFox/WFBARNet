@@ -24,6 +24,16 @@ class PoseBranch:
     input_size: tuple[int, int] = (192, 256)
     conf_thr: float = 0.3
     max_persons: int = 2
+    yolo_imgsz: int | None = None
+    yolo_crop_pose: bool = False
+    yolo_crop_imgsz: int | None = None
+    yolo_crop_padding: float = 0.25
+    yolo_crop_min_box_conf: float = 0.45
+    yolo_max_pose_crops: int | None = None
+    yolo_court_filter: bool = False
+    yolo_court_required: bool = False
+    yolo_court_margin: float = 30.0
+    yolo_person_model_weight: str | None = None
 
     def __post_init__(self) -> None:
         self.device = resolve_device(self.device)
@@ -48,6 +58,16 @@ class PoseBranch:
                 device=self.device,
                 conf_thr=self.conf_thr,
                 max_persons=self.max_persons,
+                imgsz=self.yolo_imgsz,
+                crop_pose=self.yolo_crop_pose,
+                crop_imgsz=self.yolo_crop_imgsz,
+                crop_padding=self.yolo_crop_padding,
+                crop_min_box_conf=self.yolo_crop_min_box_conf,
+                max_pose_crops=self.yolo_max_pose_crops,
+                court_filter=self.yolo_court_filter,
+                court_required=self.yolo_court_required,
+                court_margin=self.yolo_court_margin,
+                person_model_weight=self.yolo_person_model_weight,
             )
             return
 
@@ -56,9 +76,9 @@ class PoseBranch:
             "Supported values are 'mmpose', 'dummy', and 'yolo26s-pose'."
         )
 
-    def infer(self, image: np.ndarray) -> list[PersonPoseResult]:
+    def infer(self, image: np.ndarray, court_prediction: object | None = None) -> list[PersonPoseResult]:
         _, meta = preprocess_pose_frame(image, self.input_size, self.device)
-        raw_items = self.backend_impl.infer(image)
+        raw_items = self.backend_impl.infer(image, court_prediction=court_prediction)
         outputs: list[PersonPoseResult] = []
         for idx, item in enumerate(raw_items):
             outputs.append(

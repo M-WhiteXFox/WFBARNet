@@ -114,11 +114,17 @@ class CourtPoseTargetTracker:
         court_margin: float = 30.0,
         detection_smoothing: float = 0.68,
         velocity_smoothing: float = 0.55,
+        court_required: bool = False,
+        predict_missing_motion: bool = True,
+        motion_prediction_scale: float = 1.0,
     ) -> None:
         self.max_missing_frames = max(0, int(max_missing_frames))
         self.court_margin = max(0.0, float(court_margin))
         self.detection_smoothing = min(1.0, max(0.0, float(detection_smoothing)))
         self.velocity_smoothing = min(1.0, max(0.0, float(velocity_smoothing)))
+        self.court_required = bool(court_required)
+        self.predict_missing_motion = bool(predict_missing_motion)
+        self.motion_prediction_scale = min(1.0, max(0.0, float(motion_prediction_scale)))
         self._tracks = {half: _PoseTrack(half=half) for half in COURT_HALF_ORDER}
 
     def reset(self) -> None:
@@ -134,6 +140,9 @@ class CourtPoseTargetTracker:
     ) -> list[PersonPoseResult]:
         image_to_court_h = _extract_image_to_court_h(court_prediction)
         if image_to_court_h is None:
+            if self.court_required:
+                self.reset()
+                return []
             self._update_without_court(detections, frame_shape=frame_shape)
             return self._active_outputs()
 
@@ -145,6 +154,12 @@ class CourtPoseTargetTracker:
                 self._predict_track(track, frame_shape=frame_shape)
             else:
                 self._correct_track(track, candidate, frame_shape=frame_shape)
+            if track.pose is not None and not _pose_is_in_court_area(
+                track.pose,
+                image_to_court_h,
+                self.court_margin,
+            ):
+                self._clear_track(track)
         return self._active_outputs()
 
     def _split_detections_by_half(
@@ -178,9 +193,10 @@ class CourtPoseTargetTracker:
             track = self._tracks[half]
             if track.pose is None or not remaining:
                 continue
-            best = max(remaining, key=lambda pose: _track_match_score(track, pose))
-            assigned[half] = best
-            remaining.remove(best)
+            best = self._best_candidate_for_track(track, remaining)
+            if best is not None:
+                assigned[half] = best
+                remaining.remove(best)
 
         for half in COURT_HALF_ORDER:
             if half in assigned or not remaining:
@@ -208,7 +224,16 @@ class CourtPoseTargetTracker:
             return None
         if track.pose is None or track.missed_frames > self.max_missing_frames:
             return max(candidates, key=lambda pose: float(pose.person_score))
-        return max(candidates, key=lambda pose: _track_match_score(track, pose))
+        prediction_steps = self._prediction_steps_for_match(track)
+        ranked = sorted(
+            candidates,
+            key=lambda pose: _track_match_score(track, pose, prediction_steps=prediction_steps),
+            reverse=True,
+        )
+        for candidate in ranked:
+            if _track_match_allowed(track, candidate, prediction_steps=prediction_steps):
+                return candidate
+        return None
 
     def _correct_track(
         self,
@@ -227,12 +252,24 @@ class CourtPoseTargetTracker:
 
         previous_center = np.array(_bbox_center(track.pose.bbox), dtype=np.float64)
         detection_center = np.array(_bbox_center(detection.bbox), dtype=np.float64)
-        observed_velocity = detection_center - previous_center
+        elapsed_frames = max(1.0, float(track.missed_frames + 1))
+        observed_velocity = (detection_center - previous_center) / elapsed_frames
         current_velocity = np.array(track.velocity_xy, dtype=np.float64)
         velocity = self.velocity_smoothing * current_velocity + (1.0 - self.velocity_smoothing) * observed_velocity
+        velocity = _limit_velocity(velocity, detection.bbox)
 
-        predicted_pose = _shift_pose(track.pose, track.velocity_xy[0], track.velocity_xy[1], frame_shape)
-        track.pose = _blend_pose(predicted_pose, detection, self.detection_smoothing, frame_shape)
+        base_pose = (
+            _shift_pose(
+                track.pose,
+                track.velocity_xy[0] * self.motion_prediction_scale,
+                track.velocity_xy[1] * self.motion_prediction_scale,
+                frame_shape,
+            )
+            if self.predict_missing_motion
+            else track.pose
+        )
+        detection_alpha = _adaptive_detection_alpha(detection, self.detection_smoothing)
+        track.pose = _blend_pose(base_pose, detection, detection_alpha, frame_shape)
         track.velocity_xy = (float(velocity[0]), float(velocity[1]))
         track.missed_frames = 0
         track.age += 1
@@ -252,10 +289,26 @@ class CourtPoseTargetTracker:
             return
 
         dx, dy = track.velocity_xy
-        track.pose = _shift_pose(track.pose, dx, dy, frame_shape)
+        if self.predict_missing_motion:
+            track.pose = _shift_pose(
+                track.pose,
+                dx * self.motion_prediction_scale,
+                dy * self.motion_prediction_scale,
+                frame_shape,
+            )
         track.pose.person_score = max(0.01, float(track.pose.person_score) * 0.96)
         track.velocity_xy = (dx * 0.88, dy * 0.88)
         track.age += 1
+
+    def _clear_track(self, track: _PoseTrack) -> None:
+        track.pose = None
+        track.velocity_xy = (0.0, 0.0)
+        track.missed_frames = self.max_missing_frames + 1
+
+    def _prediction_steps_for_match(self, track: _PoseTrack) -> float:
+        if self.predict_missing_motion:
+            return self.motion_prediction_scale
+        return float(max(1, track.missed_frames + 1))
 
     def _active_outputs(self) -> list[PersonPoseResult]:
         outputs: list[PersonPoseResult] = []
@@ -327,6 +380,20 @@ def _court_half(court_xy: tuple[float, float], margin: float) -> str | None:
     return "top" if y < COURT_NET_Y else "bottom"
 
 
+def _pose_is_in_court_area(
+    pose: PersonPoseResult,
+    image_to_court_h: np.ndarray,
+    margin: float,
+) -> bool:
+    anchor = _pose_anchor_point(pose)
+    if anchor is None:
+        return False
+    court_xy = _project_image_point(image_to_court_h, anchor)
+    if court_xy is None:
+        return False
+    return _court_half(court_xy, margin) is not None
+
+
 def _pose_half_score(pose: PersonPoseResult, court_xy: tuple[float, float]) -> float:
     x, y = court_xy
     outside = max(0.0, -x, x - COURT_WIDTH, -y, y - COURT_LENGTH)
@@ -351,17 +418,75 @@ def _copy_pose(pose: PersonPoseResult, *, person_id: int | None = None) -> Perso
     )
 
 
-def _track_match_score(track: _PoseTrack, detection: PersonPoseResult) -> float:
+def _track_match_score(
+    track: _PoseTrack,
+    detection: PersonPoseResult,
+    *,
+    prediction_steps: float = 1.0,
+) -> float:
     if track.pose is None:
         return float(detection.person_score)
-    predicted_bbox = _shift_bbox(track.pose.bbox, track.velocity_xy[0], track.velocity_xy[1])
+    dx = track.velocity_xy[0] * max(0.0, float(prediction_steps))
+    dy = track.velocity_xy[1] * max(0.0, float(prediction_steps))
+    predicted_bbox = _shift_bbox(track.pose.bbox, dx, dy)
     iou = _bbox_iou(predicted_bbox, detection.bbox)
     predicted_center = np.array(_bbox_center(predicted_bbox), dtype=np.float64)
     detection_center = np.array(_bbox_center(detection.bbox), dtype=np.float64)
     center_distance = float(np.linalg.norm(detection_center - predicted_center))
-    scale = max(_bbox_diagonal(predicted_bbox), _bbox_diagonal(detection.bbox), 32.0)
+    scale = _match_distance_limit(predicted_bbox, detection.bbox, track.missed_frames)
     distance_penalty = center_distance / scale
     return float(detection.person_score) + iou * 1.2 - distance_penalty * 0.35
+
+
+def _track_match_allowed(
+    track: _PoseTrack,
+    detection: PersonPoseResult,
+    *,
+    prediction_steps: float = 1.0,
+) -> bool:
+    if track.pose is None:
+        return True
+    dx = track.velocity_xy[0] * max(0.0, float(prediction_steps))
+    dy = track.velocity_xy[1] * max(0.0, float(prediction_steps))
+    predicted_bbox = _shift_bbox(track.pose.bbox, dx, dy)
+    iou = _bbox_iou(predicted_bbox, detection.bbox)
+    predicted_center = np.array(_bbox_center(predicted_bbox), dtype=np.float64)
+    detection_center = np.array(_bbox_center(detection.bbox), dtype=np.float64)
+    center_distance = float(np.linalg.norm(detection_center - predicted_center))
+    limit = _match_distance_limit(predicted_bbox, detection.bbox, track.missed_frames)
+    return center_distance <= limit or (iou >= 0.08 and center_distance <= limit * 1.35)
+
+
+def _match_distance_limit(
+    previous_bbox: list[float],
+    detection_bbox: list[float],
+    missed_frames: int,
+) -> float:
+    height = max(_bbox_height(previous_bbox), _bbox_height(detection_bbox), 1.0)
+    width = max(_bbox_width(previous_bbox), _bbox_width(detection_bbox), 1.0)
+    base = max(24.0, min(150.0, max(height * 0.75, width * 2.0)))
+    gap_bonus = min(max(0, int(missed_frames)), 4) * 12.0
+    return base + gap_bonus
+
+
+def _adaptive_detection_alpha(detection: PersonPoseResult, base_alpha: float) -> float:
+    alpha = min(1.0, max(0.0, float(base_alpha)))
+    diagonal = _bbox_diagonal(detection.bbox)
+    if diagonal < 90.0:
+        return min(alpha, 0.62)
+    if diagonal < 140.0:
+        return min(alpha, 0.70)
+    return alpha
+
+
+def _limit_velocity(velocity: np.ndarray, bbox: list[float]) -> np.ndarray:
+    speed = float(np.linalg.norm(velocity))
+    if speed <= 1e-6:
+        return velocity
+    limit = max(4.0, min(48.0, _bbox_diagonal(bbox) * 0.32))
+    if speed <= limit:
+        return velocity
+    return velocity * (limit / speed)
 
 
 def _blend_pose(
@@ -473,6 +598,14 @@ def _bbox_diagonal(bbox: list[float]) -> float:
     width = max(0.0, float(bbox[2]) - float(bbox[0]))
     height = max(0.0, float(bbox[3]) - float(bbox[1]))
     return float(np.hypot(width, height))
+
+
+def _bbox_width(bbox: list[float]) -> float:
+    return max(0.0, float(bbox[2]) - float(bbox[0]))
+
+
+def _bbox_height(bbox: list[float]) -> float:
+    return max(0.0, float(bbox[3]) - float(bbox[1]))
 
 
 def _bbox_iou(a: list[float], b: list[float]) -> float:

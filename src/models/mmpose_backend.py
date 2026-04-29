@@ -55,7 +55,8 @@ class MMPoseBackend:
         except Exception as exc:
             raise RuntimeError(f"Failed to initialize MMPose backend: {exc}") from exc
 
-    def infer(self, image: np.ndarray) -> list[MMPoseInferenceItem]:
+    def infer(self, image: np.ndarray, court_prediction: object | None = None) -> list[MMPoseInferenceItem]:
+        del court_prediction
         h, w = image.shape[:2]
         if self.model is None:
             bbox = [0.0, 0.0, float(w), float(h)]

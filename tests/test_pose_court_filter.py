@@ -70,6 +70,62 @@ class PoseCourtFilterTest(unittest.TestCase):
         self.assertEqual(len(predicted), 1)
         self.assertAlmostEqual(predicted[0].bbox[0], 270.0)
 
+    def test_tracker_can_hold_missing_gap_without_motion_prediction(self) -> None:
+        tracker = CourtPoseTargetTracker(
+            max_missing_frames=3,
+            detection_smoothing=1.0,
+            velocity_smoothing=0.0,
+            predict_missing_motion=False,
+        )
+
+        tracker.update([_pose(0, [250.0, 140.0, 350.0, 500.0], 0.8)], self.court)
+        second = tracker.update([_pose(1, [260.0, 140.0, 360.0, 500.0], 0.8)], self.court)
+        predicted = tracker.update([], self.court)
+
+        self.assertEqual(len(predicted), 1)
+        self.assertAlmostEqual(predicted[0].bbox[0], second[0].bbox[0])
+
+    def test_tracker_can_use_scaled_missing_motion_prediction(self) -> None:
+        tracker = CourtPoseTargetTracker(
+            max_missing_frames=3,
+            detection_smoothing=1.0,
+            velocity_smoothing=0.0,
+            motion_prediction_scale=0.5,
+        )
+
+        tracker.update([_pose(0, [250.0, 140.0, 350.0, 500.0], 0.8)], self.court)
+        tracker.update([_pose(1, [260.0, 140.0, 360.0, 500.0], 0.8)], self.court)
+        predicted = tracker.update([], self.court)
+
+        self.assertEqual(len(predicted), 1)
+        self.assertAlmostEqual(predicted[0].bbox[0], 265.0)
+
+    def test_tracker_accepts_reasonable_fast_motion_in_same_half(self) -> None:
+        tracker = CourtPoseTargetTracker(
+            max_missing_frames=2,
+            detection_smoothing=1.0,
+            velocity_smoothing=0.0,
+        )
+
+        tracker.update([_pose(0, [280.0, 120.0, 330.0, 260.0], 0.8)], self.court)
+        result = tracker.update([_pose(1, [350.0, 120.0, 400.0, 260.0], 0.86)], self.court)
+
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result[0].bbox[0], 350.0)
+
+    def test_tracker_rejects_large_jump_candidate_in_same_half(self) -> None:
+        tracker = CourtPoseTargetTracker(
+            max_missing_frames=2,
+            detection_smoothing=1.0,
+            velocity_smoothing=0.0,
+        )
+
+        tracker.update([_pose(0, [280.0, 120.0, 330.0, 260.0], 0.8)], self.court)
+        result = tracker.update([_pose(1, [520.0, 120.0, 570.0, 260.0], 0.99)], self.court)
+
+        self.assertEqual(len(result), 1)
+        self.assertLess(result[0].bbox[0], 330.0)
+
     def test_tracker_expires_after_missing_limit(self) -> None:
         tracker = CourtPoseTargetTracker(max_missing_frames=1)
 
@@ -85,6 +141,27 @@ class PoseCourtFilterTest(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertGreater(result[0].bbox[0], 200.0)
+
+    def test_tracker_can_require_valid_court(self) -> None:
+        tracker = CourtPoseTargetTracker(max_missing_frames=2, court_required=True)
+
+        result = tracker.update([_pose(0, [250.0, 140.0, 350.0, 500.0], 0.8)], {"valid": False})
+
+        self.assertEqual(result, [])
+
+    def test_tracker_clears_prediction_outside_court_margin(self) -> None:
+        tracker = CourtPoseTargetTracker(
+            max_missing_frames=3,
+            court_margin=0.0,
+            detection_smoothing=1.0,
+            velocity_smoothing=0.0,
+        )
+
+        tracker.update([_pose(0, [500.0, 720.0, 580.0, 900.0], 0.8)], self.court)
+        tracker.update([_pose(1, [550.0, 720.0, 630.0, 900.0], 0.8)], self.court)
+        result = tracker.update([], self.court)
+
+        self.assertEqual(result, [])
 
 
 if __name__ == "__main__":

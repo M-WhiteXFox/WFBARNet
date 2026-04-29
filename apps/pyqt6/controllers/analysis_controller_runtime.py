@@ -30,6 +30,14 @@ DISPLAY_FPS_LIMIT = 60.0
 METRICS_UPDATE_INTERVAL_S = 0.25
 PLAYBACK_LAG_TOLERANCE_FRAMES = 1.5
 POSE_CANDIDATE_LIMIT = 12
+POSE_COURT_MARGIN_CM = 30.0
+POSE_MAX_MISSING_SECONDS = 0.35
+POSE_INFERENCE_STRIDE = 2
+POSE_YOLO_IMGSZ = 960
+POSE_CROP_IMGSZ = 640
+POSE_CROP_PADDING = 0.30
+POSE_CROP_MIN_BOX_CONF = 0.45
+POSE_MAX_CROPS = 8
 
 
 @contextmanager
@@ -284,7 +292,15 @@ class TrackNetPlaybackWorker(QThread):
         ema_infer_fps = 0.0
         last_pose = []
         track_filter = BallTrackFilter(fps=fps)
-        pose_tracker = CourtPoseTargetTracker(max_missing_frames=int(round(fps * 0.8)))
+        pose_tracker = CourtPoseTargetTracker(
+            max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
+            court_margin=POSE_COURT_MARGIN_CM,
+            detection_smoothing=0.78,
+            velocity_smoothing=0.50,
+            court_required=True,
+            predict_missing_motion=True,
+            motion_prediction_scale=0.55,
+        )
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=3.0)
         display_interval_ms = 1000.0 / self._display_fps_limit
         display_every_frame = fps <= self._display_fps_limit
@@ -310,7 +326,7 @@ class TrackNetPlaybackWorker(QThread):
 
                 if self._pose_enabled:
                     detections = (
-                        self._pose_branch.infer(current_frame)
+                        self._pose_branch.infer(current_frame, court_prediction=court_prediction)
                         if processed_frames % self._pose_stride == 0
                         else []
                     )
@@ -491,7 +507,15 @@ class CameraInferenceWorker(QThread):
         ema_infer_fps = 0.0
         last_pose = []
         track_filter = BallTrackFilter(fps=fps)
-        pose_tracker = CourtPoseTargetTracker(max_missing_frames=int(round(fps * 0.8)))
+        pose_tracker = CourtPoseTargetTracker(
+            max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
+            court_margin=POSE_COURT_MARGIN_CM,
+            detection_smoothing=0.78,
+            velocity_smoothing=0.50,
+            court_required=True,
+            predict_missing_motion=True,
+            motion_prediction_scale=0.55,
+        )
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=3.0)
         display_interval_ms = 1000.0 / self._display_fps_limit
         next_display_ms = 0.0
@@ -516,7 +540,7 @@ class CameraInferenceWorker(QThread):
 
                 if self._pose_enabled:
                     detections = (
-                        self._pose_branch.infer(current_frame)
+                        self._pose_branch.infer(current_frame, court_prediction=court_prediction)
                         if processed_frames % self._pose_stride == 0
                         else []
                     )
@@ -742,6 +766,15 @@ class MainController:
             device=device,
             conf_thr=0.35,
             max_persons=POSE_CANDIDATE_LIMIT,
+            yolo_imgsz=POSE_YOLO_IMGSZ,
+            yolo_crop_pose=True,
+            yolo_crop_imgsz=POSE_CROP_IMGSZ,
+            yolo_crop_padding=POSE_CROP_PADDING,
+            yolo_crop_min_box_conf=POSE_CROP_MIN_BOX_CONF,
+            yolo_max_pose_crops=POSE_MAX_CROPS,
+            yolo_court_filter=True,
+            yolo_court_required=True,
+            yolo_court_margin=POSE_COURT_MARGIN_CM,
         )
 
     def _bind_events(self) -> None:
@@ -1089,7 +1122,7 @@ class MainController:
             camera_index,
             self._track_branch,
             self._pose_branch,
-            pose_stride=3,
+            pose_stride=POSE_INFERENCE_STRIDE,
             track_enabled=self._track_model_enabled,
             pose_enabled=self._pose_model_enabled,
             court_service=self._court_service,
@@ -1118,7 +1151,7 @@ class MainController:
             self._track_branch,
             self._pose_branch,
             start_ms=start_ms,
-            pose_stride=3,
+            pose_stride=POSE_INFERENCE_STRIDE,
             track_enabled=self._track_model_enabled,
             pose_enabled=self._pose_model_enabled,
             court_service=self._court_service,
