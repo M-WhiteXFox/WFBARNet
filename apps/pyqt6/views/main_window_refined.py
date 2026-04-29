@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRectF, QSize, Qt, pyqtProperty, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QPainter
+from PyQt6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, pyqtProperty, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -97,6 +97,85 @@ class ToggleSwitch(QCheckBox):
         knob_rect = QRectF(knob_x, 3, knob_size, knob_size)
         painter.setBrush(QColor("#FFFFFF"))
         painter.drawEllipse(knob_rect)
+
+
+class BadmintonCourtWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("badmintonCourtPreview")
+        self.setMinimumSize(320, 220)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def sizeHint(self) -> QSize:
+        return QSize(420, 280)
+
+    def paintEvent(self, event) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        bounds = self.rect().adjusted(8, 8, -8, -8)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#0F5F3A"))
+        painter.drawRoundedRect(QRectF(bounds), 8, 8)
+
+        court = self._court_rect(bounds)
+        painter.setPen(QPen(QColor("#F8FAFC"), max(2, round(court.width() * 0.006))))
+        painter.setBrush(QColor("#15803D"))
+        painter.drawRect(court)
+
+        line_width = max(2, round(court.width() * 0.005))
+        painter.setPen(QPen(QColor("#FFFFFF"), line_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.SquareCap))
+        self._draw_court_lines(painter, court)
+
+    def _court_rect(self, bounds) -> QRectF:
+        target_ratio = 6.10 / 13.40
+        width = float(bounds.width())
+        height = width / target_ratio
+        if height > bounds.height():
+            height = float(bounds.height())
+            width = height * target_ratio
+
+        x = bounds.x() + (bounds.width() - width) / 2.0
+        y = bounds.y() + (bounds.height() - height) / 2.0
+        return QRectF(x, y, width, height)
+
+    def _draw_court_lines(self, painter: QPainter, court: QRectF) -> None:
+        left = court.left()
+        right = court.right()
+        top = court.top()
+        bottom = court.bottom()
+        width = court.width()
+        height = court.height()
+        center_x = court.center().x()
+        center_y = court.center().y()
+
+        singles_margin = width * ((6.10 - 5.18) / 6.10) / 2.0
+        back_service_margin = height * 0.057
+        short_service_offset = height * 0.293
+
+        singles_left = left + singles_margin
+        singles_right = right - singles_margin
+        back_top = top + back_service_margin
+        back_bottom = bottom - back_service_margin
+        service_top = center_y - short_service_offset
+        service_bottom = center_y + short_service_offset
+
+        painter.drawRect(court)
+        self._draw_line(painter, left, center_y, right, center_y)
+
+        self._draw_line(painter, singles_left, top, singles_left, bottom)
+        self._draw_line(painter, singles_right, top, singles_right, bottom)
+        self._draw_line(painter, left, back_top, right, back_top)
+        self._draw_line(painter, left, back_bottom, right, back_bottom)
+        self._draw_line(painter, left, service_top, right, service_top)
+        self._draw_line(painter, left, service_bottom, right, service_bottom)
+
+        self._draw_line(painter, center_x, top, center_x, service_top)
+        self._draw_line(painter, center_x, service_bottom, center_x, bottom)
+
+    def _draw_line(self, painter: QPainter, x1: float, y1: float, x2: float, y2: float) -> None:
+        painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
 
 class MainWindow(QMainWindow):
@@ -325,34 +404,35 @@ class MainWindow(QMainWindow):
     def _build_analytics_panel(self, body_layout: QHBoxLayout) -> None:
         analytics_panel = QFrame()
         analytics_panel.setObjectName("analyticsCard")
-        analytics_layout = QVBoxLayout(analytics_panel)
+        analytics_layout = QHBoxLayout(analytics_panel)
         analytics_layout.setContentsMargins(18, 18, 18, 18)
         analytics_layout.setSpacing(14)
 
-        metrics_grid = QGridLayout()
-        metrics_grid.setHorizontalSpacing(12)
-        metrics_grid.setVerticalSpacing(12)
+        metrics_column = QVBoxLayout()
+        metrics_column.setSpacing(12)
 
         card1, self.lbl_realtime_fps = self._create_metric_card("实时帧数", "0.0 FPS")
         card2, self.lbl_avg_conf = self._create_metric_card("平均置信度", "0.0%")
         card3, self.lbl_valid_pose = self._create_metric_card("推理 FPS", "0.0 FPS")
         card4, self.lbl_valid_track = self._create_metric_card("有效轨迹帧数", "0")
 
-        metrics_grid.addWidget(card1, 0, 0)
-        metrics_grid.addWidget(card2, 0, 1)
-        metrics_grid.addWidget(card3, 1, 0)
-        metrics_grid.addWidget(card4, 1, 1)
+        for card in (card1, card2, card3, card4):
+            card.setMinimumWidth(180)
+            card.setMaximumWidth(240)
+            metrics_column.addWidget(card, stretch=1)
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
+        self.tabs.setTabPosition(QTabWidget.TabPosition.North)
+        self.tabs.setTabShape(QTabWidget.TabShape.Rounded)
 
         self._build_overview_tab()
         self._build_pose_tab()
         self._build_settings_tab()
         self._build_log_tab()
 
-        analytics_layout.addLayout(metrics_grid)
         analytics_layout.addWidget(self.tabs, stretch=1)
+        analytics_layout.addLayout(metrics_column, stretch=0)
         body_layout.addWidget(analytics_panel, stretch=5)
 
     def _build_overview_tab(self) -> None:
@@ -400,14 +480,11 @@ class MainWindow(QMainWindow):
 
         pose_title = QLabel("姿态与轨迹")
         pose_title.setObjectName("sectionTitle")
-        pose_info = QLabel("后续可接入骨架点可视化、球轨迹图和更细粒度的动作回放。")
-        pose_info.setObjectName("poseInfo")
-        pose_info.setWordWrap(True)
-        pose_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        court_widget = BadmintonCourtWidget()
 
         pose_frame_layout.addWidget(pose_title, alignment=Qt.AlignmentFlag.AlignCenter)
-        pose_frame_layout.addWidget(pose_info)
-        pose_layout.addWidget(pose_frame)
+        pose_frame_layout.addWidget(court_widget, stretch=1)
+        pose_layout.addWidget(pose_frame, stretch=1)
         self.tabs.addTab(tab_pose, "姿态")
 
     def _build_log_tab(self) -> None:

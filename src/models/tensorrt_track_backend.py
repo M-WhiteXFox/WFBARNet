@@ -38,6 +38,8 @@ class TensorRTTrackBackend:
     _use_io_tensor_api: bool = field(init=False)
     _input_index: int = field(init=False, default=-1)
     _output_index: int = field(init=False, default=-1)
+    _torch_device: torch.device = field(init=False, repr=False)
+    _stream: torch.cuda.Stream = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not torch.cuda.is_available():
@@ -46,6 +48,9 @@ class TensorRTTrackBackend:
             raise RuntimeError("TensorRT engine inference requires device='cuda' or 'cuda:N'.")
         if not Path(self.engine_path).is_file():
             raise FileNotFoundError(f"TensorRT engine file not found: {self.engine_path}")
+
+        self._torch_device = torch.device(self.device)
+        self._stream = torch.cuda.Stream(device=self._torch_device)
 
         try:
             import tensorrt as trt  # type: ignore
@@ -141,26 +146,33 @@ class TensorRTTrackBackend:
             tensor = tensor.to(dtype=dtype)
         return tensor.contiguous()
 
+    def stream_context(self) -> Any:
+        return torch.cuda.stream(self._stream)
+
     @torch.inference_mode()
     def infer(self, tensor: torch.Tensor) -> np.ndarray:
         tensor = self._prepare_input(tensor)
-        stream = torch.cuda.current_stream(device=tensor.device)
+        producer_stream = torch.cuda.current_stream(device=tensor.device)
+        stream = self._stream
+        if producer_stream.cuda_stream != stream.cuda_stream:
+            stream.wait_stream(producer_stream)
 
-        if self._use_io_tensor_api:
-            if hasattr(self.context, "set_input_shape"):
-                self.context.set_input_shape(self.input_name, tuple(tensor.shape))
-            self.context.set_tensor_address(self.input_name, int(tensor.data_ptr()))
-            output = torch.empty(self._output_shape(), device=tensor.device, dtype=self._output_dtype())
-            self.context.set_tensor_address(self.output_name, int(output.data_ptr()))
-            ok = self.context.execute_async_v3(stream_handle=stream.cuda_stream)
-        else:
-            if self.engine.is_shape_binding(self._input_index) or any(dim < 0 for dim in self.engine.get_binding_shape(self._input_index)):
-                self.context.set_binding_shape(self._input_index, tuple(tensor.shape))
-            output = torch.empty(self._output_shape(), device=tensor.device, dtype=self._output_dtype())
-            bindings = [0] * self.engine.num_bindings
-            bindings[self._input_index] = int(tensor.data_ptr())
-            bindings[self._output_index] = int(output.data_ptr())
-            ok = self.context.execute_async_v2(bindings=bindings, stream_handle=stream.cuda_stream)
+        with torch.cuda.stream(stream):
+            if self._use_io_tensor_api:
+                if hasattr(self.context, "set_input_shape"):
+                    self.context.set_input_shape(self.input_name, tuple(tensor.shape))
+                self.context.set_tensor_address(self.input_name, int(tensor.data_ptr()))
+                output = torch.empty(self._output_shape(), device=tensor.device, dtype=self._output_dtype())
+                self.context.set_tensor_address(self.output_name, int(output.data_ptr()))
+                ok = self.context.execute_async_v3(stream_handle=stream.cuda_stream)
+            else:
+                if self.engine.is_shape_binding(self._input_index) or any(dim < 0 for dim in self.engine.get_binding_shape(self._input_index)):
+                    self.context.set_binding_shape(self._input_index, tuple(tensor.shape))
+                output = torch.empty(self._output_shape(), device=tensor.device, dtype=self._output_dtype())
+                bindings = [0] * self.engine.num_bindings
+                bindings[self._input_index] = int(tensor.data_ptr())
+                bindings[self._output_index] = int(output.data_ptr())
+                ok = self.context.execute_async_v2(bindings=bindings, stream_handle=stream.cuda_stream)
 
         if not ok:
             raise RuntimeError("TensorRT engine execution failed.")
