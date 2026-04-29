@@ -77,8 +77,10 @@ class PoseBranch:
         )
 
     def infer(self, image: np.ndarray, court_prediction: object | None = None) -> list[PersonPoseResult]:
-        _, meta = preprocess_pose_frame(image, self.input_size, self.device)
         raw_items = self.backend_impl.infer(image, court_prediction=court_prediction)
+        meta = None
+        if any(item.coordinate_space == "resized" for item in raw_items):
+            _, meta = preprocess_pose_frame(image, self.input_size, self.device)
         outputs: list[PersonPoseResult] = []
         for idx, item in enumerate(raw_items):
             outputs.append(

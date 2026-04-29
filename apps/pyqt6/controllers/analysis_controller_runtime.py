@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import os
 from pathlib import Path
@@ -308,112 +309,113 @@ class TrackNetPlaybackWorker(QThread):
 
         clock = QElapsedTimer()
         clock.start()
+        parallel_inference = (
+            self._track_enabled
+            and self._pose_enabled
+            and getattr(self._track_branch, "backend_name", "") == "tensorrt"
+        )
 
         try:
-            while not self._stop_requested:
-                loop_start = perf_counter()
-                if self._track_enabled:
-                    raw_track = self._track_branch.infer_result([prev_frame, current_frame, next_frame])
-                    track = track_filter.update(raw_track, frame_shape=current_frame.shape)
-                else:
-                    track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wfb-playback-infer") as infer_executor:
+                while not self._stop_requested:
+                    loop_start = perf_counter()
+                    frame_id = int(round((current_ms / 1000.0) * fps)) if fps > 0 else processed_frames
+                    court_prediction = None
+                    if self._court_service is not None:
+                        self._court_service.submit_frame(current_frame, frame_id, current_ms)
+                        court_prediction = self._court_service.latest_prediction()
 
-                frame_id = int(round((current_ms / 1000.0) * fps)) if fps > 0 else processed_frames
-                court_prediction = None
-                if self._court_service is not None:
-                    self._court_service.submit_frame(current_frame, frame_id, current_ms)
-                    court_prediction = self._court_service.latest_prediction()
+                    pose_due = self._pose_enabled and processed_frames % self._pose_stride == 0
+                    run_parallel = parallel_inference and pose_due
+                    if run_parallel:
+                        track_future = infer_executor.submit(
+                            self._track_branch.infer_result,
+                            [prev_frame, current_frame, next_frame],
+                        )
+                        pose_future = infer_executor.submit(
+                            self._pose_branch.infer,
+                            current_frame,
+                            court_prediction=court_prediction,
+                        )
+                        raw_track = track_future.result()
+                        track = track_filter.update(raw_track, frame_shape=current_frame.shape)
+                        detections = pose_future.result()
+                    else:
+                        if self._track_enabled:
+                            raw_track = self._track_branch.infer_result([prev_frame, current_frame, next_frame])
+                            track = track_filter.update(raw_track, frame_shape=current_frame.shape)
+                        else:
+                            track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
+                        detections = (
+                            self._pose_branch.infer(current_frame, court_prediction=court_prediction)
+                            if pose_due
+                            else []
+                        )
 
-                if self._pose_enabled:
-                    detections = (
-                        self._pose_branch.infer(current_frame, court_prediction=court_prediction)
-                        if processed_frames % self._pose_stride == 0
-                        else []
-                    )
-                    last_pose = pose_tracker.update(
-                        detections,
-                        court_prediction,
-                        frame_shape=current_frame.shape,
-                    )
-                    pose_frames += int(bool(last_pose))
-                else:
-                    pose_tracker.reset()
-                    last_pose = []
+                    if self._pose_enabled:
+                        last_pose = pose_tracker.update(
+                            detections,
+                            court_prediction,
+                            frame_shape=current_frame.shape,
+                        )
+                        pose_frames += int(bool(last_pose))
+                    else:
+                        pose_tracker.reset()
+                        last_pose = []
 
-                infer_elapsed = max(perf_counter() - loop_start, 1e-6)
-                infer_fps = 1.0 / infer_elapsed
-                ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
+                    infer_elapsed = max(perf_counter() - loop_start, 1e-6)
+                    infer_fps = 1.0 / infer_elapsed
+                    ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
 
-                should_emit = display_every_frame or final_pass or current_ms >= next_display_ms
-                image = None
-                if should_emit:
-                    frame_result = FrameResult(frame_id=frame_id, pose=last_pose, track=track)
-                    vis_frame = current_frame.copy()
-                    trail_renderer.draw_on(vis_frame, frame_result, timestamp_ms=current_ms)
-                    image = frame_to_qimage(vis_frame)
+                    should_emit = display_every_frame or final_pass or current_ms >= next_display_ms
+                    image = None
+                    if should_emit:
+                        frame_result = FrameResult(frame_id=frame_id, pose=last_pose, track=track)
+                        vis_frame = current_frame.copy()
+                        trail_renderer.draw_on(vis_frame, frame_result, timestamp_ms=current_ms)
+                        image = frame_to_qimage(vis_frame)
 
-                target_ms = max(0, current_ms - base_ms)
-                if not self._sleep_until(target_ms, clock):
-                    break
+                    target_ms = max(0, current_ms - base_ms)
+                    if not self._sleep_until(target_ms, clock):
+                        break
 
-                processed_frames += 1
-                visible_frames += int(bool(track.visible))
-                score_sum += float(track.score)
-                avg_score = score_sum / max(processed_frames, 1)
-                if should_emit:
-                    payload = {
-                        "image": image,
-                        "frame_id": frame_id,
-                        "position_ms": current_ms,
-                        "duration_ms": duration_ms,
-                        "progress": (current_ms / duration_ms) if duration_ms > 0 else 0.0,
-                        "track": {
-                            "ball_xy": list(track.ball_xy),
-                            "visible": bool(track.visible),
-                            "score": float(track.score),
-                        },
-                        "visible_frames": visible_frames,
-                        "pose_frames": pose_frames,
-                        "person_count": len(last_pose),
-                        "avg_score": avg_score,
-                        "processed_frames": processed_frames,
-                        "infer_fps": ema_infer_fps,
-                        "court": court_prediction.to_dict() if court_prediction is not None else None,
-                    }
-                    self.frameReady.emit(payload)
-                    if not display_every_frame:
-                        while next_display_ms <= current_ms:
-                            next_display_ms += display_interval_ms
+                    processed_frames += 1
+                    visible_frames += int(bool(track.visible))
+                    score_sum += float(track.score)
+                    avg_score = score_sum / max(processed_frames, 1)
+                    if should_emit:
+                        payload = {
+                            "image": image,
+                            "frame_id": frame_id,
+                            "position_ms": current_ms,
+                            "duration_ms": duration_ms,
+                            "progress": (current_ms / duration_ms) if duration_ms > 0 else 0.0,
+                            "track": {
+                                "ball_xy": list(track.ball_xy),
+                                "visible": bool(track.visible),
+                                "score": float(track.score),
+                            },
+                            "visible_frames": visible_frames,
+                            "pose_frames": pose_frames,
+                            "person_count": len(last_pose),
+                            "avg_score": avg_score,
+                            "processed_frames": processed_frames,
+                            "infer_fps": ema_infer_fps,
+                            "court": court_prediction.to_dict() if court_prediction is not None else None,
+                        }
+                        self.frameReady.emit(payload)
+                        if not display_every_frame:
+                            while next_display_ms <= current_ms:
+                                next_display_ms += display_interval_ms
 
-                if final_pass:
-                    break
+                    if final_pass:
+                        break
 
-                prev_frame = current_frame
-                current_frame = next_frame
-                current_ms = next_ms
-
-                ok, incoming_frame, incoming_ms = self._read_frame(cap, processed_frames + 1, fps)
-                if ok:
-                    next_frame = incoming_frame
-                    next_ms = incoming_ms
-                else:
-                    next_frame = current_frame.copy()
-                    next_ms = current_ms + frame_interval_ms
-                    final_pass = True
-
-                lag_ms = clock.elapsed() - max(0, current_ms - base_ms)
-                max_lag_ms = frame_interval_ms * PLAYBACK_LAG_TOLERANCE_FRAMES
-                while not final_pass and lag_ms > max_lag_ms:
                     prev_frame = current_frame
                     current_frame = next_frame
                     current_ms = next_ms
-                    dropped_source_frames += 1
 
-                    ok, incoming_frame, incoming_ms = self._read_frame(
-                        cap,
-                        processed_frames + dropped_source_frames + 1,
-                        fps,
-                    )
+                    ok, incoming_frame, incoming_ms = self._read_frame(cap, processed_frames + 1, fps)
                     if ok:
                         next_frame = incoming_frame
                         next_ms = incoming_ms
@@ -421,8 +423,29 @@ class TrackNetPlaybackWorker(QThread):
                         next_frame = current_frame.copy()
                         next_ms = current_ms + frame_interval_ms
                         final_pass = True
-                        break
+
                     lag_ms = clock.elapsed() - max(0, current_ms - base_ms)
+                    max_lag_ms = frame_interval_ms * PLAYBACK_LAG_TOLERANCE_FRAMES
+                    while not final_pass and lag_ms > max_lag_ms:
+                        prev_frame = current_frame
+                        current_frame = next_frame
+                        current_ms = next_ms
+                        dropped_source_frames += 1
+
+                        ok, incoming_frame, incoming_ms = self._read_frame(
+                            cap,
+                            processed_frames + dropped_source_frames + 1,
+                            fps,
+                        )
+                        if ok:
+                            next_frame = incoming_frame
+                            next_ms = incoming_ms
+                        else:
+                            next_frame = current_frame.copy()
+                            next_ms = current_ms + frame_interval_ms
+                            final_pass = True
+                            break
+                        lag_ms = clock.elapsed() - max(0, current_ms - base_ms)
         finally:
             cap.release()
 
@@ -521,82 +544,104 @@ class CameraInferenceWorker(QThread):
         next_display_ms = 0.0
         clock = QElapsedTimer()
         clock.start()
+        parallel_inference = (
+            self._track_enabled
+            and self._pose_enabled
+            and getattr(self._track_branch, "backend_name", "") == "tensorrt"
+        )
 
         try:
-            while not self._stop_requested:
-                loop_start = perf_counter()
-                if self._track_enabled:
-                    raw_track = self._track_branch.infer_result([prev_frame, current_frame, next_frame])
-                    track = track_filter.update(raw_track, frame_shape=current_frame.shape)
-                else:
-                    track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wfb-camera-infer") as infer_executor:
+                while not self._stop_requested:
+                    loop_start = perf_counter()
+                    current_frame_id = processed_frames
+                    position_ms = clock.elapsed()
+                    court_prediction = None
+                    if self._court_service is not None:
+                        self._court_service.submit_frame(current_frame, current_frame_id, position_ms)
+                        court_prediction = self._court_service.latest_prediction()
 
-                current_frame_id = processed_frames
-                position_ms = clock.elapsed()
-                court_prediction = None
-                if self._court_service is not None:
-                    self._court_service.submit_frame(current_frame, current_frame_id, position_ms)
-                    court_prediction = self._court_service.latest_prediction()
+                    pose_due = self._pose_enabled and processed_frames % self._pose_stride == 0
+                    run_parallel = parallel_inference and pose_due
+                    if run_parallel:
+                        track_future = infer_executor.submit(
+                            self._track_branch.infer_result,
+                            [prev_frame, current_frame, next_frame],
+                        )
+                        pose_future = infer_executor.submit(
+                            self._pose_branch.infer,
+                            current_frame,
+                            court_prediction=court_prediction,
+                        )
+                        raw_track = track_future.result()
+                        track = track_filter.update(raw_track, frame_shape=current_frame.shape)
+                        detections = pose_future.result()
+                    else:
+                        if self._track_enabled:
+                            raw_track = self._track_branch.infer_result([prev_frame, current_frame, next_frame])
+                            track = track_filter.update(raw_track, frame_shape=current_frame.shape)
+                        else:
+                            track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
+                        detections = (
+                            self._pose_branch.infer(current_frame, court_prediction=court_prediction)
+                            if pose_due
+                            else []
+                        )
 
-                if self._pose_enabled:
-                    detections = (
-                        self._pose_branch.infer(current_frame, court_prediction=court_prediction)
-                        if processed_frames % self._pose_stride == 0
-                        else []
-                    )
-                    last_pose = pose_tracker.update(
-                        detections,
-                        court_prediction,
-                        frame_shape=current_frame.shape,
-                    )
-                    pose_frames += int(bool(last_pose))
-                else:
-                    pose_tracker.reset()
-                    last_pose = []
+                    if self._pose_enabled:
+                        last_pose = pose_tracker.update(
+                            detections,
+                            court_prediction,
+                            frame_shape=current_frame.shape,
+                        )
+                        pose_frames += int(bool(last_pose))
+                    else:
+                        pose_tracker.reset()
+                        last_pose = []
 
-                infer_elapsed = max(perf_counter() - loop_start, 1e-6)
-                infer_fps = 1.0 / infer_elapsed
-                ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
+                    infer_elapsed = max(perf_counter() - loop_start, 1e-6)
+                    infer_fps = 1.0 / infer_elapsed
+                    ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
 
-                processed_frames += 1
-                visible_frames += int(bool(track.visible))
-                score_sum += float(track.score)
-                avg_score = score_sum / max(processed_frames, 1)
-                if position_ms >= next_display_ms:
-                    frame_result = FrameResult(frame_id=current_frame_id, pose=last_pose, track=track)
-                    vis_frame = current_frame.copy()
-                    trail_renderer.draw_on(vis_frame, frame_result, timestamp_ms=position_ms)
-                    image = frame_to_qimage(vis_frame)
+                    processed_frames += 1
+                    visible_frames += int(bool(track.visible))
+                    score_sum += float(track.score)
+                    avg_score = score_sum / max(processed_frames, 1)
+                    if position_ms >= next_display_ms:
+                        frame_result = FrameResult(frame_id=current_frame_id, pose=last_pose, track=track)
+                        vis_frame = current_frame.copy()
+                        trail_renderer.draw_on(vis_frame, frame_result, timestamp_ms=position_ms)
+                        image = frame_to_qimage(vis_frame)
 
-                    payload = {
-                        "image": image,
-                        "frame_id": current_frame_id,
-                        "position_ms": position_ms,
-                        "duration_ms": 0,
-                        "progress": 0.0,
-                        "track": {
-                            "ball_xy": list(track.ball_xy),
-                            "visible": bool(track.visible),
-                            "score": float(track.score),
-                        },
-                        "visible_frames": visible_frames,
-                        "pose_frames": pose_frames,
-                        "person_count": len(last_pose),
-                        "avg_score": avg_score,
-                        "processed_frames": processed_frames,
-                        "infer_fps": ema_infer_fps,
-                        "court": court_prediction.to_dict() if court_prediction is not None else None,
-                    }
-                    self.frameReady.emit(payload)
-                    while next_display_ms <= position_ms:
-                        next_display_ms += display_interval_ms
+                        payload = {
+                            "image": image,
+                            "frame_id": current_frame_id,
+                            "position_ms": position_ms,
+                            "duration_ms": 0,
+                            "progress": 0.0,
+                            "track": {
+                                "ball_xy": list(track.ball_xy),
+                                "visible": bool(track.visible),
+                                "score": float(track.score),
+                            },
+                            "visible_frames": visible_frames,
+                            "pose_frames": pose_frames,
+                            "person_count": len(last_pose),
+                            "avg_score": avg_score,
+                            "processed_frames": processed_frames,
+                            "infer_fps": ema_infer_fps,
+                            "court": court_prediction.to_dict() if court_prediction is not None else None,
+                        }
+                        self.frameReady.emit(payload)
+                        while next_display_ms <= position_ms:
+                            next_display_ms += display_interval_ms
 
-                prev_frame = current_frame
-                current_frame = next_frame
-                ok, incoming_frame = cap.read()
-                if not ok or incoming_frame is None:
-                    break
-                next_frame = incoming_frame
+                    prev_frame = current_frame
+                    current_frame = next_frame
+                    ok, incoming_frame = cap.read()
+                    if not ok or incoming_frame is None:
+                        break
+                    next_frame = incoming_frame
         finally:
             cap.release()
 

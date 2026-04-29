@@ -9,6 +9,7 @@ from src.models.yolo_pose_backend import (
     expanded_crop_rect,
     extract_image_to_court_h,
     filter_boxes_by_court,
+    needs_crop_refine,
     translate_item,
 )
 
@@ -52,6 +53,11 @@ class YoloPoseBackendHelpersTest(unittest.TestCase):
 
         self.assertIsNotNone(extract_image_to_court_h(valid))
         self.assertIsNone(extract_image_to_court_h({"valid": False, "image_to_court_h": valid["image_to_court_h"]}))
+
+    def test_needs_crop_refine_only_for_low_quality_keypoints(self) -> None:
+        self.assertFalse(needs_crop_refine([0.8] * 13 + [0.4] * 4, score_thr=0.65, min_strong_keypoints=10))
+        self.assertTrue(needs_crop_refine([0.8] * 6 + [0.2] * 11, score_thr=0.65, min_strong_keypoints=10))
+        self.assertTrue(needs_crop_refine([], score_thr=0.65, min_strong_keypoints=10))
 
 
 if __name__ == "__main__":

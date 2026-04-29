@@ -24,6 +24,8 @@ class YoloPoseBackend:
     crop_imgsz: int | None = None
     crop_padding: float = 0.25
     crop_min_box_conf: float = 0.45
+    crop_refine_score_thr: float = 0.65
+    crop_refine_min_strong_keypoints: int = 10
     max_pose_crops: int | None = None
     court_filter: bool = False
     court_required: bool = False
@@ -230,18 +232,34 @@ class YoloPoseBackend:
 
         items: list[MMPoseInferenceItem] = []
         for idx in candidate_indices[: max(0, int(crop_limit))]:
+            fallback_item = self._original_item(boxes, keypoints, scores, idx)
+            keypoint_scores = scores[idx] if idx < len(scores) else []
+            if fallback_item is not None and not needs_crop_refine(
+                keypoint_scores,
+                self.crop_refine_score_thr,
+                self.crop_refine_min_strong_keypoints,
+            ):
+                items.append(fallback_item)
+                continue
+
             crop_rect = expanded_crop_rect(boxes[idx], frame_shape, self.crop_padding)
             if crop_rect is None:
+                if fallback_item is not None:
+                    items.append(fallback_item)
                 continue
 
             x1, y1, x2, y2 = crop_rect
             crop = image[y1:y2, x1:x2]
             if crop.size == 0:
+                if fallback_item is not None:
+                    items.append(fallback_item)
                 continue
 
             try:
                 crop_result = self._predict(crop, imgsz=self.crop_imgsz, conf=max(0.05, self.conf_thr * 0.75))
             except Exception:
+                if fallback_item is not None:
+                    items.append(fallback_item)
                 continue
 
             crop_boxes = self._boxes(crop_result)
@@ -255,20 +273,31 @@ class YoloPoseBackend:
                 crop.shape,
             )
             if crop_item is None:
-                if idx < len(keypoints) and idx < len(scores):
-                    items.append(
-                        MMPoseInferenceItem(
-                            bbox=boxes[idx],
-                            keypoints=keypoints[idx],
-                            scores=scores[idx],
-                            coordinate_space="original",
-                        )
-                    )
+                if fallback_item is not None:
+                    items.append(fallback_item)
                 continue
 
             items.append(translate_item(crop_item, float(x1), float(y1)))
 
         return items[: self.max_persons]
+
+    def _original_item(
+        self,
+        boxes: list[list[float]],
+        keypoints: list[list[list[float]]],
+        scores: list[list[float]],
+        idx: int,
+    ) -> MMPoseInferenceItem | None:
+        if idx >= len(boxes) or idx >= len(keypoints) or idx >= len(scores):
+            return None
+        if not keypoints[idx] or not scores[idx]:
+            return None
+        return MMPoseInferenceItem(
+            bbox=boxes[idx],
+            keypoints=keypoints[idx],
+            scores=scores[idx],
+            coordinate_space="original",
+        )
 
     def _best_crop_item(
         self,
@@ -358,6 +387,21 @@ def _candidate_rank(box: list[float], box_score: float, keypoint_scores: list[fl
     keypoint_score = float(sum(keypoint_scores) / max(len(keypoint_scores), 1)) if keypoint_scores else 0.0
     area_bias = min(_box_area(box), 250000.0) / 250000.0
     return float(box_score) * 1.5 + keypoint_score + area_bias * 0.05
+
+
+def needs_crop_refine(
+    keypoint_scores: list[float],
+    score_thr: float,
+    min_strong_keypoints: int,
+) -> bool:
+    if not keypoint_scores:
+        return True
+    finite_scores = [float(score) for score in keypoint_scores if np.isfinite(score)]
+    if not finite_scores:
+        return True
+    mean_score = sum(finite_scores) / len(finite_scores)
+    strong_count = sum(1 for score in finite_scores if score >= float(score_thr))
+    return mean_score < float(score_thr) or strong_count < int(min_strong_keypoints)
 
 
 def expanded_crop_rect(
