@@ -15,12 +15,13 @@ from PyQt6.QtCore import QElapsedTimer, QSettings, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import QApplication, QFileDialog
 
-from src.postprocess.track_filter import BallTrackFilter
 from apps.pyqt6.utils.style import apply_theme, discover_themes
 from apps.pyqt6.utils.theme_transition import start_theme_ripple_transition
 from apps.pyqt6.views.main_window_refined import MainWindow
 from src.models.pose_branch import PoseBranch
 from src.models.track_branch import TrackBranch
+from src.postprocess.pose import CourtPoseTargetTracker
+from src.postprocess.track_filter import BallTrackFilter
 from src.utils.structures import FrameResult, TrackResult
 from src.utils.visualize import TrackTrailRenderer
 
@@ -28,6 +29,7 @@ from src.utils.visualize import TrackTrailRenderer
 DISPLAY_FPS_LIMIT = 60.0
 METRICS_UPDATE_INTERVAL_S = 0.25
 PLAYBACK_LAG_TOLERANCE_FRAMES = 1.5
+POSE_CANDIDATE_LIMIT = 12
 
 
 @contextmanager
@@ -282,6 +284,7 @@ class TrackNetPlaybackWorker(QThread):
         ema_infer_fps = 0.0
         last_pose = []
         track_filter = BallTrackFilter(fps=fps)
+        pose_tracker = CourtPoseTargetTracker(max_missing_frames=int(round(fps * 0.8)))
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=3.0)
         display_interval_ms = 1000.0 / self._display_fps_limit
         display_every_frame = fps <= self._display_fps_limit
@@ -300,20 +303,30 @@ class TrackNetPlaybackWorker(QThread):
                     track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
 
                 frame_id = int(round((current_ms / 1000.0) * fps)) if fps > 0 else processed_frames
-                if self._pose_enabled and processed_frames % self._pose_stride == 0:
-                    last_pose = self._pose_branch.infer(current_frame)
+                court_prediction = None
+                if self._court_service is not None:
+                    self._court_service.submit_frame(current_frame, frame_id, current_ms)
+                    court_prediction = self._court_service.latest_prediction()
+
+                if self._pose_enabled:
+                    detections = (
+                        self._pose_branch.infer(current_frame)
+                        if processed_frames % self._pose_stride == 0
+                        else []
+                    )
+                    last_pose = pose_tracker.update(
+                        detections,
+                        court_prediction,
+                        frame_shape=current_frame.shape,
+                    )
                     pose_frames += int(bool(last_pose))
-                elif not self._pose_enabled:
+                else:
+                    pose_tracker.reset()
                     last_pose = []
 
                 infer_elapsed = max(perf_counter() - loop_start, 1e-6)
                 infer_fps = 1.0 / infer_elapsed
                 ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
-
-                court_prediction = None
-                if self._court_service is not None:
-                    self._court_service.submit_frame(current_frame, frame_id, current_ms)
-                    court_prediction = self._court_service.latest_prediction()
 
                 should_emit = display_every_frame or final_pass or current_ms >= next_display_ms
                 image = None
@@ -478,6 +491,7 @@ class CameraInferenceWorker(QThread):
         ema_infer_fps = 0.0
         last_pose = []
         track_filter = BallTrackFilter(fps=fps)
+        pose_tracker = CourtPoseTargetTracker(max_missing_frames=int(round(fps * 0.8)))
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=3.0)
         display_interval_ms = 1000.0 / self._display_fps_limit
         next_display_ms = 0.0
@@ -493,22 +507,32 @@ class CameraInferenceWorker(QThread):
                 else:
                     track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
 
-                if self._pose_enabled and processed_frames % self._pose_stride == 0:
-                    last_pose = self._pose_branch.infer(current_frame)
-                    pose_frames += int(bool(last_pose))
-                elif not self._pose_enabled:
-                    last_pose = []
-
-                infer_elapsed = max(perf_counter() - loop_start, 1e-6)
-                infer_fps = 1.0 / infer_elapsed
-                ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
-
                 current_frame_id = processed_frames
                 position_ms = clock.elapsed()
                 court_prediction = None
                 if self._court_service is not None:
                     self._court_service.submit_frame(current_frame, current_frame_id, position_ms)
                     court_prediction = self._court_service.latest_prediction()
+
+                if self._pose_enabled:
+                    detections = (
+                        self._pose_branch.infer(current_frame)
+                        if processed_frames % self._pose_stride == 0
+                        else []
+                    )
+                    last_pose = pose_tracker.update(
+                        detections,
+                        court_prediction,
+                        frame_shape=current_frame.shape,
+                    )
+                    pose_frames += int(bool(last_pose))
+                else:
+                    pose_tracker.reset()
+                    last_pose = []
+
+                infer_elapsed = max(perf_counter() - loop_start, 1e-6)
+                infer_fps = 1.0 / infer_elapsed
+                ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
 
                 processed_frames += 1
                 visible_frames += int(bool(track.visible))
@@ -717,7 +741,7 @@ class MainController:
             model_weight=str(model_weight),
             device=device,
             conf_thr=0.35,
-            max_persons=2,
+            max_persons=POSE_CANDIDATE_LIMIT,
         )
 
     def _bind_events(self) -> None:
