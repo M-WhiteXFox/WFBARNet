@@ -100,6 +100,13 @@ class ToggleSwitch(QCheckBox):
 
 
 class BadmintonCourtWidget(QWidget):
+    COURT_LENGTH_MM = 13400.0
+    COURT_WIDTH_MM = 6100.0
+    LINE_WIDTH_MM = 40.0
+    SINGLES_SIDE_MARGIN_MM = 460.0
+    DOUBLE_LONG_SERVICE_FROM_BACK_MM = 760.0
+    SHORT_SERVICE_FROM_NET_MM = 1980.0
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("badmintonCourtPreview")
@@ -107,7 +114,7 @@ class BadmintonCourtWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def sizeHint(self) -> QSize:
-        return QSize(420, 280)
+        return QSize(320, 460)
 
     def paintEvent(self, event) -> None:
         del event
@@ -120,16 +127,16 @@ class BadmintonCourtWidget(QWidget):
         painter.drawRoundedRect(QRectF(bounds), 8, 8)
 
         court = self._court_rect(bounds)
-        painter.setPen(QPen(QColor("#F8FAFC"), max(2, round(court.width() * 0.006))))
+        line_width = max(2, round(self.LINE_WIDTH_MM * self._scale(court)))
+        painter.setPen(QPen(QColor("#F8FAFC"), line_width))
         painter.setBrush(QColor("#15803D"))
         painter.drawRect(court)
 
-        line_width = max(2, round(court.width() * 0.005))
         painter.setPen(QPen(QColor("#FFFFFF"), line_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.SquareCap))
         self._draw_court_lines(painter, court)
 
     def _court_rect(self, bounds) -> QRectF:
-        target_ratio = 6.10 / 13.40
+        target_ratio = self.COURT_WIDTH_MM / self.COURT_LENGTH_MM
         width = float(bounds.width())
         height = width / target_ratio
         if height > bounds.height():
@@ -141,41 +148,40 @@ class BadmintonCourtWidget(QWidget):
         return QRectF(x, y, width, height)
 
     def _draw_court_lines(self, painter: QPainter, court: QRectF) -> None:
-        left = court.left()
-        right = court.right()
-        top = court.top()
-        bottom = court.bottom()
-        width = court.width()
-        height = court.height()
-        center_x = court.center().x()
-        center_y = court.center().y()
-
-        singles_margin = width * ((6.10 - 5.18) / 6.10) / 2.0
-        back_service_margin = height * 0.057
-        short_service_offset = height * 0.293
-
-        singles_left = left + singles_margin
-        singles_right = right - singles_margin
-        back_top = top + back_service_margin
-        back_bottom = bottom - back_service_margin
-        service_top = center_y - short_service_offset
-        service_bottom = center_y + short_service_offset
-
         painter.drawRect(court)
-        self._draw_line(painter, left, center_y, right, center_y)
 
-        self._draw_line(painter, singles_left, top, singles_left, bottom)
-        self._draw_line(painter, singles_right, top, singles_right, bottom)
-        self._draw_line(painter, left, back_top, right, back_top)
-        self._draw_line(painter, left, back_bottom, right, back_bottom)
-        self._draw_line(painter, left, service_top, right, service_top)
-        self._draw_line(painter, left, service_bottom, right, service_bottom)
+        y_net = self._y(court, self.COURT_LENGTH_MM / 2.0)
+        y_short_top = self._y(court, self.COURT_LENGTH_MM / 2.0 - self.SHORT_SERVICE_FROM_NET_MM)
+        y_short_bottom = self._y(court, self.COURT_LENGTH_MM / 2.0 + self.SHORT_SERVICE_FROM_NET_MM)
+        y_double_long_top = self._y(court, self.DOUBLE_LONG_SERVICE_FROM_BACK_MM)
+        y_double_long_bottom = self._y(court, self.COURT_LENGTH_MM - self.DOUBLE_LONG_SERVICE_FROM_BACK_MM)
 
-        self._draw_line(painter, center_x, top, center_x, service_top)
-        self._draw_line(painter, center_x, service_bottom, center_x, bottom)
+        x_single_left = self._x(court, self.SINGLES_SIDE_MARGIN_MM)
+        x_single_right = self._x(court, self.COURT_WIDTH_MM - self.SINGLES_SIDE_MARGIN_MM)
+        x_center = self._x(court, self.COURT_WIDTH_MM / 2.0)
+
+        self._draw_line(painter, court.left(), y_net, court.right(), y_net)
+        self._draw_line(painter, court.left(), y_double_long_top, court.right(), y_double_long_top)
+        self._draw_line(painter, court.left(), y_double_long_bottom, court.right(), y_double_long_bottom)
+        self._draw_line(painter, court.left(), y_short_top, court.right(), y_short_top)
+        self._draw_line(painter, court.left(), y_short_bottom, court.right(), y_short_bottom)
+
+        self._draw_line(painter, x_single_left, court.top(), x_single_left, court.bottom())
+        self._draw_line(painter, x_single_right, court.top(), x_single_right, court.bottom())
+        self._draw_line(painter, x_center, court.top(), x_center, y_short_top)
+        self._draw_line(painter, x_center, y_short_bottom, x_center, court.bottom())
 
     def _draw_line(self, painter: QPainter, x1: float, y1: float, x2: float, y2: float) -> None:
         painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+    def _scale(self, court: QRectF) -> float:
+        return min(court.width() / self.COURT_WIDTH_MM, court.height() / self.COURT_LENGTH_MM)
+
+    def _x(self, court: QRectF, mm: float) -> float:
+        return court.left() + court.width() * (mm / self.COURT_WIDTH_MM)
+
+    def _y(self, court: QRectF, mm: float) -> float:
+        return court.top() + court.height() * (mm / self.COURT_LENGTH_MM)
 
 
 class MainWindow(QMainWindow):
