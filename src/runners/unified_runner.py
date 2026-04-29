@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -11,7 +11,7 @@ from src.builders.bst_input_builder import BSTInputBuilder
 from src.models.pose_branch import PoseBranch
 from src.models.track_branch import TrackBranch
 from src.postprocess.track_filter import BallTrackFilter
-from src.utils.exporters import export_csv, export_json, export_npy
+from src.utils.exporters import export_csv, export_json, export_npy, export_track_debug_csv
 from src.utils.structures import FrameResult
 from src.utils.video import iter_frame_windows, iter_video_frame_windows, load_frames, probe_video
 from src.utils.visualize import TrackTrailRenderer, save_visualization_video
@@ -24,6 +24,7 @@ class UnifiedRunner:
     output_dir: Path
     device: str = "cpu"
     execution_mode: str = "serial"
+    track_debug_records: list[dict[str, object]] = field(default_factory=list, init=False, repr=False)
 
     def run(
         self,
@@ -70,21 +71,23 @@ class UnifiedRunner:
             export_npy(results, self.output_dir / "unified_results.npy")
         if save_bst:
             BSTInputBuilder(normalize=False).save(results, self.output_dir / "bst_input.npy")
+        export_track_debug_csv(self.track_debug_records, self.output_dir / "unified_track_debug.csv")
 
     def _run_serial(self, frames: list) -> list[FrameResult]:
         outputs: list[FrameResult] = []
-        track_filter = BallTrackFilter()
+        track_filter = BallTrackFilter(debug_enabled=True)
         for frame_id, frame, window in tqdm(list(iter_frame_windows(frames)), desc="Unified inference"):
             pose = self.pose_branch.infer(frame)
-            raw_track = self.track_branch.infer_result(window)
-            track = track_filter.update(raw_track, frame_shape=frame.shape)
+            candidates = self.track_branch.infer_candidate_results(window)
+            track = track_filter.update_candidates(candidates, frame_shape=frame.shape)
             outputs.append(FrameResult(frame_id=frame_id, pose=pose, track=track))
+        self.track_debug_records = list(track_filter.debug_records)
         return outputs
 
     def _run_video_stream(self, source: str, save_vis: bool) -> list[FrameResult]:
         metadata = probe_video(source)
-        track_filter = BallTrackFilter(fps=metadata.fps)
-        trail_renderer = TrackTrailRenderer(fps=metadata.fps, history_seconds=3.0)
+        track_filter = BallTrackFilter(fps=metadata.fps, debug_enabled=True)
+        trail_renderer = TrackTrailRenderer(fps=metadata.fps, history_seconds=0.5)
         writer = None
         if save_vis:
             writer = cv2.VideoWriter(
@@ -103,8 +106,8 @@ class UnifiedRunner:
                 desc="Unified inference",
             ):
                 pose = self.pose_branch.infer(frame)
-                raw_track = self.track_branch.infer_result(window)
-                track = track_filter.update(raw_track, frame_shape=frame.shape)
+                candidates = self.track_branch.infer_candidate_results(window)
+                track = track_filter.update_candidates(candidates, frame_shape=frame.shape)
                 result = FrameResult(frame_id=frame_id, pose=pose, track=track)
                 outputs.append(result)
                 if writer is not None:
@@ -115,19 +118,21 @@ class UnifiedRunner:
 
         if not outputs:
             raise FileNotFoundError(f"No frames loaded from source: {source}")
+        self.track_debug_records = list(track_filter.debug_records)
         return outputs
 
     def _run_cuda_stream(self, frames: list) -> list[FrameResult]:
         pose_stream = torch.cuda.Stream()
         track_stream = torch.cuda.Stream()
         outputs: list[FrameResult] = []
-        track_filter = BallTrackFilter()
+        track_filter = BallTrackFilter(debug_enabled=True)
         for frame_id, frame, window in tqdm(list(iter_frame_windows(frames)), desc="Unified inference (dual stream)"):
             with torch.cuda.stream(pose_stream):
                 pose = self.pose_branch.infer(frame)
             with torch.cuda.stream(track_stream):
-                raw_track = self.track_branch.infer_result(window)
+                candidates = self.track_branch.infer_candidate_results(window)
             torch.cuda.synchronize()
-            track = track_filter.update(raw_track, frame_shape=frame.shape)
+            track = track_filter.update_candidates(candidates, frame_shape=frame.shape)
             outputs.append(FrameResult(frame_id=frame_id, pose=pose, track=track))
+        self.track_debug_records = list(track_filter.debug_records)
         return outputs

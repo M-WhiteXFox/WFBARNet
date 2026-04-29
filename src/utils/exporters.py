@@ -33,6 +33,50 @@ def export_csv(results: list[FrameResult], path: Path) -> None:
             )
 
 
+TRACK_DEBUG_FIELDS = [
+    "frame_index",
+    "action",
+    "reason",
+    "candidate_count",
+    "selected_candidate_index",
+    "selected_candidate_rank",
+    "input_visible",
+    "input_x",
+    "input_y",
+    "input_score",
+    "output_visible",
+    "output_x",
+    "output_y",
+    "output_score",
+    "locked_before",
+    "locked_after",
+    "missed_before",
+    "missed_after",
+    "coast_before",
+    "coast_after",
+    "last_x_before",
+    "last_y_before",
+    "pred_x",
+    "pred_y",
+    "velocity_x_before",
+    "velocity_y_before",
+    "velocity_x_after",
+    "velocity_y_after",
+    "top_exit_remaining",
+    "frame_w",
+    "frame_h",
+    "dt",
+    "candidates",
+]
+
+
+def export_track_debug_csv(records: list[dict[str, object]], path: Path) -> None:
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=TRACK_DEBUG_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(records)
+
+
 def export_npy(results: list[FrameResult], path: Path) -> None:
     max_persons = max((len(item.pose) for item in results), default=0)
     max_kpts = max((len(person.keypoints) for item in results for person in item.pose), default=0)

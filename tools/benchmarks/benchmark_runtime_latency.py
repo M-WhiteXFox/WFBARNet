@@ -208,9 +208,9 @@ def main() -> None:
         with Timer(local_timings, "total", device):
             if track_enabled and track_branch is not None:
                 with Timer(local_timings, "track_infer_total", device):
-                    raw_track = track_branch.infer_result([prev_frame, current_frame, next_frame])
+                    candidates = track_branch.infer_candidate_results([prev_frame, current_frame, next_frame])
                 with Timer(local_timings, "track_filter"):
-                    track = track_filter.update(raw_track)
+                    track = track_filter.update_candidates(candidates)
             else:
                 track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
 

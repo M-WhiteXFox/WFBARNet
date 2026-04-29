@@ -10,7 +10,7 @@ import numpy as np
 
 from src.models.track_branch import TrackBranch
 from src.postprocess.track_filter import BallTrackFilter
-from src.utils.exporters import export_csv, export_json, export_npy
+from src.utils.exporters import export_csv, export_json, export_npy, export_track_debug_csv
 from src.utils.structures import FrameResult, TrackResult
 from src.utils.visualize import TrackTrailRenderer
 
@@ -77,14 +77,14 @@ class TrackNetRealtimeRunner:
         frame_id = 0
         ema_fps = 0.0
         tick_frequency = cv2.getTickFrequency()
-        track_filter = BallTrackFilter(fps=fps)
-        trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=3.0)
+        track_filter = BallTrackFilter(fps=fps, debug_enabled=True)
+        trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=0.5)
 
         while True:
             start_tick = cv2.getTickCount()
 
-            raw_track = self.track_branch.infer_result([prev_frame, curr_frame, next_frame])
-            track = track_filter.update(raw_track, frame_shape=curr_frame.shape)
+            candidates = self.track_branch.infer_candidate_results([prev_frame, curr_frame, next_frame])
+            track = track_filter.update_candidates(candidates, frame_shape=curr_frame.shape)
             result = FrameResult(frame_id=frame_id, pose=[], track=track)
             results.append(result)
 
@@ -113,8 +113,8 @@ class TrackNetRealtimeRunner:
                     break
                 next_frame = curr_frame.copy()
                 frame_id += 1
-                final_raw_track = self.track_branch.infer_result([prev_frame, curr_frame, next_frame])
-                final_track = track_filter.update(final_raw_track, frame_shape=curr_frame.shape)
+                final_candidates = self.track_branch.infer_candidate_results([prev_frame, curr_frame, next_frame])
+                final_track = track_filter.update_candidates(final_candidates, frame_shape=curr_frame.shape)
                 final_result = FrameResult(frame_id=frame_id, pose=[], track=final_track)
                 results.append(final_result)
                 final_vis = self._draw_overlay(curr_frame.copy(), final_result, ema_fps, trail_renderer)
@@ -139,6 +139,7 @@ class TrackNetRealtimeRunner:
             export_csv(results, self.output_dir / "tracknet_realtime_results.csv")
         if save_npy:
             export_npy(results, self.output_dir / "tracknet_realtime_results.npy")
+        export_track_debug_csv(track_filter.debug_records, self.output_dir / "tracknet_realtime_debug.csv")
 
         return results
 

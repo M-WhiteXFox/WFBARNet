@@ -10,7 +10,12 @@ import torch
 
 from src.models.tensorrt_track_backend import TensorRTTrackBackend
 from src.models.tracknet_v3 import TrackNetV3
-from src.postprocess.track import decode_track_heatmap, decode_track_heatmap_batch
+from src.postprocess.track import (
+    decode_track_heatmap,
+    decode_track_heatmap_batch,
+    decode_track_heatmap_candidate_batch,
+    decode_track_heatmap_candidates,
+)
 from src.preprocess.track import preprocess_track_window, preprocess_track_batch
 from src.utils.device import resolve_device
 from src.utils.structures import TrackResult
@@ -22,6 +27,8 @@ class TrackBranch:
     device: str = "cpu"
     input_size: tuple[int, int] = (512, 288)
     score_thr: float = 0.5
+    max_candidates: int = 5
+    candidate_score_thr_ratio: float = 0.6
     allow_random_weights: bool = False
 
     def __post_init__(self) -> None:
@@ -106,6 +113,30 @@ class TrackBranch:
         return decode_track_heatmap(heatmap, meta, self.score_thr)
 
     @torch.inference_mode()
+    def infer_candidate_results(self, frames: Sequence[np.ndarray]) -> list[TrackResult]:
+        if self.backend_name == "tensorrt":
+            with self.model.stream_context():
+                tensor, meta = preprocess_track_window(frames, self.input_size, self.device)
+                heatmap = self.predict_heatmap_planes(tensor).squeeze(0)
+            return decode_track_heatmap_candidates(
+                heatmap,
+                meta,
+                self.score_thr,
+                max_candidates=self.max_candidates,
+                candidate_score_thr=self._candidate_score_thr(),
+            )
+
+        tensor, meta = preprocess_track_window(frames, self.input_size, self.device)
+        heatmap = self.predict_heatmap_planes(tensor).squeeze(0)
+        return decode_track_heatmap_candidates(
+            heatmap,
+            meta,
+            self.score_thr,
+            max_candidates=self.max_candidates,
+            candidate_score_thr=self._candidate_score_thr(),
+        )
+
+    @torch.inference_mode()
     def infer_batch(self, batch_frames: list[Sequence[np.ndarray]]) -> tuple[np.ndarray, list[TrackResult]]:
         if self.backend_name == "tensorrt":
             with self.model.stream_context():
@@ -133,6 +164,30 @@ class TrackBranch:
         return decode_track_heatmap_batch(heatmaps, metas, self.score_thr)
 
     @torch.inference_mode()
+    def infer_batch_candidate_results(self, batch_frames: list[Sequence[np.ndarray]]) -> list[list[TrackResult]]:
+        if self.backend_name == "tensorrt":
+            with self.model.stream_context():
+                tensor, metas = preprocess_track_batch(batch_frames, self.input_size, self.device)
+                heatmaps = self.predict_heatmap_planes(tensor)
+            return decode_track_heatmap_candidate_batch(
+                heatmaps,
+                metas,
+                self.score_thr,
+                max_candidates=self.max_candidates,
+                candidate_score_thr=self._candidate_score_thr(),
+            )
+
+        tensor, metas = preprocess_track_batch(batch_frames, self.input_size, self.device)
+        heatmaps = self.predict_heatmap_planes(tensor)
+        return decode_track_heatmap_candidate_batch(
+            heatmaps,
+            metas,
+            self.score_thr,
+            max_candidates=self.max_candidates,
+            candidate_score_thr=self._candidate_score_thr(),
+        )
+
+    @torch.inference_mode()
     def predict_heatmap_planes(self, tensor: torch.Tensor) -> np.ndarray:
         if self.backend_name == "tensorrt":
             heatmaps = self._infer_tensorrt_batch(tensor)
@@ -150,3 +205,7 @@ class TrackBranch:
             return self.model.infer(tensor)
         outputs = [self.model.infer(tensor[index : index + 1]) for index in range(tensor.shape[0])]
         return np.concatenate(outputs, axis=0)
+
+    def _candidate_score_thr(self) -> float:
+        ratio = min(max(float(self.candidate_score_thr_ratio), 0.0), 1.0)
+        return float(self.score_thr) * ratio

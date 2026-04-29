@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from PyQt6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, pyqtProperty, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QPainter, QPen
@@ -102,6 +108,8 @@ class ToggleSwitch(QCheckBox):
 class BadmintonCourtWidget(QWidget):
     COURT_LENGTH_MM = 13400.0
     COURT_WIDTH_MM = 6100.0
+    COURT_LENGTH_CM = 1340.0
+    COURT_WIDTH_CM = 610.0
     LINE_WIDTH_MM = 40.0
     SINGLES_SIDE_MARGIN_MM = 460.0
     DOUBLE_LONG_SERVICE_FROM_BACK_MM = 760.0
@@ -109,12 +117,22 @@ class BadmintonCourtWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._ball_court_xy: tuple[float, float] | None = None
+        self._player_court_points: list[tuple[float, float]] = []
         self.setObjectName("badmintonCourtPreview")
         self.setMinimumSize(320, 220)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def sizeHint(self) -> QSize:
         return QSize(320, 460)
+
+    def set_ball_projection(self, court_xy: tuple[float, float] | None) -> None:
+        self._ball_court_xy = court_xy
+        self.update()
+
+    def set_player_projections(self, court_points: list[tuple[float, float]] | None) -> None:
+        self._player_court_points = list(court_points or [])
+        self.update()
 
     def paintEvent(self, event) -> None:
         del event
@@ -134,6 +152,8 @@ class BadmintonCourtWidget(QWidget):
 
         painter.setPen(QPen(QColor("#FFFFFF"), line_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.SquareCap))
         self._draw_court_lines(painter, court)
+        self._draw_player_projections(painter, court)
+        self._draw_ball_projection(painter, court)
 
     def _court_rect(self, bounds) -> QRectF:
         target_ratio = self.COURT_WIDTH_MM / self.COURT_LENGTH_MM
@@ -174,6 +194,40 @@ class BadmintonCourtWidget(QWidget):
     def _draw_line(self, painter: QPainter, x1: float, y1: float, x2: float, y2: float) -> None:
         painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
+    def _draw_ball_projection(self, painter: QPainter, court: QRectF) -> None:
+        if self._ball_court_xy is None:
+            return
+
+        court_x, court_y = self._ball_court_xy
+        marker_x = court.left() + court.width() * (court_x / self.COURT_WIDTH_CM)
+        marker_y = court.top() + court.height() * (court_y / self.COURT_LENGTH_CM)
+        radius = max(5.0, min(court.width(), court.height()) * 0.018)
+
+        painter.setPen(QPen(QColor("#FFFFFF"), max(2, int(radius * 0.35))))
+        painter.setBrush(QColor("#F97316"))
+        painter.drawEllipse(QPointF(marker_x, marker_y), radius, radius)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 190))
+        painter.drawEllipse(QPointF(marker_x, marker_y), radius * 0.36, radius * 0.36)
+
+    def _draw_player_projections(self, painter: QPainter, court: QRectF) -> None:
+        colors = (QColor("#38BDF8"), QColor("#FACC15"), QColor("#A78BFA"), QColor("#34D399"))
+        radius = max(6.0, min(court.width(), court.height()) * 0.022)
+        for index, (court_x, court_y) in enumerate(self._player_court_points):
+            if court_x < 0.0 or court_x > self.COURT_WIDTH_CM or court_y < 0.0 or court_y > self.COURT_LENGTH_CM:
+                continue
+            marker_x = court.left() + court.width() * (court_x / self.COURT_WIDTH_CM)
+            marker_y = court.top() + court.height() * (court_y / self.COURT_LENGTH_CM)
+            color = colors[index % len(colors)]
+
+            painter.setPen(QPen(QColor("#0F172A"), max(2, int(radius * 0.35))))
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(marker_x, marker_y), radius, radius)
+
+            label_rect = QRectF(marker_x - radius, marker_y - radius, radius * 2.0, radius * 2.0)
+            painter.setPen(QPen(QColor("#0F172A"), 1))
+            painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, str(index + 1))
+
     def _scale(self, court: QRectF) -> float:
         return min(court.width() / self.COURT_WIDTH_MM, court.height() / self.COURT_LENGTH_MM)
 
@@ -192,6 +246,7 @@ class MainWindow(QMainWindow):
     modelSettingsApplyRequested = pyqtSignal(str, str)
     modelSettingsDefaultsRequested = pyqtSignal()
     modelSwitchesChanged = pyqtSignal(bool, bool)
+    debugCsvChanged = pyqtSignal(bool)
     courtRedetectRequested = pyqtSignal()
 
     def __init__(self) -> None:
@@ -486,10 +541,10 @@ class MainWindow(QMainWindow):
 
         pose_title = QLabel("姿态与轨迹")
         pose_title.setObjectName("sectionTitle")
-        court_widget = BadmintonCourtWidget()
+        self.court_widget = BadmintonCourtWidget()
 
         pose_frame_layout.addWidget(pose_title, alignment=Qt.AlignmentFlag.AlignCenter)
-        pose_frame_layout.addWidget(court_widget, stretch=1)
+        pose_frame_layout.addWidget(self.court_widget, stretch=1)
         pose_layout.addWidget(pose_frame, stretch=1)
         self.tabs.addTab(tab_pose, "姿态")
 
@@ -549,6 +604,14 @@ class MainWindow(QMainWindow):
         self.btn_browse_track_model.setObjectName("btnBrowseTrackModel")
         self.btn_browse_track_model.clicked.connect(self.trackModelBrowseRequested.emit)
 
+        debug_label = QLabel("Debug CSV")
+        debug_label.setObjectName("styleLabel")
+        self.debug_csv_enabled = ToggleSwitch("Write every TrackNet prediction frame to CSV")
+        self.debug_csv_enabled.setChecked(False)
+        debug_note = QLabel("Writes candidate points, selected result, and filter decision for every frame.")
+        debug_note.setObjectName("sectionNote")
+        debug_note.setWordWrap(True)
+
         settings_frame_layout.addWidget(pose_label, 0, 0)
         settings_frame_layout.addWidget(self.pose_model_enabled, 0, 1)
         settings_frame_layout.addWidget(self.pose_model_edit, 0, 2)
@@ -557,10 +620,14 @@ class MainWindow(QMainWindow):
         settings_frame_layout.addWidget(self.track_model_enabled, 1, 1)
         settings_frame_layout.addWidget(self.track_model_edit, 1, 2)
         settings_frame_layout.addWidget(self.btn_browse_track_model, 1, 3)
+        settings_frame_layout.addWidget(debug_label, 2, 0)
+        settings_frame_layout.addWidget(self.debug_csv_enabled, 2, 1)
+        settings_frame_layout.addWidget(debug_note, 2, 2, 1, 2)
         settings_frame_layout.setColumnStretch(2, 1)
 
         self.pose_model_enabled.stateChanged.connect(self._emit_model_switches_changed)
         self.track_model_enabled.stateChanged.connect(self._emit_model_switches_changed)
+        self.debug_csv_enabled.toggled.connect(self.debugCsvChanged.emit)
 
         action_row = QHBoxLayout()
         action_row.addStretch(1)
@@ -649,10 +716,19 @@ class MainWindow(QMainWindow):
     def model_switches(self) -> tuple[bool, bool]:
         return self.pose_model_enabled.isChecked(), self.track_model_enabled.isChecked()
 
+    def set_debug_csv_enabled(self, enabled: bool) -> None:
+        self.debug_csv_enabled.blockSignals(True)
+        self.debug_csv_enabled.setChecked(enabled)
+        self.debug_csv_enabled.blockSignals(False)
+
+    def debug_csv_enabled_state(self) -> bool:
+        return self.debug_csv_enabled.isChecked()
+
     def set_model_settings_enabled(self, enabled: bool) -> None:
         widgets = (
             self.pose_model_enabled,
             self.track_model_enabled,
+            self.debug_csv_enabled,
             self.pose_model_edit,
             self.track_model_edit,
             self.btn_browse_pose_model,
@@ -671,8 +747,18 @@ class MainWindow(QMainWindow):
         pose_enabled, track_enabled = self.model_switches()
         self.modelSwitchesChanged.emit(pose_enabled, track_enabled)
 
-    def show_video_frame(self, image, position_ms: int, duration_ms: int, court=None) -> None:
+    def show_video_frame(
+        self,
+        image,
+        position_ms: int,
+        duration_ms: int,
+        court=None,
+        ball_projection=None,
+        player_projections=None,
+    ) -> None:
         self.video_player.display_image(image, court=court)
+        self.court_widget.set_ball_projection(ball_projection)
+        self.court_widget.set_player_projections(player_projections)
         self.video_timeline.set_duration(duration_ms)
         self.video_timeline.set_position(position_ms)
 
@@ -681,6 +767,8 @@ class MainWindow(QMainWindow):
 
     def clear_video(self) -> None:
         self.video_player.clear_video()
+        self.court_widget.set_ball_projection(None)
+        self.court_widget.set_player_projections(None)
         self.video_timeline.reset()
 
     def set_status_state(self, state: str) -> None:

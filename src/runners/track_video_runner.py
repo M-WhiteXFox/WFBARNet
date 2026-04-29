@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from src.models.track_branch import TrackBranch
 from src.postprocess.track_filter import BallTrackFilter
-from src.utils.exporters import export_csv, export_json, export_npy
+from src.utils.exporters import export_csv, export_json, export_npy, export_track_debug_csv
 from src.utils.structures import FrameResult
 from src.utils.video import iter_frame_windows, iter_video_frame_windows, load_frames, probe_video
 from src.utils.visualize import TrackTrailRenderer, save_visualization_video
@@ -18,6 +18,7 @@ from src.utils.visualize import TrackTrailRenderer, save_visualization_video
 class TrackVideoRunner:
     track_branch: TrackBranch
     output_dir: Path
+    batch_size: int = 8
 
     def run(
         self,
@@ -63,13 +64,22 @@ class TrackVideoRunner:
         if max_frames is not None:
             frames = frames[:max_frames]
         results: list[FrameResult] = []
-        track_filter = BallTrackFilter()
-        for frame_id, frame, window in tqdm(list(iter_frame_windows(frames)), desc="Track inference"):
-            raw_track = self.track_branch.infer_result(window)
-            track = track_filter.update(raw_track, frame_shape=frame.shape)
-            results.append(FrameResult(frame_id=frame_id, pose=[], track=track))
+        track_filter = BallTrackFilter(debug_enabled=True)
+        windows = list(iter_frame_windows(frames))
+        progress = tqdm(total=len(windows), desc="Track inference")
+        try:
+            for start in range(0, len(windows), self._batch_size()):
+                batch = windows[start : start + self._batch_size()]
+                candidate_batch = self.track_branch.infer_batch_candidate_results([window for _, _, window in batch])
+                for (frame_id, frame, _), candidates in zip(batch, candidate_batch):
+                    track = track_filter.update_candidates(candidates, frame_shape=frame.shape)
+                    results.append(FrameResult(frame_id=frame_id, pose=[], track=track))
+                progress.update(len(batch))
+        finally:
+            progress.close()
 
         self._export_results(results, save_json, save_csv, save_npy)
+        self._export_debug(track_filter)
         if save_vis:
             save_visualization_video(frames, results, self.output_dir / "track_vis.mp4")
         return results
@@ -95,21 +105,23 @@ class TrackVideoRunner:
             )
 
         results: list[FrameResult] = []
-        track_filter = BallTrackFilter(fps=metadata.fps)
-        trail_renderer = TrackTrailRenderer(fps=metadata.fps, history_seconds=3.0)
+        track_filter = BallTrackFilter(fps=metadata.fps, debug_enabled=True)
+        trail_renderer = TrackTrailRenderer(fps=metadata.fps, history_seconds=0.5)
         progress_total = metadata.frame_count if metadata.frame_count > 0 else None
         if max_frames is not None:
             progress_total = min(progress_total, max_frames) if progress_total is not None else max_frames
         progress = tqdm(total=progress_total, desc="Track inference")
+        batch: list[tuple[int, object, list[object]]] = []
         try:
             for frame_id, curr_frame, window in iter_video_frame_windows(source, max_frames=max_frames):
-                raw_track = self.track_branch.infer_result(window)
-                track = track_filter.update(raw_track, frame_shape=curr_frame.shape)
-                result = FrameResult(frame_id=frame_id, pose=[], track=track)
-                results.append(result)
-                if writer is not None:
-                    writer.write(trail_renderer.draw(curr_frame, result))
-                progress.update(1)
+                batch.append((frame_id, curr_frame, window))
+                if len(batch) >= self._batch_size():
+                    self._process_video_batch(batch, track_filter, trail_renderer, results, writer)
+                    progress.update(len(batch))
+                    batch.clear()
+            if batch:
+                self._process_video_batch(batch, track_filter, trail_renderer, results, writer)
+                progress.update(len(batch))
         finally:
             progress.close()
             if writer is not None:
@@ -119,6 +131,7 @@ class TrackVideoRunner:
             raise RuntimeError("The video opened but returned no frames.")
 
         self._export_results(results, save_json, save_csv, save_npy)
+        self._export_debug(track_filter)
         return results
 
     def _export_results(
@@ -134,3 +147,25 @@ class TrackVideoRunner:
             export_csv(results, self.output_dir / "track_results.csv")
         if save_npy:
             export_npy(results, self.output_dir / "track_results.npy")
+
+    def _export_debug(self, track_filter: BallTrackFilter) -> None:
+        export_track_debug_csv(track_filter.debug_records, self.output_dir / "track_debug.csv")
+
+    def _batch_size(self) -> int:
+        return max(1, int(self.batch_size))
+
+    def _process_video_batch(
+        self,
+        batch: list[tuple[int, object, list[object]]],
+        track_filter: BallTrackFilter,
+        trail_renderer: TrackTrailRenderer,
+        results: list[FrameResult],
+        writer: cv2.VideoWriter | None,
+    ) -> None:
+        candidate_batch = self.track_branch.infer_batch_candidate_results([window for _, _, window in batch])
+        for (frame_id, curr_frame, _), candidates in zip(batch, candidate_batch):
+            track = track_filter.update_candidates(candidates, frame_shape=curr_frame.shape)
+            result = FrameResult(frame_id=frame_id, pose=[], track=track)
+            results.append(result)
+            if writer is not None:
+                writer.write(trail_renderer.draw(curr_frame, result))

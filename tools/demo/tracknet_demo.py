@@ -92,13 +92,13 @@ def main():
     tick_frequency = cv2.getTickFrequency()
     frame_count = 0
     track_filter = BallTrackFilter(fps=fps)
-    trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=3.0)
+    trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=0.5)
 
     while True:
         start_tick = cv2.getTickCount()
 
-        raw_track = track_branch.infer_result([prev_frame, curr_frame, next_frame])
-        track = track_filter.update(raw_track)
+        candidates = track_branch.infer_candidate_results([prev_frame, curr_frame, next_frame])
+        track = track_filter.update_candidates(candidates)
 
         result = FrameResult(frame_id=frame_id, pose=[], track=track)
         vis_frame = trail_renderer.draw(curr_frame, result)
