@@ -83,6 +83,47 @@ class BallTrackFilterTest(unittest.TestCase):
         self.assertEqual(tracker.debug_records[-1]["selected_candidate_index"], 1)
         self.assertEqual(tracker.debug_records[-1]["action"], "accept")
 
+    def test_repeated_static_candidate_is_suppressed_as_hotspot(self) -> None:
+        tracker = BallTrackFilter(fps=60.0, debug_enabled=True)
+
+        outputs = [
+            tracker.update_candidates([_track(900.0, 220.0, 0.88)], frame_shape=(720, 1280, 3))
+            for _ in range(6)
+        ]
+
+        self.assertFalse(outputs[-1].visible)
+        self.assertGreaterEqual(tracker.debug_records[-1]["static_hotspot_count"], 1)
+        self.assertGreaterEqual(tracker.debug_records[-1]["static_filtered_count"], 1)
+
+    def test_static_hotspot_filter_keeps_moving_candidate_available(self) -> None:
+        tracker = BallTrackFilter(fps=60.0, debug_enabled=True)
+
+        for _ in range(5):
+            tracker.update_candidates([_track(900.0, 220.0, 0.88)], frame_shape=(720, 1280, 3))
+
+        selected = tracker.update_candidates(
+            [
+                _track(900.0, 220.0, 0.92),
+                _track(180.0, 300.0, 0.62),
+            ],
+            frame_shape=(720, 1280, 3),
+        )
+
+        self.assertFalse(selected.visible)
+        self.assertAlmostEqual(tracker.debug_records[-1]["input_x"], 180.0)
+        self.assertEqual(tracker.debug_records[-1]["static_filtered_count"], 1)
+
+    def test_slow_edge_drift_candidate_is_suppressed(self) -> None:
+        tracker = BallTrackFilter(fps=60.0, debug_enabled=True)
+
+        outputs = [
+            tracker.update_candidates([_track(1240.0, 200.0 + 3.0 * index, 0.86)], frame_shape=(720, 1280, 3))
+            for index in range(6)
+        ]
+
+        self.assertFalse(outputs[-1].visible)
+        self.assertGreaterEqual(tracker.debug_records[-1]["static_filtered_count"], 1)
+
     def test_court_filter_prefers_main_court_candidate_over_other_court_peak(self) -> None:
         tracker = BallTrackFilter(fps=25.0, debug_enabled=True)
 
@@ -150,6 +191,45 @@ class BallTrackFilterTest(unittest.TestCase):
         self.assertTrue(coasted.visible)
         self.assertGreater(coasted.ball_xy[0], 180.0)
         self.assertLess(coasted.score, 0.05)
+
+    def test_person_occlusion_candidate_is_replaced_by_prediction(self) -> None:
+        tracker = BallTrackFilter(fps=25.0, debug_enabled=True)
+        frame_shape = (300, 500, 3)
+        person_bboxes = [(205.0, 80.0, 270.0, 170.0)]
+
+        tracker.update(_track(100.0, 100.0, 0.92), frame_shape=frame_shape)
+        tracker.update(_track(140.0, 100.0, 0.9), frame_shape=frame_shape)
+        tracker.update(_track(180.0, 100.0, 0.9), frame_shape=frame_shape)
+
+        corrected = tracker.update_candidates(
+            [_track(242.0, 136.0, 0.97)],
+            frame_shape=frame_shape,
+            person_bboxes=person_bboxes,
+        )
+
+        self.assertTrue(corrected.visible)
+        self.assertLess(corrected.ball_xy[0], 230.0)
+        self.assertAlmostEqual(corrected.ball_xy[1], 100.0, delta=4.0)
+        self.assertEqual(tracker.debug_records[-1]["action"], "coast")
+        self.assertEqual(tracker.debug_records[-1]["reason"], "person_occlusion_prediction")
+
+    def test_person_occlusion_extends_missing_gap_coasting(self) -> None:
+        tracker = BallTrackFilter(fps=25.0)
+        frame_shape = (300, 500, 3)
+        person_bboxes = [(190.0, 60.0, 420.0, 170.0)]
+
+        tracker.update(_track(100.0, 100.0, 0.92), frame_shape=frame_shape)
+        tracker.update(_track(140.0, 100.0, 0.9), frame_shape=frame_shape)
+        tracker.update(_track(180.0, 100.0, 0.9), frame_shape=frame_shape)
+
+        outputs = [
+            tracker.update(_missing(), frame_shape=frame_shape, person_bboxes=person_bboxes)
+            for _ in range(5)
+        ]
+
+        self.assertTrue(all(output.visible for output in outputs))
+        self.assertGreater(outputs[-1].ball_xy[0], 280.0)
+        self.assertAlmostEqual(outputs[-1].ball_xy[1], 100.0, delta=4.0)
 
     def test_missing_gap_is_filled_from_parabolic_motion(self) -> None:
         tracker = BallTrackFilter(fps=25.0)

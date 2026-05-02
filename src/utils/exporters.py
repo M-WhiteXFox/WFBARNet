@@ -3,10 +3,11 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+from typing import TextIO
 
 import numpy as np
 
-from src.utils.structures import FrameResult
+from src.utils.structures import FrameResult, PersonPoseResult, TrackResult
 
 
 def export_json(results: list[FrameResult], path: Path) -> None:
@@ -37,9 +38,12 @@ TRACK_DEBUG_FIELDS = [
     "frame_index",
     "action",
     "reason",
+    "raw_candidate_count",
     "candidate_count",
     "selected_candidate_index",
     "selected_candidate_rank",
+    "static_filtered_count",
+    "static_hotspot_count",
     "input_visible",
     "input_x",
     "input_y",
@@ -75,6 +79,59 @@ def export_track_debug_csv(records: list[dict[str, object]], path: Path) -> None
         writer = csv.DictWriter(f, fieldnames=TRACK_DEBUG_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(records)
+
+
+def frame_result_log_record(
+    result: FrameResult,
+    *,
+    timestamp_ms: int | None = None,
+    hit_event: object | None = None,
+) -> dict[str, object]:
+    return {
+        "frame_id": int(result.frame_id),
+        "timestamp_ms": int(timestamp_ms) if timestamp_ms is not None else None,
+        "ball": _track_log_record(result.track),
+        "pose": [_pose_log_record(person) for person in result.pose],
+        "hit_event": _hit_event_log_record(hit_event),
+    }
+
+
+def write_frame_log_jsonl(log_file: TextIO | None, record: dict[str, object]) -> None:
+    if log_file is None:
+        return
+    log_file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def _track_log_record(track: TrackResult) -> dict[str, object]:
+    ball_xy = [float(value) for value in track.ball_xy[:2]] if len(track.ball_xy) >= 2 else [-1.0, -1.0]
+    return {
+        "xy": ball_xy,
+        "visible": int(bool(track.visible)),
+        "score": float(track.score),
+    }
+
+
+def _pose_log_record(person: PersonPoseResult) -> dict[str, object]:
+    return {
+        "person_id": int(person.person_id),
+        "bbox": [float(value) for value in person.bbox[:4]],
+        "person_score": float(person.person_score),
+        "keypoints": [[float(point[0]), float(point[1])] for point in person.keypoints if len(point) >= 2],
+        "keypoint_scores": [float(score) for score in person.scores],
+    }
+
+
+def _hit_event_log_record(hit_event: object | None) -> dict[str, object] | None:
+    if not isinstance(hit_event, dict):
+        return None
+    ball_xy = hit_event.get("ball_xy", [-1.0, -1.0])
+    if not isinstance(ball_xy, (list, tuple)) or len(ball_xy) < 2:
+        ball_xy = [-1.0, -1.0]
+    return {
+        "frame_id": int(hit_event.get("frame_id", -1)),
+        "timestamp_ms": int(hit_event.get("timestamp_ms", 0)),
+        "ball_xy": [float(ball_xy[0]), float(ball_xy[1])],
+    }
 
 
 def export_npy(results: list[FrameResult], path: Path) -> None:

@@ -25,9 +25,10 @@ from src.models.bst_runtime import build_bst_model
 from src.models.bst_stroke_runtime import BSTStrokeRecognizer
 from src.models.pose_branch import PoseBranch
 from src.models.track_branch import TrackBranch
+from src.postprocess.player_distance import PlayerDistanceAccumulator
 from src.postprocess.pose import CourtPoseTargetTracker
 from src.postprocess.track_filter import BallTrackFilter
-from src.utils.exporters import TRACK_DEBUG_FIELDS
+from src.utils.exporters import TRACK_DEBUG_FIELDS, frame_result_log_record, write_frame_log_jsonl
 from src.utils.structures import FrameResult, PersonPoseResult, TrackResult
 from src.utils.visualize import TrackTrailRenderer
 
@@ -162,23 +163,73 @@ def write_track_debug_row(writer: csv.DictWriter | None, record: object) -> None
     writer.writerow(record)
 
 
+def open_frame_log_jsonl(path: str | None) -> object | None:
+    if not path:
+        return None
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return output_path.open("w", encoding="utf-8")
+
+
 def project_poses_to_court(
     poses: list[PersonPoseResult],
     court_prediction: object | None,
 ) -> list[tuple[float, float]]:
+    projected_by_player = project_player_points_to_court(poses, court_prediction)
+    return [
+        projected_by_player[index]
+        for index in sorted(projected_by_player)
+    ]
+
+
+def project_player_points_to_court(
+    poses: list[PersonPoseResult],
+    court_prediction: object | None,
+) -> dict[int, tuple[float, float]]:
     h = extract_image_to_court_h(court_prediction)
     if h is None:
-        return []
+        return {}
 
-    projected: list[tuple[float, float]] = []
-    for pose in poses:
+    projected: dict[int, tuple[float, float]] = {}
+    for fallback_index, pose in enumerate(poses):
         anchor = pose_ground_anchor(pose)
         if anchor is None:
             continue
         court_xy = project_image_point(h, anchor)
         if court_xy is not None:
-            projected.append(court_xy)
+            person_index = _person_projection_index(pose, fallback_index)
+            if person_index is not None:
+                projected[person_index] = court_xy
     return projected
+
+
+def pose_person_bboxes(poses: list[PersonPoseResult]) -> list[tuple[float, float, float, float]]:
+    bboxes: list[tuple[float, float, float, float]] = []
+    for pose in poses:
+        if len(pose.bbox) < 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [float(value) for value in pose.bbox[:4]]
+        except (TypeError, ValueError):
+            continue
+        if not all(_is_finite(value) for value in (x1, y1, x2, y2)):
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+        bboxes.append((x1, y1, x2, y2))
+    return bboxes
+
+
+def _person_projection_index(pose: PersonPoseResult, fallback_index: int) -> int | None:
+    try:
+        person_id = int(getattr(pose, "person_id", fallback_index))
+    except (TypeError, ValueError):
+        person_id = fallback_index
+    if 0 <= person_id < 2:
+        return person_id
+    if 0 <= fallback_index < 2:
+        return fallback_index
+    return None
 
 
 def pose_ground_anchor(pose: PersonPoseResult) -> tuple[float, float] | None:
@@ -318,6 +369,7 @@ class TrackNetPlaybackWorker(QThread):
         display_fps_limit: float = DISPLAY_FPS_LIMIT,
         court_service: Any | None = None,
         debug_csv_path: str | None = None,
+        frame_log_path: str | None = None,
         bst_model: Any | None = None,
         bst_device: str = "cpu",
     ) -> None:
@@ -332,6 +384,7 @@ class TrackNetPlaybackWorker(QThread):
         self._display_fps_limit = max(1.0, float(display_fps_limit))
         self._court_service = court_service
         self._debug_csv_path = debug_csv_path
+        self._frame_log_path = frame_log_path
         self._bst_model = bst_model
         self._bst_device = bst_device
         self._stop_requested = False
@@ -432,6 +485,7 @@ class TrackNetPlaybackWorker(QThread):
             predict_missing_motion=True,
             motion_prediction_scale=0.55,
         )
+        distance_accumulator = PlayerDistanceAccumulator()
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=0.5)
         frame_height, frame_width = current_frame.shape[:2]
         bst_recognizer = self._create_bst_recognizer(frame_width, frame_height, fps)
@@ -449,6 +503,7 @@ class TrackNetPlaybackWorker(QThread):
             and getattr(self._track_branch, "backend_name", "") == "tensorrt"
         )
         debug_file, debug_writer = open_track_debug_csv(self._debug_csv_path)
+        frame_log_file = open_frame_log_jsonl(self._frame_log_path)
 
         try:
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wfb-playback-infer") as infer_executor:
@@ -473,22 +528,12 @@ class TrackNetPlaybackWorker(QThread):
                             court_prediction=court_prediction,
                         )
                         candidates = track_future.result()
-                        track = track_filter.update_candidates(
-                            candidates,
-                            frame_shape=current_frame.shape,
-                            court_prediction=court_prediction,
-                        )
                         detections = pose_future.result()
                     else:
                         if self._track_enabled:
                             candidates = self._track_branch.infer_candidate_results([prev_frame, current_frame, next_frame])
-                            track = track_filter.update_candidates(
-                                candidates,
-                                frame_shape=current_frame.shape,
-                                court_prediction=court_prediction,
-                            )
                         else:
-                            track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
+                            candidates = []
                         detections = (
                             self._pose_branch.infer(current_frame, court_prediction=court_prediction)
                             if pose_due
@@ -506,6 +551,16 @@ class TrackNetPlaybackWorker(QThread):
                         pose_tracker.reset()
                         last_pose = []
 
+                    if self._track_enabled:
+                        track = track_filter.update_candidates(
+                            candidates,
+                            frame_shape=current_frame.shape,
+                            court_prediction=court_prediction,
+                            person_bboxes=pose_person_bboxes(last_pose),
+                        )
+                    else:
+                        track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
+
                     infer_elapsed = max(perf_counter() - loop_start, 1e-6)
                     infer_fps = 1.0 / infer_elapsed
                     ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
@@ -519,8 +574,16 @@ class TrackNetPlaybackWorker(QThread):
                         hit_event = trail_renderer.last_hit_event()
                         image = frame_to_qimage(vis_frame)
                     else:
-                        trail_renderer.update_hit_detection(frame_result, timestamp_ms=current_ms)
+                        trail_renderer.update_hit_detection(
+                            frame_result,
+                            timestamp_ms=current_ms,
+                            frame_shape=current_frame.shape,
+                        )
                         hit_event = trail_renderer.last_hit_event()
+                    write_frame_log_jsonl(
+                        frame_log_file,
+                        frame_result_log_record(frame_result, timestamp_ms=current_ms, hit_event=hit_event),
+                    )
 
                     if bst_recognizer is not None:
                         try:
@@ -545,7 +608,13 @@ class TrackNetPlaybackWorker(QThread):
                     score_sum += float(track.score)
                     avg_score = score_sum / max(processed_frames, 1)
                     track_debug = track_filter.last_debug_record()
-                    player_projections = project_poses_to_court(last_pose, court_prediction)
+                    player_points = project_player_points_to_court(last_pose, court_prediction)
+                    player_projections = [player_points[index] for index in sorted(player_points)]
+                    if player_points:
+                        player_distances_m = distance_accumulator.update(player_points)
+                    else:
+                        distance_accumulator.reset_tracking_points()
+                        player_distances_m = distance_accumulator.totals_m()
                     write_track_debug_row(debug_writer, track_debug)
                     track_filter.debug_records.clear()
                     if should_emit:
@@ -569,6 +638,7 @@ class TrackNetPlaybackWorker(QThread):
                             "court": court_prediction.to_dict() if court_prediction is not None else None,
                             "ball_projection": None,
                             "player_projections": player_projections,
+                            "player_distances_m": player_distances_m,
                             "track_debug": track_debug,
                             "bst_predictions": list(pending_bst_predictions),
                             "bst_errors": list(pending_bst_errors),
@@ -622,6 +692,8 @@ class TrackNetPlaybackWorker(QThread):
             cap.release()
             if debug_file is not None:
                 debug_file.close()
+            if frame_log_file is not None:
+                frame_log_file.close()
 
         self.playbackFinished.emit(
             {
@@ -631,6 +703,7 @@ class TrackNetPlaybackWorker(QThread):
                 "visible_frames": visible_frames,
                 "pose_frames": pose_frames,
                 "avg_score": (score_sum / processed_frames) if processed_frames else 0.0,
+                "player_distances_m": distance_accumulator.totals_m(),
             }
         )
 
@@ -652,6 +725,7 @@ class CameraInferenceWorker(QThread):
         display_fps_limit: float = DISPLAY_FPS_LIMIT,
         court_service: Any | None = None,
         debug_csv_path: str | None = None,
+        frame_log_path: str | None = None,
         bst_model: Any | None = None,
         bst_device: str = "cpu",
     ) -> None:
@@ -665,6 +739,7 @@ class CameraInferenceWorker(QThread):
         self._display_fps_limit = max(1.0, float(display_fps_limit))
         self._court_service = court_service
         self._debug_csv_path = debug_csv_path
+        self._frame_log_path = frame_log_path
         self._bst_model = bst_model
         self._bst_device = bst_device
         self._stop_requested = False
@@ -732,6 +807,7 @@ class CameraInferenceWorker(QThread):
             predict_missing_motion=True,
             motion_prediction_scale=0.55,
         )
+        distance_accumulator = PlayerDistanceAccumulator()
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=0.5)
         frame_height, frame_width = first_frame.shape[:2]
         bst_recognizer = self._create_bst_recognizer(frame_width, frame_height, fps)
@@ -747,6 +823,7 @@ class CameraInferenceWorker(QThread):
             and getattr(self._track_branch, "backend_name", "") == "tensorrt"
         )
         debug_file, debug_writer = open_track_debug_csv(self._debug_csv_path)
+        frame_log_file = open_frame_log_jsonl(self._frame_log_path)
 
         try:
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wfb-camera-infer") as infer_executor:
@@ -772,22 +849,12 @@ class CameraInferenceWorker(QThread):
                             court_prediction=court_prediction,
                         )
                         candidates = track_future.result()
-                        track = track_filter.update_candidates(
-                            candidates,
-                            frame_shape=current_frame.shape,
-                            court_prediction=court_prediction,
-                        )
                         detections = pose_future.result()
                     else:
                         if self._track_enabled:
                             candidates = self._track_branch.infer_candidate_results([prev_frame, current_frame, next_frame])
-                            track = track_filter.update_candidates(
-                                candidates,
-                                frame_shape=current_frame.shape,
-                                court_prediction=court_prediction,
-                            )
                         else:
-                            track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
+                            candidates = []
                         detections = (
                             self._pose_branch.infer(current_frame, court_prediction=court_prediction)
                             if pose_due
@@ -805,6 +872,16 @@ class CameraInferenceWorker(QThread):
                         pose_tracker.reset()
                         last_pose = []
 
+                    if self._track_enabled:
+                        track = track_filter.update_candidates(
+                            candidates,
+                            frame_shape=current_frame.shape,
+                            court_prediction=court_prediction,
+                            person_bboxes=pose_person_bboxes(last_pose),
+                        )
+                    else:
+                        track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
+
                     infer_elapsed = max(perf_counter() - loop_start, 1e-6)
                     infer_fps = 1.0 / infer_elapsed
                     ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
@@ -814,7 +891,13 @@ class CameraInferenceWorker(QThread):
                     score_sum += float(track.score)
                     avg_score = score_sum / max(processed_frames, 1)
                     track_debug = track_filter.last_debug_record()
-                    player_projections = project_poses_to_court(last_pose, court_prediction)
+                    player_points = project_player_points_to_court(last_pose, court_prediction)
+                    player_projections = [player_points[index] for index in sorted(player_points)]
+                    if player_points:
+                        player_distances_m = distance_accumulator.update(player_points)
+                    else:
+                        distance_accumulator.reset_tracking_points()
+                        player_distances_m = distance_accumulator.totals_m()
                     write_track_debug_row(debug_writer, track_debug)
                     track_filter.debug_records.clear()
                     frame_result = FrameResult(frame_id=current_frame_id, pose=last_pose, track=track)
@@ -824,8 +907,16 @@ class CameraInferenceWorker(QThread):
                         hit_event = trail_renderer.last_hit_event()
                         image = frame_to_qimage(vis_frame)
                     else:
-                        trail_renderer.update_hit_detection(frame_result, timestamp_ms=position_ms)
+                        trail_renderer.update_hit_detection(
+                            frame_result,
+                            timestamp_ms=position_ms,
+                            frame_shape=current_frame.shape,
+                        )
                         hit_event = trail_renderer.last_hit_event()
+                    write_frame_log_jsonl(
+                        frame_log_file,
+                        frame_result_log_record(frame_result, timestamp_ms=position_ms, hit_event=hit_event),
+                    )
 
                     if bst_recognizer is not None:
                         try:
@@ -862,6 +953,7 @@ class CameraInferenceWorker(QThread):
                             "court": court_prediction.to_dict() if court_prediction is not None else None,
                             "ball_projection": None,
                             "player_projections": player_projections,
+                            "player_distances_m": player_distances_m,
                             "track_debug": track_debug,
                             "bst_predictions": list(pending_bst_predictions),
                             "bst_errors": list(pending_bst_errors),
@@ -882,6 +974,8 @@ class CameraInferenceWorker(QThread):
             cap.release()
             if debug_file is not None:
                 debug_file.close()
+            if frame_log_file is not None:
+                frame_log_file.close()
 
         self.inferFinished.emit(
             {
@@ -890,6 +984,7 @@ class CameraInferenceWorker(QThread):
                 "visible_frames": visible_frames,
                 "pose_frames": pose_frames,
                 "avg_score": (score_sum / processed_frames) if processed_frames else 0.0,
+                "player_distances_m": distance_accumulator.totals_m(),
             }
         )
 
@@ -1025,6 +1120,15 @@ class MainController:
             safe_stem = "track"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return str(self._project_root / "outputs" / "pyqt_debug" / f"{safe_stem}_{timestamp}_track_debug.csv")
+
+    def _make_frame_log_jsonl_path(self, track_debug_csv_path: str | None) -> str | None:
+        if not track_debug_csv_path:
+            return None
+        csv_path = Path(track_debug_csv_path)
+        suffix = "_track_debug.csv"
+        if csv_path.name.endswith(suffix):
+            return str(csv_path.with_name(f"{csv_path.name[:-len(suffix)]}_frame_log.jsonl"))
+        return str(csv_path.with_suffix(".jsonl"))
 
     def _build_track_branch(self) -> TrackBranch:
         branch = self._create_track_branch(self._track_model_path)
@@ -1441,6 +1545,7 @@ class MainController:
         self.view.video_player.set_live_source(f"摄像头 {camera_index}")
         self.view.video_player.play()
         debug_csv_path = self._make_track_debug_csv_path(f"camera_{camera_index}")
+        frame_log_path = self._make_frame_log_jsonl_path(debug_csv_path)
         self.view.set_progress_busy(True, "实时推理中")
         self.view.append_log(
             f"[TrackNet] 开始摄像头实时推理: 摄像头 {camera_index} | "
@@ -1450,6 +1555,8 @@ class MainController:
 
         if debug_csv_path is not None:
             self.view.append_log(f"[TrackDebug] Writing CSV: {debug_csv_path}")
+        if frame_log_path is not None:
+            self.view.append_log(f"[FrameLog] Writing JSONL: {frame_log_path}")
 
         self._camera_worker = CameraInferenceWorker(
             camera_index,
@@ -1460,6 +1567,7 @@ class MainController:
             pose_enabled=self._pose_model_enabled,
             court_service=self._court_service,
             debug_csv_path=debug_csv_path,
+            frame_log_path=frame_log_path,
             bst_model=self._bst_model,
             bst_device=self._bst_device,
         )
@@ -1477,6 +1585,7 @@ class MainController:
         self._set_running_state()
         self.view.video_player.play()
         debug_csv_path = self._make_track_debug_csv_path(Path(self._selected_video_path).stem)
+        frame_log_path = self._make_frame_log_jsonl_path(debug_csv_path)
         self.view.append_log(
             f"[TrackNet] 开始播放: {Path(self._selected_video_path).name} | "
             f"球轨迹 {'启用' if self._track_model_enabled else '关闭'} | "
@@ -1484,6 +1593,8 @@ class MainController:
         )
         if debug_csv_path is not None:
             self.view.append_log(f"[TrackDebug] Writing CSV: {debug_csv_path}")
+        if frame_log_path is not None:
+            self.view.append_log(f"[FrameLog] Writing JSONL: {frame_log_path}")
 
         self._playback_worker = TrackNetPlaybackWorker(
             self._selected_video_path,
@@ -1495,6 +1606,7 @@ class MainController:
             pose_enabled=self._pose_model_enabled,
             court_service=self._court_service,
             debug_csv_path=debug_csv_path,
+            frame_log_path=frame_log_path,
             bst_model=self._bst_model,
             bst_device=self._bst_device,
         )
@@ -1517,6 +1629,7 @@ class MainController:
                 payload.get("ball_projection"),
                 payload.get("player_projections"),
             )
+            self.view.set_player_distances(payload.get("player_distances_m"))
             self._update_display_fps()
         self._log_track_debug_event(payload.get("track_debug"))
         self._append_bst_predictions(payload)
@@ -1526,8 +1639,6 @@ class MainController:
         if not self._should_update_metrics_text():
             return
 
-        processed_frames = int(payload.get("processed_frames", 0))
-        visible_frames = int(payload.get("visible_frames", 0))
         person_count = int(payload.get("person_count", 0))
         avg_score = float(payload.get("avg_score", 0.0))
         infer_fps = float(payload.get("infer_fps", 0.0))
@@ -1539,7 +1650,7 @@ class MainController:
             court_text = f" | Court {float(court.get('confidence', 0.0)):.2f}"
 
         self.view.lbl_valid_pose.setText(f"{infer_fps:.1f} FPS")
-        self.view.lbl_valid_track.setText(str(visible_frames))
+        self.view.lbl_valid_track.setText(str(self.view.stroke_total_count()))
         self.view.lbl_avg_conf.setText(f"{avg_score * 100:.1f}%")
         self.view.lbl_realtime_fps.setText(f"{self._display_fps_ema:.1f} FPS")
         self.view.status_label.setText(
@@ -1555,14 +1666,13 @@ class MainController:
             self.view.video_player.display_image(image, court=payload.get("court"))
             self.view.court_widget.set_ball_projection(payload.get("ball_projection"))
             self.view.court_widget.set_player_projections(payload.get("player_projections"))
+            self.view.set_player_distances(payload.get("player_distances_m"))
             self._update_display_fps()
         self._log_track_debug_event(payload.get("track_debug"))
         self._append_bst_predictions(payload)
         if not self._should_update_metrics_text():
             return
 
-        processed_frames = int(payload.get("processed_frames", 0))
-        visible_frames = int(payload.get("visible_frames", 0))
         person_count = int(payload.get("person_count", 0))
         avg_score = float(payload.get("avg_score", 0.0))
         track = payload.get("track", {})
@@ -1574,7 +1684,7 @@ class MainController:
             court_text = f" | Court {float(court.get('confidence', 0.0)):.2f}"
 
         self.view.lbl_valid_pose.setText(f"{infer_fps:.1f} FPS")
-        self.view.lbl_valid_track.setText(str(visible_frames))
+        self.view.lbl_valid_track.setText(str(self.view.stroke_total_count()))
         self.view.lbl_avg_conf.setText(f"{avg_score * 100:.1f}%")
         self.view.lbl_realtime_fps.setText(f"{self._display_fps_ema:.1f} FPS")
         self.view.status_label.setText(
@@ -1626,6 +1736,29 @@ class MainController:
             return f"{minutes:d}:{seconds:05.2f}"
         return f"{seconds:.2f}s"
 
+    def _append_player_distance_summary(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        distances = payload.get("player_distances_m")
+        if not isinstance(distances, dict):
+            return
+        top_distance = self._safe_distance_value(distances.get("top", 0.0))
+        bottom_distance = self._safe_distance_value(distances.get("bottom", 0.0))
+        self.view.set_player_distances(distances)
+        self.view.append_log(
+            f"[PoseDistance] 上方球员 {top_distance:.2f} m | 下方球员 {bottom_distance:.2f} m"
+        )
+
+    @staticmethod
+    def _safe_distance_value(value: object) -> float:
+        try:
+            distance = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if distance != distance or distance in (float("inf"), float("-inf")):
+            return 0.0
+        return max(0.0, distance)
+
     def _log_track_debug_event(self, debug: object) -> None:
         if not isinstance(debug, dict):
             return
@@ -1676,6 +1809,7 @@ class MainController:
             else:
                 self.view.append_log("[TrackNet] 摄像头实时推理结束。")
 
+        self._append_player_distance_summary(payload)
         self._set_idle_state()
 
     def _on_camera_failed(self, message: str) -> None:
@@ -1708,6 +1842,7 @@ class MainController:
             else:
                 self.view.append_log("[TrackNet] 已完成。")
 
+        self._append_player_distance_summary(payload)
         self._set_idle_state()
 
         if self._pending_seek_ms is not None and self._selected_video_path is not None:

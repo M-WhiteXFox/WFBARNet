@@ -17,7 +17,6 @@ WFBARNet/
     utils/                         # video, export, visualization, structures
   apps/
     pyqt6/                         # current desktop application
-    desktop_gui/                   # legacy DearPyGui desktop application
   tools/
     demo/                          # runnable CLI demos
     benchmarks/                    # local performance benchmark scripts

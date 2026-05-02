@@ -10,6 +10,7 @@ from src.utils.structures import TrackResult
 
 Point = tuple[float, float]
 FrameSize = tuple[float, float]
+PersonBBox = tuple[float, float, float, float]
 CourtMatrix = tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
 COURT_WIDTH = 610.0
 COURT_LENGTH = 1340.0
@@ -46,6 +47,11 @@ class BallTrackFilterConfig:
     coast_velocity_decay: float = 0.82
     coast_score_decay: float = 0.55
     coast_on_outlier: bool = False
+    person_occlusion_enabled: bool = True
+    person_occlusion_padding_px: float = 18.0
+    person_occlusion_coast_frames: int = 7
+    person_occlusion_min_speed_px_per_sec: float = 250.0
+    person_occlusion_candidate_penalty: float = 140.0
     frame_measurement_margin_px: float = 6.0
     out_of_frame_prediction_margin_px: float = 12.0
     parabola_enabled: bool = True
@@ -75,6 +81,15 @@ class BallTrackFilterConfig:
     top_exit_history_frames: int = 4
     top_exit_suppression_frames: int = 6
     top_exit_reversal_min_delta_px: float = 8.0
+    static_hotspot_enabled: bool = True
+    static_hotspot_radius_px: float = 18.0
+    static_hotspot_min_frames: int = 4
+    static_hotspot_max_motion_px: float = 12.0
+    static_hotspot_memory_frames: int = 90
+    static_hotspot_suppression_frames: int = 45
+    static_hotspot_tracking_speed_px_per_sec: float = 900.0
+    static_hotspot_edge_band_ratio: float = 0.07
+    static_hotspot_edge_max_motion_px: float = 32.0
 
 
 @dataclass(slots=True)
@@ -82,6 +97,18 @@ class _RelockCandidate:
     point: Point
     score: float
     count: int = 1
+
+
+@dataclass(slots=True)
+class _StaticHotspot:
+    anchor: Point
+    point: Point
+    score: float
+    first_frame: int
+    last_frame: int
+    count: int = 1
+    max_distance: float = 0.0
+    suppressed_until: int = -1
 
 
 @dataclass(slots=True)
@@ -130,6 +157,7 @@ class BallTrackFilter:
         self._locked = False
         self._candidate: _RelockCandidate | None = None
         self._history: deque[_TrajectoryPoint] = deque(maxlen=max(1, self.config.parabola_history_frames))
+        self._static_hotspots: list[_StaticHotspot] = []
         self._frame_index = -1
         self._last_frame_size: FrameSize | None = None
         self._top_exit_frames_remaining = 0
@@ -137,6 +165,9 @@ class BallTrackFilter:
         self.debug_records: list[dict[str, object]] = []
         self._last_debug_record: dict[str, object] | None = None
         self._pending_candidate_debug: dict[str, object] | None = None
+        self._raw_candidate_count = 0
+        self._static_filtered_count = 0
+        self._static_hotspot_count = 0
         self._decision_action = "unknown"
         self._decision_reason = ""
 
@@ -149,12 +180,16 @@ class BallTrackFilter:
         self._locked = False
         self._candidate = None
         self._history.clear()
+        self._static_hotspots.clear()
         self._frame_index = -1
         self._last_frame_size = None
         self._top_exit_frames_remaining = 0
         self.debug_records.clear()
         self._last_debug_record = None
         self._pending_candidate_debug = None
+        self._raw_candidate_count = 0
+        self._static_filtered_count = 0
+        self._static_hotspot_count = 0
         self._decision_action = "unknown"
         self._decision_reason = ""
 
@@ -165,11 +200,13 @@ class BallTrackFilter:
         dt: float | None = None,
         frame_shape: tuple[int, ...] | list[int] | None = None,
         court_prediction: Any | None = None,
+        person_bboxes: Sequence[Sequence[float]] | None = None,
     ) -> TrackResult:
         self._frame_index += 1
         step_dt = self._resolve_dt(dt)
         frame_size = self._resolve_frame_size(frame_shape)
         court_filter = self._court_filter(court_prediction)
+        normalized_person_bboxes = self._normalize_person_bboxes(person_bboxes, frame_size)
         debug_before = self._debug_before_state(step_dt, frame_size)
         self._start_decision()
 
@@ -185,9 +222,18 @@ class BallTrackFilter:
             measurement = self._raw_measurement(track, frame_size)
             soft_measurement = measurement is not None
 
+        person_occlusion_active = self._person_occlusion_likely(step_dt, frame_size, normalized_person_bboxes)
         if measurement is None:
             self._mark_decision("reject", "missing_or_low_confidence")
-            result = self._reject(track, step_dt, allow_coast=True, frame_size=frame_size, court_filter=court_filter)
+            result = self._reject(
+                track,
+                step_dt,
+                allow_coast=True,
+                frame_size=frame_size,
+                court_filter=court_filter,
+                occlusion_active=person_occlusion_active,
+                coast_reason="person_occlusion_prediction" if person_occlusion_active else None,
+            )
         elif not self._locked or self._last_point is None:
             result = self._bootstrap(track, measurement, step_dt, frame_size)
         elif self._prediction_is_out_of_frame(step_dt, frame_size):
@@ -197,6 +243,20 @@ class BallTrackFilter:
             self._enter_top_exit()
             self._mark_decision("top_exit_enter", "measurement_reverses_after_top_exit", force=True)
             result = self._invisible(track)
+        elif (
+            person_occlusion_active
+            and self._point_inside_person_bbox(measurement, normalized_person_bboxes)
+        ):
+            self._mark_decision("reject", "person_occlusion_candidate")
+            result = self._reject(
+                track,
+                step_dt,
+                allow_coast=True,
+                frame_size=frame_size,
+                court_filter=court_filter,
+                occlusion_active=True,
+                coast_reason="person_occlusion_prediction",
+            )
         elif self._passes_gate(measurement, float(track.score), step_dt, frame_size):
             if soft_measurement:
                 self._mark_decision("accept", "soft_confidence_motion_gate")
@@ -221,9 +281,11 @@ class BallTrackFilter:
                 result = self._reject(
                     track,
                     step_dt,
-                    allow_coast=self.config.coast_on_outlier or allow_parabola_fill,
+                    allow_coast=self.config.coast_on_outlier or allow_parabola_fill or person_occlusion_active,
                     frame_size=frame_size,
                     court_filter=court_filter,
+                    occlusion_active=person_occlusion_active,
+                    coast_reason="person_occlusion_prediction" if person_occlusion_active else None,
                 )
 
         return self._finish_debug(track, result, step_dt, frame_size, debug_before)
@@ -235,13 +297,25 @@ class BallTrackFilter:
         dt: float | None = None,
         frame_shape: tuple[int, ...] | list[int] | None = None,
         court_prediction: Any | None = None,
+        person_bboxes: Sequence[Sequence[float]] | None = None,
     ) -> TrackResult:
         step_dt = self._resolve_dt(dt)
         frame_size = self._resolve_frame_size(frame_shape)
         court_filter = self._court_filter(court_prediction)
+        normalized_person_bboxes = self._normalize_person_bboxes(person_bboxes, frame_size)
         tracks = self._filter_candidates_by_court(tracks, frame_size, court_filter)
-        track = self._select_candidate(tracks, step_dt, frame_size, court_filter)
-        return self.update(track, dt=step_dt, frame_shape=frame_shape, court_prediction=court_prediction)
+        self._raw_candidate_count = len(tracks)
+        candidate_frame_index = self._frame_index + 1
+        self._observe_static_hotspots(tracks, frame_size, court_filter, candidate_frame_index)
+        tracks = self._filter_static_hotspots(tracks, frame_size, court_filter, step_dt, candidate_frame_index)
+        track = self._select_candidate(tracks, step_dt, frame_size, court_filter, normalized_person_bboxes)
+        return self.update(
+            track,
+            dt=step_dt,
+            frame_shape=frame_shape,
+            court_prediction=court_prediction,
+            person_bboxes=normalized_person_bboxes,
+        )
 
     def _select_candidate(
         self,
@@ -249,6 +323,7 @@ class BallTrackFilter:
         dt: float,
         frame_size: FrameSize | None,
         court_filter: _CourtFilter | None,
+        person_bboxes: Sequence[PersonBBox],
     ) -> TrackResult:
         if not tracks:
             self._pending_candidate_debug = {
@@ -267,6 +342,7 @@ class BallTrackFilter:
                 dt,
                 frame_size,
                 court_filter,
+                person_bboxes,
                 selected_index=selected_index,
                 selected_rank="primary",
             )
@@ -276,8 +352,18 @@ class BallTrackFilter:
         best_track = primary
         best_rank = float("-inf")
         best_index = -1
+        person_occlusion_active = self._person_occlusion_likely(dt, frame_size, person_bboxes)
         for index, candidate in enumerate(tracks):
-            rank = self._candidate_rank(candidate, predicted, dt, frame_size, court_filter, index)
+            rank = self._candidate_rank(
+                candidate,
+                predicted,
+                dt,
+                frame_size,
+                court_filter,
+                person_bboxes,
+                person_occlusion_active,
+                index,
+            )
             if rank > best_rank:
                 best_rank = rank
                 best_track = candidate
@@ -288,6 +374,7 @@ class BallTrackFilter:
             dt,
             frame_size,
             court_filter,
+            person_bboxes,
             selected_index=best_index,
             selected_rank=f"{best_rank:.4f}",
         )
@@ -300,6 +387,8 @@ class BallTrackFilter:
         dt: float,
         frame_size: FrameSize | None,
         court_filter: _CourtFilter | None,
+        person_bboxes: Sequence[PersonBBox],
+        person_occlusion_active: bool,
         index: int,
     ) -> float:
         measurement = self._measurement(track, frame_size, court_filter=court_filter)
@@ -311,7 +400,12 @@ class BallTrackFilter:
         gate_bonus = 100.0 if self._passes_gate(measurement, score, dt, frame_size) else 0.0
         distance_penalty = distance_to_prediction / 56.0
         heatmap_rank_penalty = index * 0.08
-        return gate_bonus + score * 12.0 - distance_penalty - heatmap_rank_penalty
+        occlusion_penalty = (
+            self.config.person_occlusion_candidate_penalty
+            if person_occlusion_active and self._point_inside_person_bbox(measurement, person_bboxes)
+            else 0.0
+        )
+        return gate_bonus + score * 12.0 - distance_penalty - heatmap_rank_penalty - occlusion_penalty
 
     def _resolve_frame_size(self, frame_shape: tuple[int, ...] | list[int] | None) -> FrameSize | None:
         if frame_shape is None:
@@ -387,6 +481,74 @@ class BallTrackFilter:
         if court_filter is not None and not self._point_inside_court_region(measurement, court_filter, frame_size):
             return False
         return True
+
+    def _normalize_person_bboxes(
+        self,
+        person_bboxes: Sequence[Sequence[float]] | None,
+        frame_size: FrameSize | None,
+    ) -> list[PersonBBox]:
+        if not self.config.person_occlusion_enabled or not person_bboxes:
+            return []
+
+        normalized: list[PersonBBox] = []
+        for raw_bbox in person_bboxes:
+            try:
+                x1, y1, x2, y2 = [float(value) for value in raw_bbox[:4]]
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not all(isfinite(value) for value in (x1, y1, x2, y2)):
+                continue
+            if x2 < x1:
+                x1, x2 = x2, x1
+            if y2 < y1:
+                y1, y2 = y2, y1
+            if frame_size is not None:
+                width, height = frame_size
+                x1 = min(max(x1, 0.0), width)
+                x2 = min(max(x2, 0.0), width)
+                y1 = min(max(y1, 0.0), height)
+                y2 = min(max(y2, 0.0), height)
+            if x2 - x1 < 2.0 or y2 - y1 < 2.0:
+                continue
+            normalized.append((x1, y1, x2, y2))
+        return normalized
+
+    def _person_occlusion_likely(
+        self,
+        dt: float,
+        frame_size: FrameSize | None,
+        person_bboxes: Sequence[PersonBBox],
+    ) -> bool:
+        if not self.config.person_occlusion_enabled or not person_bboxes:
+            return False
+        if not self._locked or self._last_point is None:
+            return False
+        if _length(self._velocity) < max(0.0, float(self.config.person_occlusion_min_speed_px_per_sec)):
+            return False
+
+        predicted = self._predict(dt)
+        if self._point_is_out_of_frame_prediction(predicted, frame_size):
+            return False
+
+        for bbox in person_bboxes:
+            if _point_inside_rect(self._last_point, bbox, padding=self.config.person_occlusion_padding_px):
+                return True
+            if _point_inside_rect(predicted, bbox, padding=self.config.person_occlusion_padding_px):
+                return True
+            if _segment_intersects_rect(
+                self._last_point,
+                predicted,
+                bbox,
+                padding=self.config.person_occlusion_padding_px,
+            ):
+                return True
+        return False
+
+    def _point_inside_person_bbox(self, point: Point, person_bboxes: Sequence[PersonBBox]) -> bool:
+        for bbox in person_bboxes:
+            if _point_inside_rect(point, bbox, padding=self.config.person_occlusion_padding_px):
+                return True
+        return False
 
     def _bootstrap(
         self,
@@ -575,14 +737,16 @@ class BallTrackFilter:
         allow_coast: bool,
         frame_size: FrameSize | None,
         court_filter: _CourtFilter | None,
+        occlusion_active: bool = False,
+        coast_reason: str | None = None,
     ) -> TrackResult:
         if self._top_exit_is_likely(dt, frame_size):
             self._enter_top_exit()
             self._mark_decision("top_exit_enter", "likely_top_exit", force=True)
             return self._invisible(track)
 
-        if allow_coast and self._can_coast(dt, frame_size, court_filter):
-            return self._coast(track, dt, frame_size, court_filter)
+        if allow_coast and self._can_coast(dt, frame_size, court_filter, occlusion_active=occlusion_active):
+            return self._coast(track, dt, frame_size, court_filter, reason=coast_reason)
 
         self._missed_frames += 1
         if self._missed_frames > self.config.max_missed_frames:
@@ -592,7 +756,14 @@ class BallTrackFilter:
             self._mark_decision("reject", "hidden_after_reject")
         return self._invisible(track)
 
-    def _can_coast(self, dt: float, frame_size: FrameSize | None, court_filter: _CourtFilter | None) -> bool:
+    def _can_coast(
+        self,
+        dt: float,
+        frame_size: FrameSize | None,
+        court_filter: _CourtFilter | None,
+        *,
+        occlusion_active: bool = False,
+    ) -> bool:
         if not self._locked or self._last_point is None:
             return False
 
@@ -608,9 +779,15 @@ class BallTrackFilter:
             self._last_point[1] + self._velocity[1] * dt,
         )
 
+        max_coast_frames = self.config.max_coast_frames
+        min_speed = self.config.min_coast_speed_px_per_sec
+        if occlusion_active:
+            max_coast_frames = max(max_coast_frames, int(self.config.person_occlusion_coast_frames))
+            min_speed = min(min_speed, float(self.config.person_occlusion_min_speed_px_per_sec))
+
         return (
-            self._coast_frames < self.config.max_coast_frames
-            and _length(self._velocity) >= self.config.min_coast_speed_px_per_sec
+            self._coast_frames < max_coast_frames
+            and _length(self._velocity) >= min_speed
             and self._point_can_be_predicted(predicted, frame_size, court_filter)
         )
 
@@ -684,12 +861,192 @@ class BallTrackFilter:
             )
         ]
 
+    def _observe_static_hotspots(
+        self,
+        tracks: Sequence[TrackResult],
+        frame_size: FrameSize | None,
+        court_filter: _CourtFilter | None,
+        frame_index: int,
+    ) -> None:
+        if not self.config.static_hotspot_enabled:
+            self._static_hotspot_count = 0
+            return
+
+        self._prune_static_hotspots(frame_index)
+        updated_indices: set[int] = set()
+        for track in tracks:
+            if float(track.score) < self.config.min_confidence:
+                continue
+            measurement = self._measurement(track, frame_size, court_filter=court_filter)
+            if measurement is None:
+                continue
+
+            index = self._nearest_static_hotspot_index(measurement)
+            if index is None:
+                self._static_hotspots.append(
+                    _StaticHotspot(
+                        anchor=measurement,
+                        point=measurement,
+                        score=float(track.score),
+                        first_frame=frame_index,
+                        last_frame=frame_index,
+                    )
+                )
+                updated_indices.add(len(self._static_hotspots) - 1)
+                continue
+
+            if index in updated_indices:
+                continue
+            hotspot = self._static_hotspots[index]
+            if frame_index > hotspot.last_frame:
+                hotspot.count += 1
+            hotspot.last_frame = frame_index
+            hotspot.score = max(hotspot.score, float(track.score))
+            hotspot.max_distance = max(hotspot.max_distance, _distance(measurement, hotspot.anchor))
+            hotspot.point = (
+                0.78 * hotspot.point[0] + 0.22 * measurement[0],
+                0.78 * hotspot.point[1] + 0.22 * measurement[1],
+            )
+            if self._hotspot_is_static(hotspot):
+                hotspot.suppressed_until = max(
+                    hotspot.suppressed_until,
+                    frame_index + max(1, int(self.config.static_hotspot_suppression_frames)),
+                )
+            updated_indices.add(index)
+
+        self._static_hotspot_count = sum(
+            1 for hotspot in self._static_hotspots if self._hotspot_is_active(hotspot, frame_index)
+        )
+
+    def _filter_static_hotspots(
+        self,
+        tracks: Sequence[TrackResult],
+        frame_size: FrameSize | None,
+        court_filter: _CourtFilter | None,
+        dt: float,
+        frame_index: int,
+    ) -> list[TrackResult]:
+        self._static_filtered_count = 0
+        if not self.config.static_hotspot_enabled:
+            return list(tracks)
+
+        selected: list[TrackResult] = []
+        best_score = 0.0
+        heatmap_shape: list[int] = []
+        for track in tracks:
+            best_score = max(best_score, float(track.score))
+            if not heatmap_shape:
+                heatmap_shape = list(track.heatmap_shape)
+
+            measurement = self._measurement(track, frame_size, court_filter=court_filter)
+            if measurement is not None and self._point_matches_static_hotspot(measurement, dt, frame_index, frame_size):
+                self._static_filtered_count += 1
+                continue
+            selected.append(track)
+
+        if selected:
+            return selected
+        if self._static_filtered_count <= 0:
+            return list(tracks)
+        return [
+            TrackResult(
+                ball_xy=[-1.0, -1.0],
+                visible=0,
+                score=best_score,
+                heatmap_shape=heatmap_shape,
+            )
+        ]
+
+    def _nearest_static_hotspot_index(self, point: Point) -> int | None:
+        radius = max(1.0, float(self.config.static_hotspot_radius_px))
+        best_index: int | None = None
+        best_distance = radius
+        for index, hotspot in enumerate(self._static_hotspots):
+            distance = _distance(point, hotspot.point)
+            if distance <= best_distance:
+                best_index = index
+                best_distance = distance
+        return best_index
+
+    def _prune_static_hotspots(self, frame_index: int) -> None:
+        memory_frames = max(1, int(self.config.static_hotspot_memory_frames))
+        self._static_hotspots = [
+            hotspot
+            for hotspot in self._static_hotspots
+            if frame_index - hotspot.last_frame <= memory_frames or frame_index <= hotspot.suppressed_until
+        ]
+
+    def _hotspot_is_static(self, hotspot: _StaticHotspot) -> bool:
+        return (
+            hotspot.count >= max(1, int(self.config.static_hotspot_min_frames))
+            and hotspot.max_distance <= max(0.0, float(self.config.static_hotspot_max_motion_px))
+        )
+
+    def _hotspot_is_active(self, hotspot: _StaticHotspot, frame_index: int) -> bool:
+        return frame_index <= hotspot.suppressed_until or self._hotspot_is_static(hotspot)
+
+    def _point_matches_static_hotspot(
+        self,
+        point: Point,
+        dt: float,
+        frame_index: int,
+        frame_size: FrameSize | None,
+    ) -> bool:
+        radius = max(1.0, float(self.config.static_hotspot_radius_px))
+        for hotspot in self._static_hotspots:
+            if not self._hotspot_is_active(hotspot, frame_index) and not self._hotspot_is_slow_edge_drift(
+                hotspot,
+                point,
+                frame_size,
+            ):
+                continue
+            if _distance(point, hotspot.point) > radius:
+                continue
+            if self._moving_track_can_claim_static_point(point, dt):
+                return False
+            return True
+        return False
+
+    def _hotspot_is_slow_edge_drift(
+        self,
+        hotspot: _StaticHotspot,
+        point: Point,
+        frame_size: FrameSize | None,
+    ) -> bool:
+        if frame_size is None:
+            return False
+        if hotspot.count < max(1, int(self.config.static_hotspot_min_frames)):
+            return False
+        if hotspot.max_distance > max(0.0, float(self.config.static_hotspot_edge_max_motion_px)):
+            return False
+
+        width, height = frame_size
+        x_margin = width * max(0.0, float(self.config.static_hotspot_edge_band_ratio))
+        y_margin = height * max(0.0, float(self.config.static_hotspot_edge_band_ratio))
+        return (
+            point[0] <= x_margin
+            or point[0] >= width - x_margin
+            or point[1] <= y_margin
+            or point[1] >= height - y_margin
+        )
+
+    def _moving_track_can_claim_static_point(self, point: Point, dt: float) -> bool:
+        if not self._locked or self._last_point is None:
+            return False
+        speed = _length(self._velocity)
+        if speed < max(0.0, float(self.config.static_hotspot_tracking_speed_px_per_sec)):
+            return False
+        predicted = self._predict(dt)
+        return _distance(point, predicted) <= max(float(self.config.close_gate_px), float(self.config.base_gate_px))
+
     def _coast(
         self,
         track: TrackResult,
         dt: float,
         frame_size: FrameSize | None,
         court_filter: _CourtFilter | None,
+        *,
+        reason: str | None = None,
     ) -> TrackResult:
         assert self._last_point is not None
 
@@ -701,7 +1058,7 @@ class BallTrackFilter:
                 (predicted[1] - self._last_point[1]) / max(dt, 1e-6),
             )
             score_decay = self.config.parabola_score_decay
-            self._mark_decision("coast", "parabola_prediction", force=True)
+            self._mark_decision("coast", reason or "parabola_prediction", force=True)
         else:
             predicted = (
                 self._last_point[0] + self._velocity[0] * dt,
@@ -712,7 +1069,7 @@ class BallTrackFilter:
                 self._velocity[1] * self.config.coast_velocity_decay,
             )
             score_decay = self.config.coast_score_decay
-            self._mark_decision("coast", "velocity_prediction", force=True)
+            self._mark_decision("coast", reason or "velocity_prediction", force=True)
 
         if not self._point_can_be_predicted(predicted, frame_size, court_filter):
             self._missed_frames += 1
@@ -990,6 +1347,9 @@ class BallTrackFilter:
             **candidate_debug,
             "frame_index": self._frame_index,
             "dt": dt,
+            "raw_candidate_count": self._raw_candidate_count,
+            "static_filtered_count": self._static_filtered_count,
+            "static_hotspot_count": self._static_hotspot_count,
             "action": self._decision_action,
             "reason": self._decision_reason,
             "input_visible": int(bool(input_track.visible)),
@@ -1017,6 +1377,7 @@ class BallTrackFilter:
         dt: float,
         frame_size: FrameSize | None,
         court_filter: _CourtFilter | None,
+        person_bboxes: Sequence[PersonBBox],
         *,
         selected_index: int,
         selected_rank: str,
@@ -1032,20 +1393,36 @@ class BallTrackFilter:
                 else -1
             )
             rank = (
-                self._candidate_rank(track, predicted, dt, frame_size, court_filter, index)
+                self._candidate_rank(
+                    track,
+                    predicted,
+                    dt,
+                    frame_size,
+                    court_filter,
+                    person_bboxes,
+                    self._person_occlusion_likely(dt, frame_size, person_bboxes),
+                    index,
+                )
                 if predicted is not None and self._locked and self._last_point is not None
                 else float("nan")
+            )
+            person_occ = int(
+                measurement is not None
+                and self._person_occlusion_likely(dt, frame_size, person_bboxes)
+                and self._point_inside_person_bbox(measurement, person_bboxes)
             )
             x = track.ball_xy[0] if len(track.ball_xy) > 0 else -1.0
             y = track.ball_xy[1] if len(track.ball_xy) > 1 else -1.0
             items.append(
                 f"{index}:x={float(x):.1f},y={float(y):.1f},s={float(track.score):.3f},"
-                f"v={int(bool(track.visible))},d={distance:.1f},gate={gate},rank={rank:.3f}"
+                f"v={int(bool(track.visible))},d={distance:.1f},gate={gate},occ={person_occ},rank={rank:.3f}"
             )
         return {
             "candidate_count": len(tracks),
             "selected_candidate_index": selected_index,
             "selected_candidate_rank": selected_rank,
+            "static_filtered_count": self._static_filtered_count,
+            "static_hotspot_count": self._static_hotspot_count,
             "candidates": " | ".join(items),
         }
 
@@ -1092,6 +1469,49 @@ def _point_inside_frame(point: Point, frame_size: FrameSize, *, margin: float) -
         -allowed_margin <= point[0] < width + allowed_margin
         and -allowed_margin <= point[1] < height + allowed_margin
     )
+
+
+def _point_inside_rect(point: Point, rect: PersonBBox, *, padding: float) -> bool:
+    x1, y1, x2, y2 = rect
+    pad = max(0.0, float(padding))
+    return x1 - pad <= point[0] <= x2 + pad and y1 - pad <= point[1] <= y2 + pad
+
+
+def _segment_intersects_rect(a: Point, b: Point, rect: PersonBBox, *, padding: float) -> bool:
+    if _point_inside_rect(a, rect, padding=padding) or _point_inside_rect(b, rect, padding=padding):
+        return True
+
+    x1, y1, x2, y2 = rect
+    pad = max(0.0, float(padding))
+    min_x, max_x = x1 - pad, x2 + pad
+    min_y, max_y = y1 - pad, y2 + pad
+    dx = b[0] - a[0]
+    dy = b[1] - a[1]
+    t0 = 0.0
+    t1 = 1.0
+
+    for p, q in (
+        (-dx, a[0] - min_x),
+        (dx, max_x - a[0]),
+        (-dy, a[1] - min_y),
+        (dy, max_y - a[1]),
+    ):
+        if abs(p) < 1e-9:
+            if q < 0.0:
+                return False
+            continue
+        r = q / p
+        if p < 0.0:
+            if r > t1:
+                return False
+            if r > t0:
+                t0 = r
+        else:
+            if r < t0:
+                return False
+            if r < t1:
+                t1 = r
+    return True
 
 
 def _extract_court_filter(court_prediction: Any | None) -> _CourtFilter | None:

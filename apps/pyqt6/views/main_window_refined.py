@@ -309,7 +309,7 @@ class CourtHeatmapWidget(QWidget):
     DOUBLE_LONG_SERVICE_FROM_BACK_MM = 760.0
     SHORT_SERVICE_FROM_NET_MM = 1980.0
     HEATMAP_MAX_POINTS = 1600
-    HEATMAP_REFRESH_INTERVAL = 2
+    HEATMAP_REFRESH_INTERVAL = 12
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -842,7 +842,7 @@ class MainWindow(QMainWindow):
         card1, self.lbl_realtime_fps = self._create_metric_card("实时帧数", "0.0 FPS")
         card2, self.lbl_avg_conf = self._create_metric_card("平均置信度", "0.0%")
         card3, self.lbl_valid_pose = self._create_metric_card("推理 FPS", "0.0 FPS")
-        card4, self.lbl_valid_track = self._create_metric_card("有效轨迹帧数", "0")
+        card4, self.lbl_valid_track = self._create_metric_card("击球次数", "0")
 
         for card in (card1, card2, card3, card4):
             card.setMinimumWidth(180)
@@ -931,6 +931,7 @@ class MainWindow(QMainWindow):
         tab_pose = QWidget()
         pose_layout = QVBoxLayout(tab_pose)
         pose_layout.setContentsMargins(12, 12, 12, 12)
+        pose_layout.setSpacing(10)
 
         pose_frame = QFrame()
         pose_frame.setObjectName("emptyStateCard")
@@ -940,10 +941,24 @@ class MainWindow(QMainWindow):
 
         pose_title = QLabel("姿态与轨迹")
         pose_title.setObjectName("sectionTitle")
+        header_row = QHBoxLayout()
+        header_row.setSpacing(12)
+        distance_layout = QVBoxLayout()
+        distance_layout.setSpacing(4)
+        self.lbl_top_player_distance = QLabel(self._format_player_distance("上方球员", 0.0))
+        self.lbl_top_player_distance.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_top_player_distance.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.lbl_bottom_player_distance = QLabel(self._format_player_distance("下方球员", 0.0))
+        self.lbl_bottom_player_distance.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_bottom_player_distance.setAlignment(Qt.AlignmentFlag.AlignRight)
+        distance_layout.addWidget(self.lbl_top_player_distance, alignment=Qt.AlignmentFlag.AlignRight)
+        distance_layout.addWidget(self.lbl_bottom_player_distance, alignment=Qt.AlignmentFlag.AlignRight)
+        header_row.addWidget(pose_title, stretch=1, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        header_row.addLayout(distance_layout)
         self.court_widget = CourtHeatmapWidget()
 
-        pose_frame_layout.addWidget(pose_title, alignment=Qt.AlignmentFlag.AlignCenter)
         pose_frame_layout.addWidget(self.court_widget, stretch=1)
+        pose_layout.addLayout(header_row)
         pose_layout.addWidget(pose_frame, stretch=1)
         self.tabs.addTab(tab_pose, "姿态")
 
@@ -1003,11 +1018,11 @@ class MainWindow(QMainWindow):
         self.btn_browse_track_model.setObjectName("btnBrowseTrackModel")
         self.btn_browse_track_model.clicked.connect(self.trackModelBrowseRequested.emit)
 
-        debug_label = QLabel("Debug CSV")
+        debug_label = QLabel("Debug Logs")
         debug_label.setObjectName("styleLabel")
-        self.debug_csv_enabled = ToggleSwitch("Write every TrackNet prediction frame to CSV")
+        self.debug_csv_enabled = ToggleSwitch("Write frame analysis logs")
         self.debug_csv_enabled.setChecked(False)
-        debug_note = QLabel("Writes candidate points, selected result, and filter decision for every frame.")
+        debug_note = QLabel("Writes TrackNet filter CSV plus frame JSONL with ball, pose, and hit-point events.")
         debug_note.setObjectName("sectionNote")
         debug_note.setWordWrap(True)
 
@@ -1220,10 +1235,49 @@ class MainWindow(QMainWindow):
         self.stroke_pie_chart.clear_counts()
         self._refresh_stroke_total()
         self.court_widget.clear_player_heatmap()
+        self.set_player_distances(None)
         self.lbl_realtime_fps.setText("0.0 FPS")
         self.lbl_avg_conf.setText("0.0%")
         self.lbl_valid_pose.setText("0.0 FPS")
         self.lbl_valid_track.setText("0")
 
+    def stroke_total_count(self) -> int:
+        return self.stroke_pie_chart.total_count()
+
+    def set_player_distances(self, distances_m: object | None) -> None:
+        top_distance = 0.0
+        bottom_distance = 0.0
+        if isinstance(distances_m, dict):
+            top_distance = self._safe_distance_m(distances_m.get("top", 0.0))
+            bottom_distance = self._safe_distance_m(distances_m.get("bottom", 0.0))
+        elif isinstance(distances_m, (list, tuple)):
+            if len(distances_m) > 0:
+                top_distance = self._safe_distance_m(distances_m[0])
+            if len(distances_m) > 1:
+                bottom_distance = self._safe_distance_m(distances_m[1])
+
+        self.lbl_top_player_distance.setText(self._format_player_distance("上方球员", top_distance))
+        self.lbl_bottom_player_distance.setText(self._format_player_distance("下方球员", bottom_distance))
+
+    @staticmethod
+    def _format_player_distance(label: str, distance_m: float) -> str:
+        return (
+            f"<span style='font-weight:700;color:#111827;'>{label}: </span>"
+            f"<span style='font-weight:700;color:#DC2626;'>{distance_m:.2f}</span>"
+            "<span style='font-weight:700;color:#111827;'> 米</span>"
+        )
+
+    @staticmethod
+    def _safe_distance_m(value: object) -> float:
+        try:
+            distance = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if distance != distance or distance in (float("inf"), float("-inf")):
+            return 0.0
+        return max(0.0, distance)
+
     def _refresh_stroke_total(self) -> None:
-        self.lbl_stroke_total.setText(f"总击球 {self.stroke_pie_chart.total_count()} 次")
+        total = self.stroke_total_count()
+        self.lbl_stroke_total.setText(f"总击球 {total} 次")
+        self.lbl_valid_track.setText(str(total))

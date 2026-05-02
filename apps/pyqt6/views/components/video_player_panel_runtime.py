@@ -204,6 +204,9 @@ class VideoPlayerWidget(QFrame):
 
         self._source_path = ""
         self._current_pixmap: QPixmap | None = None
+        self._scaled_pixmap: QPixmap | None = None
+        self._scaled_source_key: int | None = None
+        self._scaled_label_size = QSize()
         self._status_text = ""
         self._status_state = ""
 
@@ -291,11 +294,23 @@ class VideoPlayerWidget(QFrame):
         if label_size.width() <= 0 or label_size.height() <= 0:
             QTimer.singleShot(10, self._render_current_pixmap)
             return
-        scaled = self._current_pixmap.scaled(
-            label_size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        source_key = self._current_pixmap.cacheKey()
+        if (
+            self._scaled_pixmap is not None
+            and not self._scaled_pixmap.isNull()
+            and self._scaled_source_key == source_key
+            and self._scaled_label_size == label_size
+        ):
+            scaled = self._scaled_pixmap
+        else:
+            scaled = self._current_pixmap.scaled(
+                label_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            self._scaled_pixmap = scaled
+            self._scaled_source_key = source_key
+            self._scaled_label_size = QSize(label_size)
         self.video_label.setPixmap(scaled)
         self.court_overlay.setGeometry(self.video_label.rect())
         display_rect = QRect(
@@ -324,6 +339,9 @@ class VideoPlayerWidget(QFrame):
         if image.isNull():
             return
         self._current_pixmap = QPixmap.fromImage(image)
+        self._scaled_pixmap = None
+        self._scaled_source_key = None
+        self._scaled_label_size = QSize()
         if self.preview_stack.currentWidget() is not self.video_label:
             self.preview_stack.setCurrentWidget(self.video_label)
         self.court_overlay.set_court(court)
@@ -343,6 +361,9 @@ class VideoPlayerWidget(QFrame):
     def clear_video(self) -> None:
         self._source_path = ""
         self._current_pixmap = None
+        self._scaled_pixmap = None
+        self._scaled_source_key = None
+        self._scaled_label_size = QSize()
         self.path_edit.clear()
         self.path_edit.setToolTip("")
         self.video_label.clear()
@@ -387,6 +408,7 @@ class VideoTimelineWidget(QFrame):
         self._dragging = False
         self._duration_ms = 0
         self._position_ms = 0
+        self._last_label_text = ""
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 6, 12, 6)
@@ -423,9 +445,10 @@ class VideoTimelineWidget(QFrame):
 
     def _refresh_label(self, position_ms: int | None = None) -> None:
         pos = self._position_ms if position_ms is None else position_ms
-        self.time_label.setText(
-            f"{self._format_time(pos)} / {self._format_time(self._duration_ms)}"
-        )
+        text = f"{self._format_time(pos)} / {self._format_time(self._duration_ms)}"
+        if text != self._last_label_text:
+            self._last_label_text = text
+            self.time_label.setText(text)
 
     def _on_slider_pressed(self) -> None:
         self._dragging = True
@@ -441,14 +464,23 @@ class VideoTimelineWidget(QFrame):
         self._refresh_label(value)
 
     def set_duration(self, duration_ms: int) -> None:
-        self._duration_ms = max(0, duration_ms)
+        duration_ms = max(0, duration_ms)
+        if duration_ms == self._duration_ms and self.seek_slider.maximum() == duration_ms:
+            return
+        self._duration_ms = duration_ms
         self.seek_slider.setRange(0, self._duration_ms)
         self._refresh_label()
 
     def set_position(self, position_ms: int) -> None:
-        self._position_ms = max(0, min(position_ms, self._duration_ms))
+        new_position = max(0, min(position_ms, self._duration_ms))
+        if new_position == self._position_ms and (
+            self._dragging or self.seek_slider.value() == new_position
+        ):
+            return
+        self._position_ms = new_position
         if not self._dragging:
-            self.seek_slider.setValue(self._position_ms)
+            if self.seek_slider.value() != self._position_ms:
+                self.seek_slider.setValue(self._position_ms)
             self._refresh_label()
 
     def set_interactive(self, enabled: bool) -> None:
@@ -460,4 +492,5 @@ class VideoTimelineWidget(QFrame):
         self._position_ms = 0
         self.seek_slider.setRange(0, 0)
         self.seek_slider.setValue(0)
-        self.time_label.setText("00:00 / 00:00")
+        self._last_label_text = "00:00 / 00:00"
+        self.time_label.setText(self._last_label_text)
