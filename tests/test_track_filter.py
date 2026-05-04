@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from src.postprocess.track_filter import BallTrackFilter, _TrajectoryPoint
+from src.postprocess.track_filter import BallTrackFilter, LegacyBallTrackFilterAlgorithm, _TrajectoryPoint
 from src.utils.structures import TrackResult
 
 
@@ -29,7 +29,64 @@ def _air_court() -> dict[str, object]:
     }
 
 
+class _RecordingTrackFilterAlgorithm:
+    def __init__(self) -> None:
+        self.debug_records: list[dict[str, object]] = []
+        self.calls: list[dict[str, object]] = []
+        self.reset_called = False
+
+    def reset(self) -> None:
+        self.reset_called = True
+        self.debug_records.clear()
+
+    def update(self, track: TrackResult, **kwargs: object) -> TrackResult:
+        self.calls.append({"method": "update", "track": track, "kwargs": kwargs})
+        self.debug_records.append({"action": "custom_update"})
+        return _track(33.0, 44.0, 0.66)
+
+    def update_candidates(self, tracks: object, **kwargs: object) -> TrackResult:
+        self.calls.append({"method": "update_candidates", "tracks": tracks, "kwargs": kwargs})
+        self.debug_records.append({"action": "custom_candidates"})
+        return _track(42.0, 43.0, 0.77)
+
+    def last_debug_record(self) -> dict[str, object] | None:
+        if not self.debug_records:
+            return None
+        return dict(self.debug_records[-1])
+
+
 class BallTrackFilterTest(unittest.TestCase):
+    def test_delegates_to_custom_algorithm_interface(self) -> None:
+        algorithm = _RecordingTrackFilterAlgorithm()
+        tracker = BallTrackFilter(algorithm=algorithm)
+
+        selected = tracker.update_candidates(
+            [_track(10.0, 20.0, 0.4)],
+            dt=0.04,
+            frame_shape=(720, 1280, 3),
+            court_prediction={"valid": False},
+            person_bboxes=[(1.0, 2.0, 3.0, 4.0)],
+        )
+        updated = tracker.update(_track(11.0, 21.0, 0.5), dt=0.05)
+
+        self.assertEqual(selected.ball_xy, [42.0, 43.0])
+        self.assertEqual(updated.ball_xy, [33.0, 44.0])
+        self.assertEqual([call["method"] for call in algorithm.calls], ["update_candidates", "update"])
+        self.assertIs(tracker.debug_records, algorithm.debug_records)
+        self.assertEqual(tracker.last_debug_record(), {"action": "custom_update"})
+
+        tracker.reset()
+        self.assertTrue(algorithm.reset_called)
+        self.assertEqual(tracker.debug_records, [])
+
+    def test_legacy_algorithm_name_keeps_original_behavior(self) -> None:
+        tracker = LegacyBallTrackFilterAlgorithm(fps=25.0, debug_enabled=True)
+
+        output = tracker.update(_track(210.0, 440.0, 0.73), frame_shape=(720, 1280, 3))
+
+        self.assertTrue(output.visible)
+        self.assertEqual(tracker.debug_records[-1]["action"], "bootstrap_accept")
+
     def test_rejects_isolated_bootstrap_outlier_before_locking(self) -> None:
         tracker = BallTrackFilter(fps=25.0)
 

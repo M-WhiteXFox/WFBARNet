@@ -26,7 +26,33 @@ class FrameLogExporterTest(unittest.TestCase):
         record = frame_result_log_record(
             result,
             timestamp_ms=480,
-            hit_event={"frame_id": 11, "timestamp_ms": 440, "ball_xy": [120.0, 50.0]},
+            hit_event={
+                "event_type": "hit",
+                "frame_id": 11,
+                "timestamp_ms": 440,
+                "ball_xy": [120.0, 50.0],
+                "rule": "vy_reversal",
+                "confidence": 0.9,
+                "all_rules": ["vy_reversal"],
+            },
+            trajectory_event={
+                "event_type": "landing",
+                "frame_id": 12,
+                "timestamp_ms": 480,
+                "ball_xy": [123.0, 45.0],
+                "rule": "speed_step",
+                "confidence": 0.9,
+                "all_rules": ["speed_step"],
+                "features": {"v_curr": 1.0},
+            },
+            landing_event={
+                "event_type": "landing",
+                "frame_id": 12,
+                "timestamp_ms": 480,
+                "ball_xy": [123.0, 45.0],
+                "rule": "speed_step",
+                "confidence": 0.9,
+            },
         )
 
         self.assertEqual(record["frame_id"], 12)
@@ -36,6 +62,10 @@ class FrameLogExporterTest(unittest.TestCase):
         self.assertEqual(record["pose"][0]["bbox"], [10.0, 20.0, 70.0, 160.0])
         self.assertEqual(record["pose"][0]["keypoints"], [[12.0, 24.0], [30.0, 45.0]])
         self.assertEqual(record["hit_event"]["ball_xy"], [120.0, 50.0])
+        self.assertEqual(record["hit_event"]["rule"], "vy_reversal")
+        self.assertEqual(record["trajectory_event"]["event_type"], "landing")
+        self.assertEqual(record["trajectory_event"]["rule"], "speed_step")
+        self.assertEqual(record["landing_event"]["ball_xy"], [123.0, 45.0])
 
     def test_write_frame_log_jsonl_writes_one_json_object_per_line(self) -> None:
         buffer = StringIO()

@@ -1,6 +1,6 @@
 # 当前轨迹推理流程
 
-更新时间：2026-05-03
+更新时间：2026-05-04
 
 本文档记录当前 PyQt6 应用中的羽毛球轨迹推理、轨迹滤波、击球点检测、姿态辅助和调试日志流程。文档描述的是当前代码实现，不是理想设计。
 
@@ -11,10 +11,12 @@
 - `src/preprocess/track.py`
 - `src/postprocess/track.py`
 - `src/postprocess/track_filter.py`
+- `src/postprocess/trajectory_events.py`
 - `src/postprocess/pose.py`
 - `src/postprocess/player_distance.py`
 - `src/utils/visualize.py`
 - `src/utils/exporters.py`
+- `assets/docs/track_filter_algorithm_interface.md`
 
 ## 1. 总体流程
 
@@ -27,7 +29,8 @@
   -> CourtPoseTargetTracker 选择并稳定双方球员姿态
   -> BallTrackFilter 过滤候选点、预测丢失帧、relock 新轨迹
   -> FrameResult(frame_id, pose, track)
-  -> TrackTrailRenderer 更新轨迹尾迹和 hit_event
+  -> RealtimeTrajectoryEventDetector 生成 hit / landing / out_of_frame 候选事件
+  -> TrackTrailRenderer 更新轨迹尾迹并绘制事件 marker
   -> BSTStrokeRecognizer 根据 hit_event 做击球动作分类
   -> PlayerDistanceAccumulator 统计球员场地投影位移
   -> UI 显示，并可写入 track_debug.csv / frame_log.jsonl
@@ -38,16 +41,17 @@
 - 视频回放使用 `cv2.VideoCapture` 的帧时间和视频 FPS。
 - 摄像头实时流使用 `QElapsedTimer` 作为当前时间。
 
-无论当前帧是否实际渲染到 UI，`TrackTrailRenderer.update_hit_detection(...)` 都会被调用，因此 `hit_event` 和 JSONL 日志不会因为降低显示帧率而中断。
+无论当前帧是否实际渲染到 UI，`RealtimeTrajectoryEventDetector.update(...)` 都会被调用，因此 `hit_event`、`trajectory_event` 和 JSONL 日志不会因为降低显示帧率而中断。`TrackTrailRenderer` 在当前主路径中只更新轨迹历史并绘制事件 marker，不生成主 `hit_event`。
 
 ## 2. 运行时主循环
 
 运行时在 `analysis_controller_runtime.py` 中创建以下状态对象：
 
-- `BallTrackFilter(fps=fps, debug_enabled=...)`
+- `BallTrackFilter(algorithm=TrackNetV3TrajectoryFilter(...))`
 - `CourtPoseTargetTracker(...)`
 - `PlayerDistanceAccumulator()`
 - `TrackTrailRenderer(fps=fps, history_seconds=0.5)`
+- `RealtimeTrajectoryEventDetector(fps=fps)`
 - 可选的 `BSTStrokeRecognizer`
 
 每一帧的核心步骤：
@@ -59,9 +63,11 @@
 5. 用 `CourtPoseTargetTracker` 更新稳定后的球员姿态。
 6. 用 `BallTrackFilter.update_candidates(...)` 从候选球点中输出最终 `TrackResult`。
 7. 组装 `FrameResult(frame_id, pose, track)`。
-8. 更新轨迹尾迹和击球事件。
-9. 写入可选调试日志。
-10. 更新 UI payload，包括球点、姿态、场地、球员位移、击球分类等。
+8. 用 TrackNetV3 `bounce_detection` 风格规则更新 `trajectory_event`。
+9. 当 `trajectory_event.event_type == "hit"` 时，将该事件作为主 `hit_event`。
+10. 写入可选调试日志。
+11. 更新轨迹尾迹，并用不同颜色绘制 `hit`、`landing`、`out_of_frame` 事件 marker。
+12. 更新 UI payload，包括球点、姿态、场地、球员位移、击球分类和轨迹事件等。
 
 当 TrackNet 使用 TensorRT 后端且姿态推理刚好到期时，轨迹和姿态会通过 `ThreadPoolExecutor(max_workers=2)` 并行推理。
 
@@ -87,7 +93,7 @@ candidate_score_thr_ratio = 0.6
 candidate_score_thr = score_thr * candidate_score_thr_ratio = 0.21
 ```
 
-注意：候选列表可以包含 `score < 0.35` 的弱候选，但 `BallTrackFilter` 的正式 measurement 仍默认要求 `min_confidence = 0.35`。
+注意：候选列表可以包含 `score < 0.35` 的弱候选。当前 PyQt6 默认接入的 `TrackNetV3TrajectoryFilter` 只接收 `candidate_min_confidence = 0.35` 以上的候选点。
 
 ## 4. TrackNet 输入预处理
 
@@ -151,9 +157,40 @@ TrackResult(
 )
 ```
 
-`visible=1` 表示当前滤波器认为该帧有可用球点。这个点可能来自真实候选点，也可能来自短时 coast 预测。
+`visible=1` 表示当前滤波器认为该帧有可用球点。当前 PyQt6 默认的 `TrackNetV3TrajectoryFilter` 会保留 TrackNetV3 可见候选点，不做 Kalman coast；可选 fixed-lag 模式下，中间缺失段可能来自 TrackNetV3 风格的线性 inpaint。
+
+### 可插拔算法接口
+
+`BallTrackFilter` 现在同时承担默认滤波器和算法入口两种角色：
+
+- `BallTrackFilter(...)`：不传 `algorithm` 时继续使用原状态机算法。
+- `BallTrackFilter(algorithm=...)`：传入新算法时，`update(...)`、`update_candidates(...)`、`reset()`、`debug_records` 和 `last_debug_record()` 都委托给新算法。
+- `LegacyBallTrackFilterAlgorithm(...)`：原算法的显式类名，用于配置、测试或文档中明确选择旧算法。
+
+新算法需要满足 `TrackFilterAlgorithm` 接口，输入仍是 `TrackResult` 或候选 `list[TrackResult]`，输出必须是标准 `TrackResult`。接口签名、调试字段、参数语义和最小实现示例见 `assets/docs/track_filter_algorithm_interface.md`。
+
+当前 PyQt6 运行时已启用 TrackNetV3 风格轨迹修复模块 `TrackNetV3TrajectoryFilter`，位于 `src/postprocess/tracknet_v3_filter.py`。它从 `D:\Github\TrackNet-V3-based-Badminton` 项目的 `generate_inpaint_mask(...)` 和 `linear_interp(...)` 迁移核心规则：可见候选点原样保留；如果 fixed-lag 模式允许看到未来端点，则对非顶部出画的中间缺失段做线性修复。实时显示默认 `fixed_lag_frames = 0`，避免输出点时间戳落后一帧。
+
+```python
+from src.postprocess.track_filter import BallTrackFilter
+from src.postprocess.tracknet_v3_filter import TrackNetV3TrajectoryFilter
+
+track_filter = BallTrackFilter(
+    algorithm=TrackNetV3TrajectoryFilter(
+        fps=fps,
+        debug_enabled=True,
+        fixed_lag_frames=0,
+    )
+)
+```
+
+旧的 `RealtimeKalmanTrackCorrector` 仍保留在 `src/postprocess/track_correction.py`，可通过 `BallTrackFilter(algorithm=...)` 显式接入。它不再是 PyQt6 默认运行路径。
 
 ## 7. 候选点预过滤
+
+当前 PyQt6 默认 `TrackNetV3TrajectoryFilter.update_candidates(...)` 只做轻量候选选择：过滤不可见、低于 `candidate_min_confidence = 0.35`、或超出画面的候选点，然后选择最高分候选。它不做 Kalman 预测、人体遮挡 coast 或场地范围预过滤，因此击球后的高分急转向候选会直接保留，不会被旧速度模型拖拽。
+
+以下规则描述原 `BallTrackFilter` 状态机和可选 Kalman 纠偏路径中的预过滤逻辑，不是当前 PyQt6 默认路径：
 
 `update_candidates(...)` 先做三件事：
 
@@ -345,7 +382,7 @@ relock 时会先 `_drop_lock()` 清空旧锁定状态，再 accept 新 measureme
 `TrackTrailRenderer` 不参与 BallTrackFilter 的数据滤波，但参与两件事：
 
 - 绘制球点和尾迹。
-- 根据滤波后的轨迹和姿态生成 `hit_event`。
+- 绘制 `trajectory_event` 产生的击球、落地、出画 marker。
 
 尾迹规则：
 
@@ -357,81 +394,39 @@ relock 时会先 `_drop_lock()` 清空旧锁定状态，再 accept 新 measureme
 
 ## 16. 击球点检测
 
-`TrackTrailRenderer.update_hit_detection(...)` 会为每个可见球点保存：
+当前 PyQt6 主路径的 `hit_event` 只来自 `RealtimeTrajectoryEventDetector`：当 `trajectory_event.event_type == "hit"` 时，该事件会写入 `frame_log.jsonl` 的 `hit_event`，并继续供 `BSTStrokeRecognizer` 使用。
 
-```text
-(timestamp_s, frame_id, x, y, score, segment_id, occluded, pose_score)
-```
+旧的 `TrackTrailRenderer` 内部击球检测入口、姿态辅助击球评分和可视化层内部 hit marker 队列已经清理。`TrackTrailRenderer` 现在只维护轨迹历史并绘制外部传入的 `trajectory_event` marker，不再生成击球事件。
 
-segment 会在以下情况增加：
+## 17. TrackNetV3 轨迹事件检测
 
-- 当前帧不可见。
-- 两个可见点时间间隔超过 `hit_max_gap_seconds = 0.16`。
+`src/postprocess/trajectory_events.py` 从 `D:\Github\TrackNet-V3-based-Badminton\bounce_detection` 迁移了规则式事件候选生成逻辑。它现在是主击球事件来源，并同时输出：
 
-击球检测基于最近 3 个可见点：
+- `hit`：击球候选，规则包括 `vy_reversal`、`vx_reversal`、`acceleration_peak`、`y_local_max`、`speed_local_max`。
+- `landing`：落地点候选，规则包括 `speed_step`、`low_speed_start`、`speed_drop`、`visibility_drop`、`trajectory_end`。
+- `out_of_frame`：出画/丢失候选，规则包括 `visibility_drop_edge`、`visibility_drop_upward`、`visibility_drop_high_altitude`。
 
-```text
-prev -> mid -> current
-```
+当前主 `hit_event` 会额外做收紧过滤：
 
-基础过滤：
+- 只有 `vy_reversal` / `vx_reversal` 可以成为主击球点。
+- `acceleration_peak` 和 `speed_local_max` 只作为辅助证据，不再单独触发红色击球点。
+- 候选点和相邻可见点需要满足最低 track score，避免低分离群点制造反转。
+- 顶部出画带内的反转不作为击球点。
+- 单帧速度过小或过大的反转都会被过滤，过大的情况通常来自离群点跳变。
+- 候选如果在历史窗口里滞留太久才被确认，会被丢弃，避免旧事件延迟冒出。
 
-- 至少 3 点。
-- 前后时间差都大于 0。
-- 前后位移都不小于 3 px。
-- 最大速度达到阈值：
-  - 普通：`hit_min_speed_px_per_sec = 500`
-  - 有姿态辅助：`hit_pose_assist_relaxed_min_speed_px_per_sec = 360`
-- 排除顶部出画反转。
-- 排除地板弹跳。
-- 排除人体遮挡造成的轨迹突变，除非姿态 override 足够强。
+实时接入类是 `RealtimeTrajectoryEventDetector`。它维护最近轨迹窗口，按帧重算候选，并只在候选有足够未来帧确认后输出一次。输出事件写入：
 
-可靠性规则：
+- `trajectory_event`：当前帧新确认的任意轨迹事件。
+- `landing_event`：当 `trajectory_event.event_type == "landing"` 时额外复制一份，方便只关心落地点的后处理读取。
 
-- 同段普通击球要求 `prev/mid/current` 最低分数不小于 `hit_min_track_score = 0.25`。
-- 同段突变命中要求：
-  - `mid.score >= hit_abrupt_min_score = 0.50`
-  - `current.score >= hit_abrupt_min_score = 0.50`
-  - `dist_before >= hit_abrupt_min_jump_px = 120`
-  - `dist_before >= hit_abrupt_large_jump_px = 270`，或 `dist_before >= dist_after * hit_abrupt_min_jump_ratio = 2.5`
-- 跨段突变命中会寻找旧 segment 中的 anchor：
-  - anchor 距离 `mid` 不超过 `hit_cross_segment_anchor_max_gap_seconds = 0.22`
-  - anchor 分数不低于 `hit_min_track_score = 0.25`
-  - anchor 到 `mid` 的跳变满足突变距离，且满足大跳变阈值或比例要求
+当前主路径中，`trajectory_event.event_type == "hit"` 的事件会成为 `hit_event`，继续供 `BSTStrokeRecognizer` 使用。`TrackTrailRenderer` 负责轨迹尾迹和事件 marker：`hit` 使用红色圆点，`landing` 使用绿色菱形，`out_of_frame` 使用紫色叉号。
 
-形状规则：
+## 18. 姿态与击球事件关系
 
-- 方向突变：`turn_deg >= hit_min_turn_deg = 85`
-- 速度突变：`turn_deg >= 45` 且 `speed_change >= 1.7`
-- 姿态辅助：`pose_score >= 0.60` 且满足较宽松转角（`>= 55`），或速度变化（`>= 1.25`）加最低转角（`>= 20`）
+姿态结果仍用于 `BSTStrokeRecognizer` 的击球动作分类、球员距离统计和可视化骨架绘制，但不再参与 `TrackTrailRenderer` 内部击球判定。击球事件统一由 `RealtimeTrajectoryEventDetector` 基于滤波后的球轨迹生成。
 
-提交规则：
-
-- 命中点会记录为真实触发点的 `frame_id/timestamp_ms/ball_xy`，不是确认帧。
-- 两次击球点之间有 `hit_cooldown_seconds = 0.18` 的冷却时间。
-- 红色 marker 显示 `hit_marker_seconds = 2.0` 秒。
-
-当前需要注意：姿态辅助路径仍可能在真实击球后一段距离触发弱速度变化，因此调试击球点误检时应重点看 `pose_score`、`turn_deg` 和 `speed_change`。
-
-## 17. 姿态辅助击球评分
-
-姿态辅助在 `TrackTrailRenderer` 内完成，使用左右手腕、手肘、肩膀关键点。
-
-单个手臂评分由三部分组成：
-
-- 手腕到球的距离：距离越近越高，最大距离 `130 px`。
-- 手腕速度：阈值参考 `hit_pose_assist_min_wrist_speed_px_per_sec = 220`。
-- 手臂伸展程度：肩膀到手腕距离 / 上臂加前臂长度。
-
-综合权重：
-
-```text
-pose_score = 0.40 * proximity + 0.45 * wrist_speed + 0.15 * extension
-```
-
-这个分数只用于降低击球点检测门槛或覆盖遮挡/弹跳过滤，不会反向修改 BallTrackFilter 输出的球轨迹。
-
-## 18. FrameResult
+## 19. FrameResult
 
 每一帧最终形成统一结构：
 
@@ -450,7 +445,7 @@ FrameResult(
 
 后续 UI、日志、击球点检测、BST 动作识别都基于 `FrameResult`。
 
-## 19. 球员位移统计
+## 20. 球员位移统计
 
 球员位移统计不影响球轨迹，只用于 UI 指标。
 
@@ -463,7 +458,7 @@ FrameResult(
 
 如果当前没有可用场地投影，会保持已有累计值，但重置当前跟踪点，避免下一次重新检测时跨大距离累加。
 
-## 20. 日志输出
+## 21. 日志输出
 
 在 UI 中打开 `Debug Logs / Write frame analysis logs` 后，会在以下目录输出：
 
@@ -498,10 +493,15 @@ CSV 来自 `BallTrackFilter.last_debug_record()`。
 - `velocity_x_before/velocity_y_before`：处理前速度。
 - `velocity_x_after/velocity_y_after`：处理后速度。
 - `top_exit_remaining`：顶部出画抑制剩余帧数。
+- `source_frame_offset`：fixed-lag 输出时，当前输出点来自几帧前；实时默认 `0`。
+- `inpaint_mask`：`1` 表示该输出点来自 TrackNetV3 风格线性 inpaint。
 - `candidates`：每个候选的坐标、分数、距离、gate、遮挡和 rank。
 
 常见 `action/reason`：
 
+- `accept/tracknet_v3_candidate`
+- `inpaint/tracknet_v3_linear_inpaint`
+- `reject/missing_or_low_confidence`
 - `bootstrap_wait/waiting_for_candidate_confirmation`
 - `bootstrap_wait/static_bootstrap_candidate`
 - `bootstrap_accept/candidate_confirmed`
@@ -546,15 +546,37 @@ JSONL 来自 `frame_result_log_record(...)`，每一行是一帧：
     "frame_id": 123,
     "timestamp_ms": 2050,
     "ball_xy": [100.0, 200.0]
+  },
+  "trajectory_event": {
+    "event_type": "landing",
+    "frame_id": 128,
+    "timestamp_ms": 2133,
+    "ball_xy": [120.0, 260.0],
+    "rule": "speed_step",
+    "confidence": 0.9,
+    "all_rules": ["speed_step"],
+    "auxiliary_rules": [],
+    "features": {}
+  },
+  "landing_event": {
+    "event_type": "landing",
+    "frame_id": 128,
+    "timestamp_ms": 2133,
+    "ball_xy": [120.0, 260.0],
+    "rule": "speed_step",
+    "confidence": 0.9,
+    "all_rules": ["speed_step"],
+    "auxiliary_rules": [],
+    "features": {}
   }
 }
 ```
 
-如果该帧没有击球事件，`hit_event` 为 `null`。
+如果该帧没有击球事件，`hit_event` 为 `null`。如果没有新确认的 TrackNetV3 轨迹事件，`trajectory_event` 和 `landing_event` 为 `null`。
 
 排查轨迹误检时优先看 `track_debug.csv`；排查击球点漏检或误检时优先看 `frame_log.jsonl`，并结合 `track_debug.csv` 中相同时间附近的 `action/reason`。
 
-## 21. 调试建议
+## 22. 调试建议
 
 ### 轨迹乱飘
 
@@ -573,19 +595,19 @@ JSONL 来自 `frame_result_log_record(...)`，每一行是一帧：
 
 1. `frame_log.jsonl` 中真实拐点附近的三点轨迹。
 2. 对应 `track_debug.csv` 是否处于 `coast`、`relock_accept` 或跨段状态。
-3. 拐点是否被 `score`、`segment`、`cross_no_anchor`、`top_exit`、`floor_bounce`、`person_occlusion` 或 `cooldown` 过滤。
-4. `pose_score` 是否足够，但转角和速度变化是否太弱。
+3. 拐点是否被当前点分数、相邻点分数、顶部忽略区、速度上下限或事件延迟过滤。
+4. 拐点是否只有 `acceleration_peak` / `speed_local_max` 辅助证据，而没有 `vy_reversal` / `vx_reversal` 主反转。
 
 ### 击球后出现第二个假红点
 
 优先检查：
 
-1. 两个 `hit_event` 的时间间隔是否刚好超过 `hit_cooldown_seconds = 0.18`。
-2. 第二个红点是否来自姿态辅助路径。
-3. 第二个红点处 `turn_deg` 是否很小但 `speed_change` 触发。
-4. 第二个红点附近是否是 relock 后连续稳定飞行段，而不是真实击球瞬间。
+1. 两个 `hit_event` 的时间间隔是否刚好超过 `event_cooldown_seconds = 0.18`。
+2. 第二个红点的 `rule` 是否仍为 `vy_reversal` / `vx_reversal`。
+3. 第二个红点的 `features.reversal_magnitude`、`speed_after` 和邻居分数是否足够可信。
+4. 第二个红点附近是否是 relock 后的离群跳变，而不是真实击球瞬间。
 
-## 22. CLI Runner
+## 23. CLI Runner
 
 除 PyQt6 外，项目中还有多个 CLI runner：
 

@@ -70,6 +70,8 @@ TRACK_DEBUG_FIELDS = [
     "frame_w",
     "frame_h",
     "dt",
+    "source_frame_offset",
+    "inpaint_mask",
     "candidates",
 ]
 
@@ -86,6 +88,8 @@ def frame_result_log_record(
     *,
     timestamp_ms: int | None = None,
     hit_event: object | None = None,
+    trajectory_event: object | None = None,
+    landing_event: object | None = None,
 ) -> dict[str, object]:
     return {
         "frame_id": int(result.frame_id),
@@ -93,6 +97,8 @@ def frame_result_log_record(
         "ball": _track_log_record(result.track),
         "pose": [_pose_log_record(person) for person in result.pose],
         "hit_event": _hit_event_log_record(hit_event),
+        "trajectory_event": _trajectory_event_log_record(trajectory_event),
+        "landing_event": _trajectory_event_log_record(landing_event),
     }
 
 
@@ -127,11 +133,49 @@ def _hit_event_log_record(hit_event: object | None) -> dict[str, object] | None:
     ball_xy = hit_event.get("ball_xy", [-1.0, -1.0])
     if not isinstance(ball_xy, (list, tuple)) or len(ball_xy) < 2:
         ball_xy = [-1.0, -1.0]
-    return {
+    record: dict[str, object] = {
         "frame_id": int(hit_event.get("frame_id", -1)),
         "timestamp_ms": int(hit_event.get("timestamp_ms", 0)),
         "ball_xy": [float(ball_xy[0]), float(ball_xy[1])],
     }
+    if "event_type" in hit_event:
+        record["event_type"] = str(hit_event.get("event_type", ""))
+    if "rule" in hit_event:
+        record["rule"] = str(hit_event.get("rule", ""))
+    if "confidence" in hit_event:
+        record["confidence"] = float(hit_event.get("confidence", 0.0))
+    if "all_rules" in hit_event:
+        record["all_rules"] = [str(item) for item in _event_sequence(hit_event.get("all_rules"))]
+    if "auxiliary_rules" in hit_event:
+        record["auxiliary_rules"] = [str(item) for item in _event_sequence(hit_event.get("auxiliary_rules"))]
+    if "features" in hit_event:
+        record["features"] = hit_event.get("features", {})
+    return record
+
+
+def _trajectory_event_log_record(event: object | None) -> dict[str, object] | None:
+    if not isinstance(event, dict):
+        return None
+    ball_xy = event.get("ball_xy", [-1.0, -1.0])
+    if not isinstance(ball_xy, (list, tuple)) or len(ball_xy) < 2:
+        ball_xy = [-1.0, -1.0]
+    return {
+        "event_type": str(event.get("event_type", "")),
+        "frame_id": int(event.get("frame_id", -1)),
+        "timestamp_ms": int(event.get("timestamp_ms", 0)),
+        "ball_xy": [float(ball_xy[0]), float(ball_xy[1])],
+        "rule": str(event.get("rule", "")),
+        "confidence": float(event.get("confidence", 0.0)),
+        "all_rules": [str(item) for item in _event_sequence(event.get("all_rules"))],
+        "auxiliary_rules": [str(item) for item in _event_sequence(event.get("auxiliary_rules"))],
+        "features": event.get("features", {}),
+    }
+
+
+def _event_sequence(value: object) -> list[object]:
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return []
 
 
 def export_npy(results: list[FrameResult], path: Path) -> None:

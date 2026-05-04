@@ -3,17 +3,53 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from math import cos, hypot, isfinite, radians
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence
 
 from src.utils.structures import TrackResult
 
 
 Point = tuple[float, float]
 FrameSize = tuple[float, float]
+FrameShape = tuple[int, ...] | list[int] | None
 PersonBBox = tuple[float, float, float, float]
+PersonBBoxes = Sequence[Sequence[float]] | None
 CourtMatrix = tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
 COURT_WIDTH = 610.0
 COURT_LENGTH = 1340.0
+
+
+class TrackFilterAlgorithm(Protocol):
+    """Interface for pluggable ball trajectory filters."""
+
+    debug_records: list[dict[str, object]]
+
+    def reset(self) -> None:
+        ...
+
+    def update(
+        self,
+        track: TrackResult,
+        *,
+        dt: float | None = None,
+        frame_shape: FrameShape = None,
+        court_prediction: Any | None = None,
+        person_bboxes: PersonBBoxes = None,
+    ) -> TrackResult:
+        ...
+
+    def update_candidates(
+        self,
+        tracks: Sequence[TrackResult],
+        *,
+        dt: float | None = None,
+        frame_shape: FrameShape = None,
+        court_prediction: Any | None = None,
+        person_bboxes: PersonBBoxes = None,
+    ) -> TrackResult:
+        ...
+
+    def last_debug_record(self) -> dict[str, object] | None:
+        ...
 
 
 @dataclass(slots=True)
@@ -163,7 +199,9 @@ class BallTrackFilter:
         *,
         fps: float | None = None,
         debug_enabled: bool = False,
+        algorithm: TrackFilterAlgorithm | None = None,
     ) -> None:
+        self._algorithm = algorithm
         self.config = config or BallTrackFilterConfig()
         if fps is not None and fps > 0:
             self.config.fps = float(fps)
@@ -181,7 +219,7 @@ class BallTrackFilter:
         self._last_frame_size: FrameSize | None = None
         self._top_exit_frames_remaining = 0
         self.debug_enabled = debug_enabled
-        self.debug_records: list[dict[str, object]] = []
+        self._debug_records: list[dict[str, object]] = []
         self._last_debug_record: dict[str, object] | None = None
         self._pending_candidate_debug: dict[str, object] | None = None
         self._raw_candidate_count = 0
@@ -190,7 +228,17 @@ class BallTrackFilter:
         self._decision_action = "unknown"
         self._decision_reason = ""
 
+    @property
+    def debug_records(self) -> list[dict[str, object]]:
+        if self._algorithm is not None:
+            return self._algorithm.debug_records
+        return self._debug_records
+
     def reset(self) -> None:
+        if self._algorithm is not None:
+            self._algorithm.reset()
+            return
+
         self._last_point = None
         self._render_point = None
         self._velocity = (0.0, 0.0)
@@ -218,10 +266,19 @@ class BallTrackFilter:
         track: TrackResult,
         *,
         dt: float | None = None,
-        frame_shape: tuple[int, ...] | list[int] | None = None,
+        frame_shape: FrameShape = None,
         court_prediction: Any | None = None,
-        person_bboxes: Sequence[Sequence[float]] | None = None,
+        person_bboxes: PersonBBoxes = None,
     ) -> TrackResult:
+        if self._algorithm is not None:
+            return self._algorithm.update(
+                track,
+                dt=dt,
+                frame_shape=frame_shape,
+                court_prediction=court_prediction,
+                person_bboxes=person_bboxes,
+            )
+
         self._frame_index += 1
         step_dt = self._resolve_dt(dt)
         frame_size = self._resolve_frame_size(frame_shape)
@@ -328,10 +385,19 @@ class BallTrackFilter:
         tracks: Sequence[TrackResult],
         *,
         dt: float | None = None,
-        frame_shape: tuple[int, ...] | list[int] | None = None,
+        frame_shape: FrameShape = None,
         court_prediction: Any | None = None,
-        person_bboxes: Sequence[Sequence[float]] | None = None,
+        person_bboxes: PersonBBoxes = None,
     ) -> TrackResult:
+        if self._algorithm is not None:
+            return self._algorithm.update_candidates(
+                tracks,
+                dt=dt,
+                frame_shape=frame_shape,
+                court_prediction=court_prediction,
+                person_bboxes=person_bboxes,
+            )
+
         step_dt = self._resolve_dt(dt)
         frame_size = self._resolve_frame_size(frame_shape)
         court_filter = self._court_filter(court_prediction)
@@ -1496,6 +1562,8 @@ class BallTrackFilter:
         )
 
     def last_debug_record(self) -> dict[str, object] | None:
+        if self._algorithm is not None:
+            return self._algorithm.last_debug_record()
         if self._last_debug_record is None:
             return None
         return dict(self._last_debug_record)
@@ -1646,6 +1714,10 @@ class BallTrackFilter:
             score=float(original.score),
             heatmap_shape=list(original.heatmap_shape),
         )
+
+
+class LegacyBallTrackFilterAlgorithm(BallTrackFilter):
+    """Named original trajectory filter implementation for explicit algorithm selection."""
 
 
 def _distance(a: Point, b: Point) -> float:

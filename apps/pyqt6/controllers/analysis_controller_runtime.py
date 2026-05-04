@@ -8,6 +8,7 @@ from datetime import datetime
 import os
 from pathlib import Path
 import sys
+import traceback
 from time import perf_counter
 from typing import Any
 import importlib.util
@@ -28,6 +29,8 @@ from src.models.track_branch import TrackBranch
 from src.postprocess.player_distance import PlayerDistanceAccumulator
 from src.postprocess.pose import CourtPoseTargetTracker
 from src.postprocess.track_filter import BallTrackFilter
+from src.postprocess.tracknet_v3_filter import TrackNetV3TrajectoryFilter
+from src.postprocess.trajectory_events import RealtimeTrajectoryEventDetector
 from src.utils.exporters import TRACK_DEBUG_FIELDS, frame_result_log_record, write_frame_log_jsonl
 from src.utils.structures import FrameResult, PersonPoseResult, TrackResult
 from src.utils.visualize import TrackTrailRenderer
@@ -45,6 +48,7 @@ POSE_CROP_IMGSZ = 640
 POSE_CROP_PADDING = 0.30
 POSE_CROP_MIN_BOX_CONF = 0.45
 POSE_MAX_CROPS = 8
+TRACKNET_V3_FILTER_FIXED_LAG_FRAMES = 0
 
 
 @contextmanager
@@ -169,6 +173,18 @@ def open_frame_log_jsonl(path: str | None) -> object | None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return output_path.open("w", encoding="utf-8")
+
+
+def create_ball_track_filter(fps: float, *, debug_enabled: bool) -> BallTrackFilter:
+    return BallTrackFilter(
+        fps=fps,
+        debug_enabled=debug_enabled,
+        algorithm=TrackNetV3TrajectoryFilter(
+            fps=fps,
+            debug_enabled=debug_enabled,
+            fixed_lag_frames=TRACKNET_V3_FILTER_FIXED_LAG_FRAMES,
+        ),
+    )
 
 
 def project_poses_to_court(
@@ -439,6 +455,13 @@ class TrackNetPlaybackWorker(QThread):
         return False
 
     def run(self) -> None:
+        try:
+            self._run_impl()
+        except Exception as exc:
+            traceback.print_exc()
+            self.failed.emit(f"播放推理失败: {exc}")
+
+    def _run_impl(self) -> None:
         cap = cv2.VideoCapture(self._video_path)
         if not cap.isOpened():
             self.failed.emit(f"无法打开视频: {self._video_path}")
@@ -475,7 +498,7 @@ class TrackNetPlaybackWorker(QThread):
         final_pass = False
         ema_infer_fps = 0.0
         last_pose = []
-        track_filter = BallTrackFilter(fps=fps, debug_enabled=self._debug_csv_path is not None)
+        track_filter = create_ball_track_filter(fps, debug_enabled=self._debug_csv_path is not None)
         pose_tracker = CourtPoseTargetTracker(
             max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
             court_margin=POSE_COURT_MARGIN_CM,
@@ -487,6 +510,7 @@ class TrackNetPlaybackWorker(QThread):
         )
         distance_accumulator = PlayerDistanceAccumulator()
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=0.5)
+        event_detector = RealtimeTrajectoryEventDetector(fps=fps)
         frame_height, frame_width = current_frame.shape[:2]
         bst_recognizer = self._create_bst_recognizer(frame_width, frame_height, fps)
         pending_bst_predictions: list[dict[str, Any]] = []
@@ -566,23 +590,47 @@ class TrackNetPlaybackWorker(QThread):
                     ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
 
                     frame_result = FrameResult(frame_id=frame_id, pose=last_pose, track=track)
+                    trajectory_event = event_detector.update(
+                        frame_result,
+                        timestamp_ms=current_ms,
+                        frame_shape=current_frame.shape,
+                    )
+                    hit_event = (
+                        trajectory_event
+                        if isinstance(trajectory_event, dict) and trajectory_event.get("event_type") == "hit"
+                        else None
+                    )
+                    landing_event = (
+                        trajectory_event
+                        if isinstance(trajectory_event, dict) and trajectory_event.get("event_type") == "landing"
+                        else None
+                    )
                     should_emit = display_every_frame or final_pass or current_ms >= next_display_ms
                     image = None
                     if should_emit:
                         vis_frame = current_frame.copy()
-                        trail_renderer.draw_on(vis_frame, frame_result, timestamp_ms=current_ms)
-                        hit_event = trail_renderer.last_hit_event()
-                        image = frame_to_qimage(vis_frame)
-                    else:
-                        trail_renderer.update_hit_detection(
+                        trail_renderer.draw_on(
+                            vis_frame,
                             frame_result,
                             timestamp_ms=current_ms,
-                            frame_shape=current_frame.shape,
+                            trajectory_event=trajectory_event,
                         )
-                        hit_event = trail_renderer.last_hit_event()
+                        image = frame_to_qimage(vis_frame)
+                    else:
+                        trail_renderer.update_track_history(
+                            frame_result,
+                            timestamp_ms=current_ms,
+                        )
+                        trail_renderer.add_trajectory_event(trajectory_event)
                     write_frame_log_jsonl(
                         frame_log_file,
-                        frame_result_log_record(frame_result, timestamp_ms=current_ms, hit_event=hit_event),
+                        frame_result_log_record(
+                            frame_result,
+                            timestamp_ms=current_ms,
+                            hit_event=hit_event,
+                            trajectory_event=trajectory_event,
+                            landing_event=landing_event,
+                        ),
                     )
 
                     if bst_recognizer is not None:
@@ -640,6 +688,8 @@ class TrackNetPlaybackWorker(QThread):
                             "player_projections": player_projections,
                             "player_distances_m": player_distances_m,
                             "track_debug": track_debug,
+                            "trajectory_event": trajectory_event,
+                            "landing_event": landing_event,
                             "bst_predictions": list(pending_bst_predictions),
                             "bst_errors": list(pending_bst_errors),
                         }
@@ -769,6 +819,13 @@ class CameraInferenceWorker(QThread):
         )
 
     def run(self) -> None:
+        try:
+            self._run_impl()
+        except Exception as exc:
+            traceback.print_exc()
+            self.failed.emit(f"摄像头推理失败: {exc}")
+
+    def _run_impl(self) -> None:
         cap, backend_name = open_camera_capture(self._camera_index, quiet=True)
         if not cap.isOpened():
             self.failed.emit(f"无法打开摄像头设备: {self._camera_index}")
@@ -797,7 +854,7 @@ class CameraInferenceWorker(QThread):
         score_sum = 0.0
         ema_infer_fps = 0.0
         last_pose = []
-        track_filter = BallTrackFilter(fps=fps, debug_enabled=self._debug_csv_path is not None)
+        track_filter = create_ball_track_filter(fps, debug_enabled=self._debug_csv_path is not None)
         pose_tracker = CourtPoseTargetTracker(
             max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
             court_margin=POSE_COURT_MARGIN_CM,
@@ -809,6 +866,7 @@ class CameraInferenceWorker(QThread):
         )
         distance_accumulator = PlayerDistanceAccumulator()
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=0.5)
+        event_detector = RealtimeTrajectoryEventDetector(fps=fps)
         frame_height, frame_width = first_frame.shape[:2]
         bst_recognizer = self._create_bst_recognizer(frame_width, frame_height, fps)
         pending_bst_predictions: list[dict[str, Any]] = []
@@ -901,21 +959,45 @@ class CameraInferenceWorker(QThread):
                     write_track_debug_row(debug_writer, track_debug)
                     track_filter.debug_records.clear()
                     frame_result = FrameResult(frame_id=current_frame_id, pose=last_pose, track=track)
+                    trajectory_event = event_detector.update(
+                        frame_result,
+                        timestamp_ms=position_ms,
+                        frame_shape=current_frame.shape,
+                    )
+                    hit_event = (
+                        trajectory_event
+                        if isinstance(trajectory_event, dict) and trajectory_event.get("event_type") == "hit"
+                        else None
+                    )
+                    landing_event = (
+                        trajectory_event
+                        if isinstance(trajectory_event, dict) and trajectory_event.get("event_type") == "landing"
+                        else None
+                    )
                     if position_ms >= next_display_ms:
                         vis_frame = current_frame.copy()
-                        trail_renderer.draw_on(vis_frame, frame_result, timestamp_ms=position_ms)
-                        hit_event = trail_renderer.last_hit_event()
-                        image = frame_to_qimage(vis_frame)
-                    else:
-                        trail_renderer.update_hit_detection(
+                        trail_renderer.draw_on(
+                            vis_frame,
                             frame_result,
                             timestamp_ms=position_ms,
-                            frame_shape=current_frame.shape,
+                            trajectory_event=trajectory_event,
                         )
-                        hit_event = trail_renderer.last_hit_event()
+                        image = frame_to_qimage(vis_frame)
+                    else:
+                        trail_renderer.update_track_history(
+                            frame_result,
+                            timestamp_ms=position_ms,
+                        )
+                        trail_renderer.add_trajectory_event(trajectory_event)
                     write_frame_log_jsonl(
                         frame_log_file,
-                        frame_result_log_record(frame_result, timestamp_ms=position_ms, hit_event=hit_event),
+                        frame_result_log_record(
+                            frame_result,
+                            timestamp_ms=position_ms,
+                            hit_event=hit_event,
+                            trajectory_event=trajectory_event,
+                            landing_event=landing_event,
+                        ),
                     )
 
                     if bst_recognizer is not None:
@@ -955,6 +1037,8 @@ class CameraInferenceWorker(QThread):
                             "player_projections": player_projections,
                             "player_distances_m": player_distances_m,
                             "track_debug": track_debug,
+                            "trajectory_event": trajectory_event,
+                            "landing_event": landing_event,
                             "bst_predictions": list(pending_bst_predictions),
                             "bst_errors": list(pending_bst_errors),
                         }
@@ -1471,6 +1555,9 @@ class MainController:
             return
 
         self._stop_workers(clear_pending_seek=True)
+        if self._playback_worker is not None or self._camera_worker is not None:
+            self.view.append_log("[信息] 正在等待上一项推理任务结束...")
+            return
         self._selected_video_path = file_path
         self._video_meta = {}
         self._reset_metrics()
@@ -1482,7 +1569,10 @@ class MainController:
     def _start_probe(self, video_path: str, position_ms: int) -> None:
         if self._probe_worker is not None and self._probe_worker.isRunning():
             self._probe_worker.quit()
-            self._probe_worker.wait(300)
+            if not self._probe_worker.wait(300):
+                self.view.append_log("[信息] 正在等待上一次视频预览任务结束...")
+                return
+            self._probe_worker = None
 
         self._probe_worker = VideoProbeWorker(video_path, preview_ms=position_ms)
         self._probe_worker.finished.connect(self._on_probe_finished)
@@ -1490,35 +1580,41 @@ class MainController:
         self._probe_worker.start()
 
     def _on_probe_finished(self, file_path: str, payload: object) -> None:
-        self._probe_worker = None
-        if file_path != self._selected_video_path or not isinstance(payload, dict):
-            return
+        worker = self._probe_worker
+        try:
+            if file_path != self._selected_video_path or not isinstance(payload, dict):
+                return
 
-        self._video_meta = payload
-        self.view.show_video_frame(
-            payload["image"],
-            int(payload.get("position_ms", 0)),
-            int(payload.get("duration_ms", 0)),
-        )
-        self.view.update_progress(0)
-        self.view.set_video_state("loaded")
-        self.view.append_log(
-            f"[信息] 已加载 {Path(file_path).name} | "
-            f"{payload.get('width', 0)} x {payload.get('height', 0)} | "
-            f"FPS {float(payload.get('fps', 0.0)):.2f}"
-        )
-        self._set_idle_state()
+            self._video_meta = payload
+            self.view.show_video_frame(
+                payload["image"],
+                int(payload.get("position_ms", 0)),
+                int(payload.get("duration_ms", 0)),
+            )
+            self.view.update_progress(0)
+            self.view.set_video_state("loaded")
+            self.view.append_log(
+                f"[信息] 已加载 {Path(file_path).name} | "
+                f"{payload.get('width', 0)} x {payload.get('height', 0)} | "
+                f"FPS {float(payload.get('fps', 0.0)):.2f}"
+            )
+            self._set_idle_state()
+        finally:
+            self._release_probe_worker(worker)
 
     def _on_probe_failed(self, message: str) -> None:
-        self._probe_worker = None
-        self._selected_video_path = None
-        self._video_meta = {}
-        self.view.set_status_state("error")
-        self.view.set_video_state("error")
-        self.view.btn_analyze.setEnabled(False)
-        self.view.video_player.btn_select_video.setEnabled(True)
-        self.view.video_player.btn_force_stop.setEnabled(False)
-        self.view.append_log(f"[错误] {message}")
+        worker = self._probe_worker
+        try:
+            self._selected_video_path = None
+            self._video_meta = {}
+            self.view.set_status_state("error")
+            self.view.set_video_state("error")
+            self.view.btn_analyze.setEnabled(False)
+            self.view.video_player.btn_select_video.setEnabled(True)
+            self.view.video_player.btn_force_stop.setEnabled(False)
+            self.view.append_log(f"[错误] {message}")
+        finally:
+            self._release_probe_worker(worker)
 
     def handle_analyze(self) -> None:
         if self._input_mode == "camera":
@@ -1540,6 +1636,9 @@ class MainController:
             return
 
         self._stop_workers(clear_pending_seek=True)
+        if self._playback_worker is not None or self._camera_worker is not None:
+            self.view.append_log("[信息] 正在等待上一项推理任务结束...")
+            return
         self._reset_court_detection(request_initial_prediction=True)
         self._set_running_state()
         self.view.video_player.set_live_source(f"摄像头 {camera_index}")
@@ -1574,6 +1673,7 @@ class MainController:
         self._camera_worker.frameReady.connect(self._on_camera_frame_ready)
         self._camera_worker.inferFinished.connect(self._on_camera_finished)
         self._camera_worker.failed.connect(self._on_camera_failed)
+        self._camera_worker.finished.connect(lambda worker=self._camera_worker: self._release_camera_worker(worker))
         self._camera_worker.start()
 
     def _start_playback(self, *, start_ms: int = 0, request_court_prediction: bool = True) -> None:
@@ -1581,6 +1681,9 @@ class MainController:
             return
 
         self._stop_workers(clear_pending_seek=False)
+        if self._playback_worker is not None or self._camera_worker is not None:
+            self.view.append_log("[信息] 正在等待上一项推理任务结束...")
+            return
         self._reset_court_detection(request_initial_prediction=request_court_prediction)
         self._set_running_state()
         self.view.video_player.play()
@@ -1613,6 +1716,9 @@ class MainController:
         self._playback_worker.frameReady.connect(self._on_frame_ready)
         self._playback_worker.playbackFinished.connect(self._on_playback_finished)
         self._playback_worker.failed.connect(self._on_playback_failed)
+        self._playback_worker.finished.connect(
+            lambda worker=self._playback_worker: self._release_playback_worker(worker)
+        )
         self._playback_worker.start()
 
     def _on_frame_ready(self, payload: object) -> None:
@@ -1632,6 +1738,7 @@ class MainController:
             self.view.set_player_distances(payload.get("player_distances_m"))
             self._update_display_fps()
         self._log_track_debug_event(payload.get("track_debug"))
+        self._append_trajectory_event(payload.get("trajectory_event"))
         self._append_bst_predictions(payload)
 
         progress = max(0, min(int(float(payload.get("progress", 0.0)) * 100), 100))
@@ -1669,6 +1776,7 @@ class MainController:
             self.view.set_player_distances(payload.get("player_distances_m"))
             self._update_display_fps()
         self._log_track_debug_event(payload.get("track_debug"))
+        self._append_trajectory_event(payload.get("trajectory_event"))
         self._append_bst_predictions(payload)
         if not self._should_update_metrics_text():
             return
@@ -1709,6 +1817,27 @@ class MainController:
             detail = self._format_bst_prediction_detail(prediction)
             self.view.add_action_row(time_range, label, confidence, detail)
             self.view.append_log(f"[BST] hit {time_range} -> {label} ({confidence * 100:.1f}%)")
+
+    def _append_trajectory_event(self, event: object) -> None:
+        if not isinstance(event, dict):
+            return
+        event_type = str(event.get("event_type", "unknown"))
+        type_name = {
+            "hit": "击球候选",
+            "landing": "落地点",
+            "out_of_frame": "出画",
+        }.get(event_type, event_type)
+        time_text = self._format_time_ms(int(event.get("timestamp_ms", 0)))
+        rule = str(event.get("rule", ""))
+        confidence = float(event.get("confidence", 0.0))
+        ball_xy = event.get("ball_xy", [-1.0, -1.0])
+        x, y = (-1.0, -1.0)
+        if isinstance(ball_xy, (list, tuple)) and len(ball_xy) >= 2:
+            x, y = float(ball_xy[0]), float(ball_xy[1])
+        self.view.append_log(
+            f"[Event] {type_name} {time_text} | frame {int(event.get('frame_id', -1))} | "
+            f"({x:.1f},{y:.1f}) | {rule} {confidence * 100:.1f}%"
+        )
 
     def _format_bst_prediction_detail(self, prediction: dict[str, Any]) -> str:
         top5 = prediction.get("top5_display", prediction.get("top5", []))
@@ -1787,8 +1916,24 @@ class MainController:
             f"score {score:.2f} | pred ({pred_x:.1f},{pred_y:.1f}) | visible {int(out_visible)}"
         )
 
+    def _release_probe_worker(self, worker: object) -> None:
+        if worker is None:
+            return
+        if self._probe_worker is worker:
+            if self._probe_worker.isRunning():
+                QTimer.singleShot(10, lambda worker=worker: self._release_probe_worker(worker))
+                return
+            self._probe_worker = None
+
+    def _release_camera_worker(self, worker: object) -> None:
+        if self._camera_worker is worker:
+            self._camera_worker = None
+
+    def _release_playback_worker(self, worker: object) -> None:
+        if self._playback_worker is worker:
+            self._playback_worker = None
+
     def _on_camera_finished(self, payload: object) -> None:
-        self._camera_worker = None
         self.view.set_progress_busy(False)
         stopped = bool(payload.get("stopped")) if isinstance(payload, dict) else False
 
@@ -1813,7 +1958,6 @@ class MainController:
         self._set_idle_state()
 
     def _on_camera_failed(self, message: str) -> None:
-        self._camera_worker = None
         self.view.set_progress_busy(False)
         self.view.set_status_state("error")
         self.view.video_player.stop()
@@ -1821,7 +1965,6 @@ class MainController:
         self._set_idle_state()
 
     def _on_playback_finished(self, payload: object) -> None:
-        self._playback_worker = None
         stopped = bool(payload.get("stopped")) if isinstance(payload, dict) else False
 
         if stopped:
@@ -1851,7 +1994,6 @@ class MainController:
             self._start_playback(start_ms=pending_seek_ms, request_court_prediction=False)
 
     def _on_playback_failed(self, message: str) -> None:
-        self._playback_worker = None
         self.view.set_status_state("error")
         self.view.video_player.stop()
         self.view.append_log(f"[错误] {message}")
@@ -1904,18 +2046,24 @@ class MainController:
 
         if self._probe_worker is not None and self._probe_worker.isRunning():
             self._probe_worker.quit()
-            self._probe_worker.wait(300)
-        self._probe_worker = None
+            if self._probe_worker.wait(300):
+                self._probe_worker = None
+        elif self._probe_worker is not None:
+            self._probe_worker = None
 
         if self._playback_worker is not None and self._playback_worker.isRunning():
             self._playback_worker.request_stop()
-            self._playback_worker.wait(1000)
-        self._playback_worker = None
+            if self._playback_worker.wait(1000):
+                self._playback_worker = None
+        elif self._playback_worker is not None:
+            self._playback_worker = None
 
         if self._camera_worker is not None and self._camera_worker.isRunning():
             self._camera_worker.request_stop()
-            self._camera_worker.wait(1000)
-        self._camera_worker = None
+            if self._camera_worker.wait(1000):
+                self._camera_worker = None
+        elif self._camera_worker is not None:
+            self._camera_worker = None
         if self._court_service is not None:
             self._court_service.clear_pending()
         self.view.set_progress_busy(False)
