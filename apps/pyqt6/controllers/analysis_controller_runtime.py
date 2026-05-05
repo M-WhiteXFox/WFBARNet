@@ -28,8 +28,7 @@ from src.models.pose_branch import PoseBranch
 from src.models.track_branch import TrackBranch
 from src.postprocess.player_distance import PlayerDistanceAccumulator
 from src.postprocess.pose import CourtPoseTargetTracker
-from src.postprocess.track_filter import BallTrackFilter
-from src.postprocess.tracknet_v3_filter import TrackNetV3TrajectoryFilter
+from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
 from src.postprocess.trajectory_events import RealtimeTrajectoryEventDetector
 from src.utils.exporters import TRACK_DEBUG_FIELDS, frame_result_log_record, write_frame_log_jsonl
 from src.utils.structures import FrameResult, PersonPoseResult, TrackResult
@@ -48,7 +47,15 @@ POSE_CROP_IMGSZ = 640
 POSE_CROP_PADDING = 0.30
 POSE_CROP_MIN_BOX_CONF = 0.45
 POSE_MAX_CROPS = 8
-TRACKNET_V3_FILTER_FIXED_LAG_FRAMES = 0
+
+
+def _flush_stderr_if_available() -> None:
+    if sys.stderr is None:
+        return
+    try:
+        sys.stderr.flush()
+    except OSError:
+        return
 
 
 @contextmanager
@@ -62,7 +69,7 @@ def quiet_opencv_camera_logs():
         if previous_level is not None:
             cv2.setLogLevel(0)
         try:
-            sys.stderr.flush()
+            _flush_stderr_if_available()
             saved_stderr_fd = os.dup(2)
             stderr_fd = os.open(os.devnull, os.O_WRONLY)
             os.dup2(stderr_fd, 2)
@@ -77,7 +84,7 @@ def quiet_opencv_camera_logs():
     finally:
         if saved_stderr_fd is not None:
             try:
-                sys.stderr.flush()
+                _flush_stderr_if_available()
                 os.dup2(saved_stderr_fd, 2)
             finally:
                 os.close(saved_stderr_fd)
@@ -173,18 +180,6 @@ def open_frame_log_jsonl(path: str | None) -> object | None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     return output_path.open("w", encoding="utf-8")
-
-
-def create_ball_track_filter(fps: float, *, debug_enabled: bool) -> BallTrackFilter:
-    return BallTrackFilter(
-        fps=fps,
-        debug_enabled=debug_enabled,
-        algorithm=TrackNetV3TrajectoryFilter(
-            fps=fps,
-            debug_enabled=debug_enabled,
-            fixed_lag_frames=TRACKNET_V3_FILTER_FIXED_LAG_FRAMES,
-        ),
-    )
 
 
 def project_poses_to_court(
@@ -498,7 +493,7 @@ class TrackNetPlaybackWorker(QThread):
         final_pass = False
         ema_infer_fps = 0.0
         last_pose = []
-        track_filter = create_ball_track_filter(fps, debug_enabled=self._debug_csv_path is not None)
+        track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=self._debug_csv_path is not None)
         pose_tracker = CourtPoseTargetTracker(
             max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
             court_margin=POSE_COURT_MARGIN_CM,
@@ -854,7 +849,7 @@ class CameraInferenceWorker(QThread):
         score_sum = 0.0
         ema_infer_fps = 0.0
         last_pose = []
-        track_filter = create_ball_track_filter(fps, debug_enabled=self._debug_csv_path is not None)
+        track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=self._debug_csv_path is not None)
         pose_tracker = CourtPoseTargetTracker(
             max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
             court_margin=POSE_COURT_MARGIN_CM,

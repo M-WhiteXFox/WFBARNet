@@ -7,7 +7,8 @@ import cv2
 from tqdm import tqdm
 
 from src.models.track_branch import TrackBranch
-from src.postprocess.track_filter import BallTrackFilter
+from src.postprocess.track_filter import TrackFilterAlgorithm
+from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
 from src.utils.exporters import export_csv, export_json, export_npy, export_track_debug_csv
 from src.utils.structures import FrameResult
 from src.utils.video import iter_frame_windows, iter_video_frame_windows, load_frames, probe_video
@@ -64,7 +65,7 @@ class TrackVideoRunner:
         if max_frames is not None:
             frames = frames[:max_frames]
         results: list[FrameResult] = []
-        track_filter = BallTrackFilter(debug_enabled=True)
+        track_filter = create_tracknet_v3_ball_track_filter(debug_enabled=True)
         windows = list(iter_frame_windows(frames))
         progress = tqdm(total=len(windows), desc="Track inference")
         try:
@@ -105,7 +106,7 @@ class TrackVideoRunner:
             )
 
         results: list[FrameResult] = []
-        track_filter = BallTrackFilter(fps=metadata.fps, debug_enabled=True)
+        track_filter = create_tracknet_v3_ball_track_filter(fps=metadata.fps, debug_enabled=True)
         trail_renderer = TrackTrailRenderer(fps=metadata.fps, history_seconds=0.5)
         progress_total = metadata.frame_count if metadata.frame_count > 0 else None
         if max_frames is not None:
@@ -148,7 +149,7 @@ class TrackVideoRunner:
         if save_npy:
             export_npy(results, self.output_dir / "track_results.npy")
 
-    def _export_debug(self, track_filter: BallTrackFilter) -> None:
+    def _export_debug(self, track_filter: TrackFilterAlgorithm) -> None:
         export_track_debug_csv(track_filter.debug_records, self.output_dir / "track_debug.csv")
 
     def _batch_size(self) -> int:
@@ -157,7 +158,7 @@ class TrackVideoRunner:
     def _process_video_batch(
         self,
         batch: list[tuple[int, object, list[object]]],
-        track_filter: BallTrackFilter,
+        track_filter: TrackFilterAlgorithm,
         trail_renderer: TrackTrailRenderer,
         results: list[FrameResult],
         writer: cv2.VideoWriter | None,

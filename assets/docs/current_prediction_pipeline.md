@@ -78,7 +78,7 @@
 - `.engine`：TensorRT 后端，通常用于 INT8 量化版本。
 - 其他权重文件：PyTorch `TrackNetV3`。
 
-当前 PyQt6 默认创建参数：
+当前默认创建参数：
 
 ```text
 input_size = (512, 288)
@@ -93,7 +93,7 @@ candidate_score_thr_ratio = 0.6
 candidate_score_thr = score_thr * candidate_score_thr_ratio = 0.21
 ```
 
-注意：候选列表可以包含 `score < 0.35` 的弱候选。当前 PyQt6 默认接入的 `TrackNetV3TrajectoryFilter` 只接收 `candidate_min_confidence = 0.35` 以上的候选点。
+注意：候选列表可以包含 `score < 0.35` 的弱候选。当前默认接入的 `TrackNetV3TrajectoryFilter` 只接收 `candidate_min_confidence = 0.35` 以上的候选点。
 
 ## 4. TrackNet 输入预处理
 
@@ -157,40 +157,34 @@ TrackResult(
 )
 ```
 
-`visible=1` 表示当前滤波器认为该帧有可用球点。当前 PyQt6 默认的 `TrackNetV3TrajectoryFilter` 会保留 TrackNetV3 可见候选点，不做 Kalman coast；可选 fixed-lag 模式下，中间缺失段可能来自 TrackNetV3 风格的线性 inpaint。
+`visible=1` 表示当前滤波器认为该帧有可用球点。当前运行路径统一接入的 `TrackNetV3TrajectoryFilter` 会保留 TrackNetV3 可见候选点，不做 Kalman coast；可选 fixed-lag 模式下，中间缺失段可能来自 TrackNetV3 风格的线性 inpaint。
 
 ### 可插拔算法接口
 
-`BallTrackFilter` 现在同时承担默认滤波器和算法入口两种角色：
+`BallTrackFilter` 现在主要作为算法入口和旧状态机兼容类：
 
-- `BallTrackFilter(...)`：不传 `algorithm` 时继续使用原状态机算法。
+- `create_tracknet_v3_ball_track_filter(...)`：当前 PyQt6、CLI runner 和 `filter_track_results(...)` 统一使用的默认入口。
 - `BallTrackFilter(algorithm=...)`：传入新算法时，`update(...)`、`update_candidates(...)`、`reset()`、`debug_records` 和 `last_debug_record()` 都委托给新算法。
+- `BallTrackFilter(...)`：不传 `algorithm` 时仍可直接使用原状态机算法，主要供旧测试和显式兼容场景使用。
 - `LegacyBallTrackFilterAlgorithm(...)`：原算法的显式类名，用于配置、测试或文档中明确选择旧算法。
 
 新算法需要满足 `TrackFilterAlgorithm` 接口，输入仍是 `TrackResult` 或候选 `list[TrackResult]`，输出必须是标准 `TrackResult`。接口签名、调试字段、参数语义和最小实现示例见 `assets/docs/track_filter_algorithm_interface.md`。
 
-当前 PyQt6 运行时已启用 TrackNetV3 风格轨迹修复模块 `TrackNetV3TrajectoryFilter`，位于 `src/postprocess/tracknet_v3_filter.py`。它从 `D:\Github\TrackNet-V3-based-Badminton` 项目的 `generate_inpaint_mask(...)` 和 `linear_interp(...)` 迁移核心规则：可见候选点原样保留；如果 fixed-lag 模式允许看到未来端点，则对非顶部出画的中间缺失段做线性修复。实时显示默认 `fixed_lag_frames = 0`，避免输出点时间戳落后一帧。
+当前所有生产运行入口已启用 TrackNetV3 风格轨迹修复模块 `TrackNetV3TrajectoryFilter`，位于 `src/postprocess/tracknet_v3_filter.py`。它从 `D:\Github\TrackNet-V3-based-Badminton` 项目的 `generate_inpaint_mask(...)` 和 `linear_interp(...)` 迁移核心规则：可见候选点原样保留；如果 fixed-lag 模式允许看到未来端点，则对非顶部出画的中间缺失段做线性修复。实时显示默认 `fixed_lag_frames = 0`，避免输出点时间戳落后一帧。
 
 ```python
-from src.postprocess.track_filter import BallTrackFilter
-from src.postprocess.tracknet_v3_filter import TrackNetV3TrajectoryFilter
+from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
 
-track_filter = BallTrackFilter(
-    algorithm=TrackNetV3TrajectoryFilter(
-        fps=fps,
-        debug_enabled=True,
-        fixed_lag_frames=0,
-    )
-)
+track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=True)
 ```
 
-旧的 `RealtimeKalmanTrackCorrector` 仍保留在 `src/postprocess/track_correction.py`，可通过 `BallTrackFilter(algorithm=...)` 显式接入。它不再是 PyQt6 默认运行路径。
+旧的 `RealtimeKalmanTrackCorrector` 仍保留在 `src/postprocess/track_correction.py`，可通过 `BallTrackFilter(algorithm=...)` 显式接入。它不再是默认运行路径。
 
 ## 7. 候选点预过滤
 
-当前 PyQt6 默认 `TrackNetV3TrajectoryFilter.update_candidates(...)` 只做轻量候选选择：过滤不可见、低于 `candidate_min_confidence = 0.35`、或超出画面的候选点，然后选择最高分候选。它不做 Kalman 预测、人体遮挡 coast 或场地范围预过滤，因此击球后的高分急转向候选会直接保留，不会被旧速度模型拖拽。
+当前默认 `TrackNetV3TrajectoryFilter.update_candidates(...)` 只做轻量候选选择：过滤不可见、低于 `candidate_min_confidence = 0.35`、或超出画面的候选点，然后选择最高分候选。它不做 Kalman 预测、人体遮挡 coast 或场地范围预过滤，因此击球后的高分急转向候选会直接保留，不会被旧速度模型拖拽。
 
-以下规则描述原 `BallTrackFilter` 状态机和可选 Kalman 纠偏路径中的预过滤逻辑，不是当前 PyQt6 默认路径：
+以下规则描述原 `BallTrackFilter` 状态机和可选 Kalman 纠偏路径中的预过滤逻辑，不是当前默认路径：
 
 `update_candidates(...)` 先做三件事：
 

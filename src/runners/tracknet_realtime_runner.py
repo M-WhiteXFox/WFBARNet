@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 
 from src.models.track_branch import TrackBranch
-from src.postprocess.track_filter import BallTrackFilter
+from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
 from src.utils.exporters import export_csv, export_json, export_npy, export_track_debug_csv
 from src.utils.structures import FrameResult, TrackResult
 from src.utils.visualize import TrackTrailRenderer
@@ -77,7 +77,7 @@ class TrackNetRealtimeRunner:
         frame_id = 0
         ema_fps = 0.0
         tick_frequency = cv2.getTickFrequency()
-        track_filter = BallTrackFilter(fps=fps, debug_enabled=True)
+        track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=True)
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=0.5)
 
         while True:

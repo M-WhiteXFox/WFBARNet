@@ -2,12 +2,12 @@
 
 更新时间：2026-05-04
 
-本文档描述 `src/postprocess/track_filter.py` 中的轨迹滤波可插拔接口。这个接口用于在保留原 `BallTrackFilter` 算法的同时，把新的轨迹滤波算法接入现有 PyQt6、CLI runner、调试日志和击球点检测流程。
+本文档描述轨迹滤波可插拔接口。当前生产运行入口统一通过 `create_tracknet_v3_ball_track_filter(...)` 接入 TrackNetV3 风格轨迹滤波；原 `BallTrackFilter` 状态机仍保留为显式兼容实现。
 
 ## 1. 设计目标
 
-- 默认调用 `BallTrackFilter(...)` 时继续使用原轨迹滤波算法，现有运行路径不需要改动。
-- 新算法通过 `BallTrackFilter(algorithm=...)` 接入，外层仍暴露 `update(...)`、`update_candidates(...)`、`reset()`、`debug_records` 和 `last_debug_record()`。
+- 生产路径默认调用 `create_tracknet_v3_ball_track_filter(...)`，统一使用 TrackNetV3 风格轨迹修复算法。
+- 新算法仍通过 `BallTrackFilter(algorithm=...)` 接入，外层暴露 `update(...)`、`update_candidates(...)`、`reset()`、`debug_records` 和 `last_debug_record()`。
 - 下游继续接收标准 `TrackResult`，因此 `FrameResult`、轨迹尾迹、击球点检测、BST 输入和日志输出不需要理解具体滤波算法。
 - 原算法也有显式名称 `LegacyBallTrackFilterAlgorithm`，便于在配置或测试中明确选择“旧算法”。
 
@@ -17,14 +17,15 @@
   - `TrackFilterAlgorithm`：新算法需要满足的 Protocol。
   - `FrameShape`：当前帧尺寸类型别名。
   - `PersonBBoxes`：人体框输入类型别名。
-  - `BallTrackFilter(..., algorithm=None)`：默认使用原算法；传入 `algorithm` 时作为委托入口。
+  - `BallTrackFilter(..., algorithm=None)`：显式使用原算法；传入 `algorithm` 时作为委托入口。
   - `LegacyBallTrackFilterAlgorithm`：原轨迹滤波实现的显式类名。
 - `src/postprocess/track_correction.py`
   - `RealtimeKalmanTrackCorrector`：实时轨迹纠偏算法实现。
   - `RealtimeKalmanTrackCorrectorConfig`：实时纠偏算法参数。
 - `src/postprocess/tracknet_v3_filter.py`
-  - `TrackNetV3TrajectoryFilter`：当前 PyQt6 默认的 TrackNetV3 风格轨迹修复算法。
+  - `TrackNetV3TrajectoryFilter`：当前默认的 TrackNetV3 风格轨迹修复算法。
   - `TrackNetV3TrajectoryFilterConfig`：TrackNetV3 风格修复算法参数。
+  - `create_tracknet_v3_ball_track_filter(...)`：PyQt6、CLI runner 和通用 `filter_track_results(...)` 使用的默认工厂。
 - `src/utils/structures.py`
   - `TrackResult`：轨迹滤波输入和输出的标准数据结构。
 - `src/utils/exporters.py`
@@ -215,7 +216,21 @@ TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=float(score), heatmap_shape=[
 
 ## 8. BallTrackFilter 委托规则
 
-### 默认路径
+### 当前默认路径
+
+```python
+from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
+
+track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=True)
+```
+
+行为：
+
+- 使用 `TrackNetV3TrajectoryFilter`。
+- `fps` 会写入 `TrackNetV3TrajectoryFilterConfig.fps`。
+- `debug_enabled=False` 时不写 `debug_records`。
+
+### 原状态机兼容路径
 
 ```python
 track_filter = BallTrackFilter(fps=fps, debug_enabled=True)
@@ -224,8 +239,7 @@ track_filter = BallTrackFilter(fps=fps, debug_enabled=True)
 行为：
 
 - 使用原 `BallTrackFilter` 状态机。
-- `fps` 会写入 `BallTrackFilterConfig.fps`。
-- `debug_enabled=False` 时原算法不写 `debug_records`。
+- 仅在显式兼容、对比测试或调试旧行为时使用。
 
 ### 新算法路径
 
@@ -257,11 +271,11 @@ track_filter = BallTrackFilter(
 track_filter = LegacyBallTrackFilterAlgorithm(fps=fps, debug_enabled=True)
 ```
 
-这与默认 `BallTrackFilter(...)` 使用同一套旧算法逻辑。它的作用是让配置、测试或文档可以明确表达“当前选择的是原轨迹滤波算法”。
+这与显式 `BallTrackFilter(...)` 使用同一套旧算法逻辑。它的作用是让配置、测试或文档可以明确表达“当前选择的是原轨迹滤波算法”。
 
 ## 9. 内置 TrackNetV3 风格轨迹修复模块
 
-`TrackNetV3TrajectoryFilter` 是当前 PyQt6 默认接入的轨迹滤波模块，位于 `src/postprocess/tracknet_v3_filter.py`。它迁移自 `D:\Github\TrackNet-V3-based-Badminton` 项目的轨迹修复思路：
+`TrackNetV3TrajectoryFilter` 是当前默认接入的轨迹滤波模块，位于 `src/postprocess/tracknet_v3_filter.py`。它迁移自 `D:\Github\TrackNet-V3-based-Badminton` 项目的轨迹修复思路：
 
 ```text
 TrackNetV3 heatmap
@@ -275,16 +289,9 @@ TrackNetV3 heatmap
 接入方式：
 
 ```python
-from src.postprocess.track_filter import BallTrackFilter
-from src.postprocess.tracknet_v3_filter import TrackNetV3TrajectoryFilter
+from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
 
-track_filter = BallTrackFilter(
-    algorithm=TrackNetV3TrajectoryFilter(
-        fps=fps,
-        debug_enabled=True,
-        fixed_lag_frames=0,
-    )
-)
+track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=True)
 ```
 
 `fixed_lag_frames = 0` 是实时显示默认值，用于避免输出坐标和当前帧时间戳错位。若离线流程希望复用 TrackNetV3 的缺失段修复，可显式设置 fixed-lag，并观察 CSV 中的 `inpaint_mask` 与 `source_frame_offset`。
@@ -353,7 +360,7 @@ track_filter = BallTrackFilter(
 )
 ```
 
-这个模块不会替换默认旧算法。只有调用方显式传入 `algorithm=RealtimeKalmanTrackCorrector(...)` 时才会启用。
+这个模块不会替换当前默认 TrackNetV3 滤波入口。只有调用方显式传入 `algorithm=RealtimeKalmanTrackCorrector(...)` 时才会启用。
 
 核心参数：
 
@@ -585,25 +592,13 @@ track_filter = BallTrackFilter(
 
 ## 14. 测试入口
 
-当前接口回归测试位于 `tests/test_track_filter.py`：
-
-- `test_delegates_to_custom_algorithm_interface`：确认 `BallTrackFilter(algorithm=...)` 会委托到自定义算法，并暴露自定义算法的调试记录。
-- `test_legacy_algorithm_name_keeps_original_behavior`：确认 `LegacyBallTrackFilterAlgorithm` 仍保持原算法行为。
-
-实时纠偏模块测试位于 `tests/test_track_correction.py`：
-
-- `test_prefers_motion_candidate_over_higher_score_noise`：高分噪点和运动路径候选同时存在时，优先选择路径合理候选。
-- `test_coasts_through_person_occlusion_when_candidate_is_inside_bbox`：人体遮挡区域内的弱候选不会拉偏轨迹，算法使用预测 coast。
-- `test_out_of_frame_state_suppresses_edge_noise`：球从画面飞出后，边缘高分噪点被短时抑制。
-- `test_fixed_lag_outputs_delayed_smoothed_point`：fixed-lag 平滑输出小延迟轨迹点。
-- `test_can_be_plugged_into_ball_track_filter_interface`：实时纠偏模块可以通过 `BallTrackFilter(algorithm=...)` 接入。
-
 TrackNetV3 风格修复模块测试位于 `tests/test_tracknet_v3_filter.py`：
 
 - `test_generates_inpaint_mask_for_middle_disappearance`：确认移植的 `Inpaint_Mask` 规则会修复中间缺失段。
 - `test_does_not_inpaint_top_exit_disappearance`：确认顶部出画不被线性补点。
 - `test_keeps_post_hit_direction_change_without_kalman_coast`：确认击球后急转向候选直接保留，不发生旧速度 coast。
 - `test_can_be_plugged_into_ball_track_filter_interface`：TrackNetV3 修复模块可以通过 `BallTrackFilter(algorithm=...)` 接入。
+- `test_factory_builds_tracknet_v3_runtime_filter`：确认生产默认工厂会创建 TrackNetV3 委托滤波器。
 
 建议新增算法时至少补充：
 

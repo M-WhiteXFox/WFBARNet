@@ -28,6 +28,7 @@ class TrajectoryEventDetectorConfig:
     min_hit_reversal_magnitude: float = 8.0
     min_hit_track_score: float = 0.48
     min_hit_neighbor_score: float = 0.35
+    max_hit_neighbor_gap: int = 3
     hit_top_ignore_ratio: float = 0.08
     hit_top_ignore_px: float = 36.0
     acc_threshold: float = 3.0
@@ -41,6 +42,7 @@ class TrajectoryEventDetectorConfig:
     history_frames: int = 180
     confirmation_frames: int = 1
     trajectory_end_missing_frames: int = 3
+    visibility_drop_missing_frames: int = 3
     event_cooldown_seconds: float = 0.18
     max_event_lag_frames: int = 12
 
@@ -116,8 +118,6 @@ class TrajectoryEventCandidateGenerator:
             return []
 
         kinematics = self.kinematics_calculator.compute(x_arr, y_arr, vis)
-        v_x = np.nan_to_num(kinematics["v_x"], nan=0.0, posinf=0.0, neginf=0.0)
-        v_y = np.nan_to_num(kinematics["v_y"], nan=0.0, posinf=0.0, neginf=0.0)
         a_x = np.nan_to_num(kinematics["a_x"], nan=0.0, posinf=0.0, neginf=0.0)
         a_y = np.nan_to_num(kinematics["a_y"], nan=0.0, posinf=0.0, neginf=0.0)
         speed = np.nan_to_num(kinematics["speed"], nan=0.0, posinf=0.0, neginf=0.0)
@@ -127,15 +127,19 @@ class TrajectoryEventCandidateGenerator:
         for t in range(self.config.min_visible_before, n - 1):
             if vis[t] == 0:
                 continue
-            visible_count = int(np.sum(vis[max(0, t - self.config.min_visible_before) : t + 1]))
+            recent_start = max(
+                0,
+                t - self.config.min_visible_before - max(0, int(self.config.max_hit_neighbor_gap)) + 1,
+            )
+            visible_count = int(np.sum(vis[recent_start : t + 1]))
             if visible_count < self.config.min_visible_before:
                 continue
 
             primary: dict[str, object] | None = None
             primary_features: dict[str, object] = {}
             for event_type, rule, confidence, features in (
-                ("hit", "vy_reversal", 0.85, self._check_vy_reversal(t, n, vis, v_y, speed)),
-                ("hit", "vx_reversal", 0.80, self._check_vx_reversal(t, n, vis, v_x, speed)),
+                ("hit", "vy_reversal", 0.85, self._check_vy_reversal(t, n, x_arr, y_arr, vis)),
+                ("hit", "vx_reversal", 0.80, self._check_vx_reversal(t, n, x_arr, y_arr, vis)),
                 ("landing", "speed_step", 0.90, self._check_speed_step(t, n, vis, speed)),
                 ("landing", "low_speed_start", 0.85, self._check_low_speed_start(t, n, vis, speed)),
                 ("landing", "speed_drop", 0.80, self._check_speed_drop(t, n, vis, speed)),
@@ -152,8 +156,6 @@ class TrajectoryEventCandidateGenerator:
                     x_arr,
                     y_arr,
                     vis,
-                    speed,
-                    v_y,
                     img_height,
                     img_width,
                     visible_count,
@@ -215,63 +217,147 @@ class TrajectoryEventCandidateGenerator:
         self,
         t: int,
         n: int,
+        x: np.ndarray,
+        y: np.ndarray,
         visibility: np.ndarray,
-        v_y: np.ndarray,
-        speed: np.ndarray,
     ) -> dict[str, float] | None:
-        if t <= 0 or t + 1 >= n or visibility[t - 1] != 1 or visibility[t + 1] != 1:
+        if t <= 0 or t + 1 >= n:
             return None
-        vy_before = float(v_y[t - 1])
-        vy_after = float(v_y[t + 1])
-        threshold = float(self.config.vy_reversal_threshold)
-        is_reversal = (vy_before > threshold and vy_after < -threshold) or (
-            vy_before < -threshold and vy_after > threshold
+        prev_idx, next_idx = self._hit_neighbor_indices(t, n, visibility)
+        if prev_idx is None or next_idx is None:
+            return None
+        next_gap = max(1, next_idx - t)
+        vy_after = float((y[next_idx] - y[t]) / next_gap)
+        if abs(vy_after) <= self.config.vy_reversal_threshold:
+            return None
+        before = self._before_velocity_with_sign(
+            t,
+            y,
+            visibility,
+            positive=vy_after < 0.0,
         )
+        if before is None:
+            return None
+        vy_before, prev_gap = before
+        vx_after = float((x[next_idx] - x[t]) / next_gap)
+        speed_after = float(np.hypot(vx_after, vy_after))
         reversal_magnitude = abs(vy_before - vy_after)
         if (
-            not is_reversal
-            or speed[t + 1] < self.config.min_speed_at_hit
-            or speed[t + 1] > self.config.max_speed_at_hit
+            speed_after < self.config.min_speed_at_hit
+            or speed_after > self.config.max_speed_at_hit
             or reversal_magnitude < self.config.min_hit_reversal_magnitude
         ):
             return None
         return {
             "vy_before": vy_before,
             "vy_after": vy_after,
-            "speed_after": float(speed[t + 1]),
+            "speed_after": speed_after,
             "reversal_magnitude": reversal_magnitude,
+            "prev_gap": float(prev_gap),
+            "next_gap": float(next_idx - t),
         }
 
     def _check_vx_reversal(
         self,
         t: int,
         n: int,
+        x: np.ndarray,
+        y: np.ndarray,
         visibility: np.ndarray,
-        v_x: np.ndarray,
-        speed: np.ndarray,
     ) -> dict[str, float] | None:
-        if t <= 0 or t + 1 >= n or visibility[t - 1] != 1 or visibility[t + 1] != 1:
+        if t <= 0 or t + 1 >= n:
             return None
-        vx_before = float(v_x[t - 1])
-        vx_after = float(v_x[t + 1])
-        threshold = float(self.config.vy_reversal_threshold)
-        is_reversal = (vx_before > threshold and vx_after < -threshold) or (
-            vx_before < -threshold and vx_after > threshold
+        prev_idx, next_idx = self._hit_neighbor_indices(t, n, visibility)
+        if prev_idx is None or next_idx is None:
+            return None
+        next_gap = max(1, next_idx - t)
+        vx_after = float((x[next_idx] - x[t]) / next_gap)
+        if abs(vx_after) <= self.config.vy_reversal_threshold:
+            return None
+        before = self._before_velocity_with_sign(
+            t,
+            x,
+            visibility,
+            positive=vx_after < 0.0,
         )
+        if before is None:
+            return None
+        vx_before, prev_gap = before
+        vy_after = float((y[next_idx] - y[t]) / next_gap)
+        speed_after = float(np.hypot(vx_after, vy_after))
         reversal_magnitude = abs(vx_before - vx_after)
         if (
-            not is_reversal
-            or speed[t + 1] < self.config.min_speed_at_hit
-            or speed[t + 1] > self.config.max_speed_at_hit
+            speed_after < self.config.min_speed_at_hit
+            or speed_after > self.config.max_speed_at_hit
             or reversal_magnitude < self.config.min_hit_reversal_magnitude
         ):
             return None
         return {
             "vx_before": vx_before,
             "vx_after": vx_after,
-            "speed_after": float(speed[t + 1]),
+            "speed_after": speed_after,
             "reversal_magnitude": reversal_magnitude,
+            "prev_gap": float(prev_gap),
+            "next_gap": float(next_idx - t),
         }
+
+    def _hit_neighbor_indices(
+        self,
+        t: int,
+        n: int,
+        visibility: np.ndarray,
+    ) -> tuple[int | None, int | None]:
+        max_gap = max(1, int(self.config.max_hit_neighbor_gap))
+        return (
+            self._nearest_visible_index(t, n, visibility, -1, max_gap),
+            self._nearest_visible_index(t, n, visibility, 1, max_gap),
+        )
+
+    def _before_velocity_with_sign(
+        self,
+        t: int,
+        values: np.ndarray,
+        visibility: np.ndarray,
+        *,
+        positive: bool,
+    ) -> tuple[float, int] | None:
+        threshold = float(self.config.vy_reversal_threshold)
+        best: tuple[float, int] | None = None
+        max_gap = max(1, int(self.config.max_hit_neighbor_gap))
+        for gap in range(1, max_gap + 1):
+            idx = t - gap
+            if idx < 0:
+                break
+            if visibility[idx] != 1:
+                continue
+            velocity = float((values[t] - values[idx]) / gap)
+            if positive:
+                if velocity <= threshold:
+                    continue
+                if best is None or velocity > best[0]:
+                    best = (velocity, gap)
+            else:
+                if velocity >= -threshold:
+                    continue
+                if best is None or velocity < best[0]:
+                    best = (velocity, gap)
+        return best
+
+    def _nearest_visible_index(
+        self,
+        t: int,
+        n: int,
+        visibility: np.ndarray,
+        direction: int,
+        max_gap: int,
+    ) -> int | None:
+        for offset in range(1, max_gap + 1):
+            idx = t + direction * offset
+            if idx < 0 or idx >= n:
+                break
+            if visibility[idx] == 1:
+                return idx
+        return None
 
     def _check_acceleration_peak(
         self,
@@ -381,17 +467,23 @@ class TrajectoryEventCandidateGenerator:
         x: np.ndarray,
         y: np.ndarray,
         visibility: np.ndarray,
-        speed: np.ndarray,
-        v_y: np.ndarray,
         img_height: int,
         img_width: int,
         visible_count: int,
     ) -> dict[str, object] | None:
         if t + 1 >= n or visibility[t] != 1 or visibility[t + 1] != 0:
             return None
-        recent_speed = float(np.mean(speed[max(0, t - 3) : t + 1]))
+        missing_after = self._consecutive_missing_after(t, n, visibility)
+        if missing_after < max(1, int(self.config.visibility_drop_missing_frames)):
+            return None
+        motion = self._previous_visible_motion(t, n, x, y, visibility)
+        if motion is None:
+            return None
+        recent_speed = motion["speed_before"]
         if recent_speed < self.config.min_speed_before_landing:
             return None
+        previous_v_y = motion["v_y"]
+        previous_v_x = motion["v_x"]
         is_edge = (
             x[t] < self.config.edge_margin
             or x[t] > img_width - self.config.edge_margin
@@ -399,27 +491,37 @@ class TrajectoryEventCandidateGenerator:
             or y[t] > img_height - self.config.edge_margin
         )
         edge_distance = float(min(x[t], img_width - x[t], y[t], img_height - y[t]))
+        moving_out = self._is_moving_out_of_frame(
+            x[t],
+            y[t],
+            previous_v_x,
+            previous_v_y,
+            img_width,
+            img_height,
+        )
         features = {
             "speed_before": recent_speed,
-            "v_y": float(v_y[t]),
+            "v_y": previous_v_y,
             "visible_before": int(visible_count),
             "edge_distance": edge_distance,
+            "missing_after": int(missing_after),
         }
-        if is_edge:
+        if is_edge and (moving_out or edge_distance <= self.config.edge_margin * 0.5):
             return {
                 "event_type": "out_of_frame",
                 "rule": "visibility_drop_edge",
                 "confidence": 0.45,
                 "features": features,
             }
-        if v_y[t] < -1.0:
+        top_exit_band = max(self.config.edge_margin * 2.0, img_height * 0.25)
+        if previous_v_y < -1.0 and y[t] <= top_exit_band:
             return {
                 "event_type": "out_of_frame",
                 "rule": "visibility_drop_upward",
                 "confidence": 0.50,
                 "features": features,
             }
-        if y[t] < img_height * 0.15:
+        if y[t] < img_height * 0.15 and previous_v_y <= 0.0:
             return {
                 "event_type": "out_of_frame",
                 "rule": "visibility_drop_high_altitude",
@@ -427,6 +529,53 @@ class TrajectoryEventCandidateGenerator:
                 "features": features,
             }
         return {"event_type": "landing", "rule": "visibility_drop", "confidence": 0.55, "features": features}
+
+    def _consecutive_missing_after(self, t: int, n: int, visibility: np.ndarray) -> int:
+        count = 0
+        for idx in range(t + 1, n):
+            if visibility[idx] == 1:
+                break
+            count += 1
+        return count
+
+    def _previous_visible_motion(
+        self,
+        t: int,
+        n: int,
+        x: np.ndarray,
+        y: np.ndarray,
+        visibility: np.ndarray,
+    ) -> dict[str, float] | None:
+        prev_idx = self._nearest_visible_index(
+            t,
+            n,
+            visibility,
+            -1,
+            max(self.config.min_visible_before, int(self.config.max_hit_neighbor_gap)),
+        )
+        if prev_idx is None:
+            return None
+        gap = max(1, t - prev_idx)
+        v_x = float((x[t] - x[prev_idx]) / gap)
+        v_y = float((y[t] - y[prev_idx]) / gap)
+        return {"v_x": v_x, "v_y": v_y, "speed_before": float(np.hypot(v_x, v_y))}
+
+    def _is_moving_out_of_frame(
+        self,
+        x: float,
+        y: float,
+        v_x: float,
+        v_y: float,
+        img_width: int,
+        img_height: int,
+    ) -> bool:
+        margin = self.config.edge_margin
+        return (
+            (x < margin and v_x < 0.0)
+            or (x > img_width - margin and v_x > 0.0)
+            or (y < margin and v_y < 0.0)
+            or (y > img_height - margin and v_y > 0.0)
+        )
 
     def _check_y_local_max(
         self,
@@ -739,11 +888,13 @@ class RealtimeTrajectoryEventDetector:
         sample = samples[local_index]
         if sample.score < self.config.min_hit_track_score:
             return False
-        for neighbor_index in (local_index - 1, local_index + 1):
-            if 0 <= neighbor_index < len(samples):
-                neighbor = samples[neighbor_index]
-                if neighbor.visible and neighbor.score < self.config.min_hit_neighbor_score:
-                    return False
+        for direction in (-1, 1):
+            neighbor_index = self._nearest_visible_sample_index(samples, local_index, direction)
+            if neighbor_index is None:
+                return False
+            neighbor = samples[neighbor_index]
+            if neighbor.score < self.config.min_hit_neighbor_score:
+                return False
         ball_xy = event.get("ball_xy", [-1.0, -1.0])
         if isinstance(ball_xy, (list, tuple)) and len(ball_xy) >= 2:
             try:
@@ -757,6 +908,21 @@ class RealtimeTrajectoryEventDetector:
             if y <= top_band:
                 return False
         return True
+
+    def _nearest_visible_sample_index(
+        self,
+        samples: Sequence[_TrajectoryPoint],
+        local_index: int,
+        direction: int,
+    ) -> int | None:
+        max_gap = max(1, int(self.config.max_hit_neighbor_gap))
+        for offset in range(1, max_gap + 1):
+            idx = local_index + direction * offset
+            if idx < 0 or idx >= len(samples):
+                break
+            if samples[idx].visible:
+                return idx
+        return None
 
     def _in_cooldown(self, event: dict[str, object]) -> bool:
         event_type = str(event["event_type"])

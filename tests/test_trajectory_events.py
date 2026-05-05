@@ -34,6 +34,32 @@ class TrajectoryEventCandidateGeneratorTest(unittest.TestCase):
         self.assertEqual(candidates[0]["rule"], "vy_reversal")
         self.assertEqual(candidates[0]["frame"], 3)
 
+    def test_detects_hit_across_short_visibility_gap(self) -> None:
+        generator = TrajectoryEventCandidateGenerator()
+
+        candidates = generator.generate(
+            [100.0, 100.0, 100.0, 100.0, -1.0, -1.0, 100.0, 100.0, -1.0, -1.0, 105.0, 110.0],
+            [200.0, 220.0, 240.0, 260.0, -1.0, -1.0, 300.0, 320.0, -1.0, -1.0, 250.0, 200.0],
+            [1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1],
+            include_trajectory_end=False,
+        )
+
+        hit = next(item for item in candidates if item["event_type"] == "hit")
+        self.assertEqual(hit["rule"], "vy_reversal")
+        self.assertEqual(hit["frame"], 7)
+
+    def test_does_not_use_missing_gap_as_hit_reversal_velocity(self) -> None:
+        generator = TrajectoryEventCandidateGenerator()
+
+        candidates = generator.generate(
+            [100.0, 100.0, -1.0, -1.0, 100.0, 100.0, 100.0, 100.0],
+            [420.0, 360.0, -1.0, -1.0, 260.0, 180.0, 110.0, 60.0],
+            [1, 1, 0, 0, 1, 1, 1, 1],
+            include_trajectory_end=False,
+        )
+
+        self.assertFalse(any(item["event_type"] == "hit" for item in candidates))
+
     def test_detects_landing_from_speed_step(self) -> None:
         generator = TrajectoryEventCandidateGenerator()
 
@@ -52,11 +78,55 @@ class TrajectoryEventCandidateGeneratorTest(unittest.TestCase):
         generator = TrajectoryEventCandidateGenerator()
 
         candidates = generator.generate(
-            [100.0, 80.0, 50.0, 10.0, -1.0, -1.0],
-            [100.0, 100.0, 100.0, 100.0, -1.0, -1.0],
-            [1, 1, 1, 1, 0, 0],
+            [100.0, 80.0, 50.0, 10.0, -1.0, -1.0, -1.0],
+            [100.0, 100.0, 100.0, 100.0, -1.0, -1.0, -1.0],
+            [1, 1, 1, 1, 0, 0, 0],
             img_width=200,
             img_height=200,
+            include_trajectory_end=False,
+        )
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0]["event_type"], "out_of_frame")
+        self.assertEqual(candidates[0]["rule"], "visibility_drop_edge")
+
+    def test_does_not_mark_one_frame_dropout_as_out_of_frame(self) -> None:
+        generator = TrajectoryEventCandidateGenerator()
+
+        candidates = generator.generate(
+            [100.0, 100.0, 100.0, 100.0, -1.0, 102.0],
+            [200.0, 220.0, 240.0, 260.0, -1.0, 280.0],
+            [1, 1, 1, 1, 0, 1],
+            img_width=500,
+            img_height=500,
+            include_trajectory_end=False,
+        )
+
+        self.assertFalse(any(item["event_type"] == "out_of_frame" for item in candidates))
+
+    def test_does_not_use_missing_point_as_upward_motion(self) -> None:
+        generator = TrajectoryEventCandidateGenerator()
+
+        candidates = generator.generate(
+            [100.0, 100.0, 100.0, 100.0, -1.0, -1.0, -1.0],
+            [200.0, 220.0, 240.0, 260.0, -1.0, -1.0, -1.0],
+            [1, 1, 1, 1, 0, 0, 0],
+            img_width=500,
+            img_height=500,
+            include_trajectory_end=False,
+        )
+
+        self.assertFalse(any(item["event_type"] == "out_of_frame" for item in candidates))
+
+    def test_marks_confirmed_top_exit_as_out_of_frame(self) -> None:
+        generator = TrajectoryEventCandidateGenerator()
+
+        candidates = generator.generate(
+            [100.0, 100.0, 100.0, 100.0, -1.0, -1.0, -1.0],
+            [80.0, 60.0, 35.0, 8.0, -1.0, -1.0, -1.0],
+            [1, 1, 1, 1, 0, 0, 0],
+            img_width=500,
+            img_height=500,
             include_trajectory_end=False,
         )
 

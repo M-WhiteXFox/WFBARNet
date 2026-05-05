@@ -20,6 +20,12 @@ QFrame#headerCard {
     border-top: 3px solid #525252;
 }
 
+QFrame#analyticsCard {
+    background-color: transparent;
+    border: none;
+    border-radius: 0px;
+}
+
 QFrame#metricCard {
     min-height: 80px;
 }

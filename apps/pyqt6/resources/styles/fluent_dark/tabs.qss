@@ -4,9 +4,13 @@
 
 QTabWidget#mainTabs::pane {
     border: 1px solid #3A3F4B;
-    border-radius: 4px;
+    border-radius: 6px;
     top: -1px;
     background-color: #22262E;
+}
+
+QTabWidget#mainTabs::tab-bar {
+    left: 0px;
 }
 
 QTabBar::tab {

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Any, Sequence
 
-from src.postprocess.track_filter import FrameShape, PersonBBoxes
+from src.postprocess.track_filter import BallTrackFilter, FrameShape, PersonBBoxes
 from src.utils.structures import TrackResult
 
 
@@ -347,6 +347,24 @@ class TrackNetV3TrajectoryFilter:
 
     def _invisible(self, *, score: float) -> TrackResult:
         return TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=float(score), heatmap_shape=[])
+
+
+def create_tracknet_v3_ball_track_filter(
+    *,
+    fps: float | None = None,
+    debug_enabled: bool = False,
+    fixed_lag_frames: int | None = 0,
+) -> BallTrackFilter:
+    resolved_fps = float(fps) if fps is not None and fps > 0 else TrackNetV3TrajectoryFilterConfig.fps
+    return BallTrackFilter(
+        fps=resolved_fps,
+        debug_enabled=debug_enabled,
+        algorithm=TrackNetV3TrajectoryFilter(
+            fps=resolved_fps,
+            debug_enabled=debug_enabled,
+            fixed_lag_frames=fixed_lag_frames,
+        ),
+    )
 
 
 def generate_tracknet_v3_inpaint_mask(

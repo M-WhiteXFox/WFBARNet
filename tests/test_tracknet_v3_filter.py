@@ -6,6 +6,7 @@ from src.postprocess.track_filter import BallTrackFilter
 from src.postprocess.tracknet_v3_filter import (
     TrackNetV3TrajectoryFilter,
     TrackNetV3TrajectoryFilterConfig,
+    create_tracknet_v3_ball_track_filter,
     generate_tracknet_v3_inpaint_mask,
     linear_interpolate_masked_values,
 )
@@ -90,6 +91,15 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
         self.assertTrue(output.visible)
         self.assertEqual(output.ball_xy, [120.0, 130.0])
         self.assertIs(track_filter.debug_records, algorithm.debug_records)
+        self.assertEqual(track_filter.last_debug_record()["reason"], "tracknet_v3_candidate")
+
+    def test_factory_builds_tracknet_v3_runtime_filter(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=60.0, debug_enabled=True)
+
+        output = track_filter.update_candidates([_track(120.0, 130.0, 0.9)], dt=1.0 / 60.0, frame_shape=(400, 600, 3))
+
+        self.assertTrue(output.visible)
+        self.assertEqual(output.ball_xy, [120.0, 130.0])
         self.assertEqual(track_filter.last_debug_record()["reason"], "tracknet_v3_candidate")
 
 

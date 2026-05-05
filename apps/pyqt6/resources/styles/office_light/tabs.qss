@@ -9,6 +9,10 @@ QTabWidget#mainTabs::pane {
     background-color: #FFFFFF;
 }
 
+QTabWidget#mainTabs::tab-bar {
+    left: 0px;
+}
+
 QTabBar::tab {
     background: #F3F3F3;
     color: #323130;

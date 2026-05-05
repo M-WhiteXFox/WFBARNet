@@ -1,9 +1,18 @@
+# WFBARNet runtime dependencies.
+# Python 3.10 is recommended for the current local environment.
 numpy>=1.24
 opencv-python>=4.9
+PyQt6>=6.6
 torch>=2.2
 torchvision>=0.17
+ultralytics>=8.3
 tqdm>=4.66
 Pillow>=10.0
+
+# Tools and export utilities.
 matplotlib>=3.8
-ultralytics>=8.3
 onnx>=1.16
+
+# Optional: required only for TensorRT .engine inference/export.
+# Install the CUDA variant that matches your local CUDA/TensorRT setup, for example:
+# tensorrt-cu12>=10.0

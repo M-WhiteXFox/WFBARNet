@@ -10,7 +10,7 @@ from tqdm import tqdm
 from src.builders.bst_input_builder import BSTInputBuilder
 from src.models.pose_branch import PoseBranch
 from src.models.track_branch import TrackBranch
-from src.postprocess.track_filter import BallTrackFilter
+from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
 from src.utils.exporters import export_csv, export_json, export_npy, export_track_debug_csv
 from src.utils.structures import FrameResult
 from src.utils.video import iter_frame_windows, iter_video_frame_windows, load_frames, probe_video
@@ -75,7 +75,7 @@ class UnifiedRunner:
 
     def _run_serial(self, frames: list) -> list[FrameResult]:
         outputs: list[FrameResult] = []
-        track_filter = BallTrackFilter(debug_enabled=True)
+        track_filter = create_tracknet_v3_ball_track_filter(debug_enabled=True)
         for frame_id, frame, window in tqdm(list(iter_frame_windows(frames)), desc="Unified inference"):
             pose = self.pose_branch.infer(frame)
             candidates = self.track_branch.infer_candidate_results(window)
@@ -86,7 +86,7 @@ class UnifiedRunner:
 
     def _run_video_stream(self, source: str, save_vis: bool) -> list[FrameResult]:
         metadata = probe_video(source)
-        track_filter = BallTrackFilter(fps=metadata.fps, debug_enabled=True)
+        track_filter = create_tracknet_v3_ball_track_filter(fps=metadata.fps, debug_enabled=True)
         trail_renderer = TrackTrailRenderer(fps=metadata.fps, history_seconds=0.5)
         writer = None
         if save_vis:
@@ -125,7 +125,7 @@ class UnifiedRunner:
         pose_stream = torch.cuda.Stream()
         track_stream = torch.cuda.Stream()
         outputs: list[FrameResult] = []
-        track_filter = BallTrackFilter(debug_enabled=True)
+        track_filter = create_tracknet_v3_ball_track_filter(debug_enabled=True)
         for frame_id, frame, window in tqdm(list(iter_frame_windows(frames)), desc="Unified inference (dual stream)"):
             with torch.cuda.stream(pose_stream):
                 pose = self.pose_branch.infer(frame)

@@ -833,21 +833,8 @@ class MainWindow(QMainWindow):
         analytics_panel = QFrame()
         analytics_panel.setObjectName("analyticsCard")
         analytics_layout = QHBoxLayout(analytics_panel)
-        analytics_layout.setContentsMargins(18, 18, 18, 18)
+        analytics_layout.setContentsMargins(0, 0, 0, 0)
         analytics_layout.setSpacing(14)
-
-        metrics_column = QVBoxLayout()
-        metrics_column.setSpacing(12)
-
-        card1, self.lbl_realtime_fps = self._create_metric_card("实时帧数", "0.0 FPS")
-        card2, self.lbl_avg_conf = self._create_metric_card("平均置信度", "0.0%")
-        card3, self.lbl_valid_pose = self._create_metric_card("推理 FPS", "0.0 FPS")
-        card4, self.lbl_valid_track = self._create_metric_card("击球次数", "0")
-
-        for card in (card1, card2, card3, card4):
-            card.setMinimumWidth(180)
-            card.setMaximumWidth(240)
-            metrics_column.addWidget(card, stretch=1)
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
@@ -861,7 +848,6 @@ class MainWindow(QMainWindow):
         self._build_log_tab()
 
         analytics_layout.addWidget(self.tabs, stretch=1)
-        analytics_layout.addLayout(metrics_column, stretch=0)
         body_layout.addWidget(analytics_panel, stretch=5)
 
     def _build_overview_tab(self) -> None:
@@ -869,6 +855,19 @@ class MainWindow(QMainWindow):
         overview_layout = QVBoxLayout(tab_overview)
         overview_layout.setContentsMargins(12, 12, 12, 12)
         overview_layout.setSpacing(12)
+
+        metrics_grid = QGridLayout()
+        metrics_grid.setHorizontalSpacing(12)
+        metrics_grid.setVerticalSpacing(12)
+        card1, self.lbl_realtime_fps = self._create_metric_card("实时帧数", "0.0 FPS")
+        card2, self.lbl_avg_conf = self._create_metric_card("平均置信度", "0.0%")
+        card3, self.lbl_valid_pose = self._create_metric_card("推理 FPS", "0.0 FPS")
+        card4, self.lbl_valid_track = self._create_metric_card("击球次数", "0")
+        for index, card in enumerate((card1, card2, card3, card4)):
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            metrics_grid.addWidget(card, index // 2, index % 2)
+        metrics_grid.setColumnStretch(0, 1)
+        metrics_grid.setColumnStretch(1, 1)
 
         section_header = QHBoxLayout()
         section_title = QLabel("动作时序识别结果")
@@ -892,6 +891,7 @@ class MainWindow(QMainWindow):
         self.table_actions.verticalHeader().setVisible(False)
         self.table_actions.setShowGrid(True)
 
+        overview_layout.addLayout(metrics_grid)
         overview_layout.addLayout(section_header)
         overview_layout.addWidget(self.table_actions)
         self.tabs.addTab(tab_overview, "概览")

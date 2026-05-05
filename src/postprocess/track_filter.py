@@ -1963,5 +1963,7 @@ def _eval_quadratic(coefficients: tuple[float, float, float], t: float) -> float
 
 
 def filter_track_results(tracks: list[TrackResult], *, fps: float = 25.0) -> list[TrackResult]:
-    tracker = BallTrackFilter(fps=fps)
+    from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
+
+    tracker = create_tracknet_v3_ball_track_filter(fps=fps)
     return [tracker.update(track) for track in tracks]
