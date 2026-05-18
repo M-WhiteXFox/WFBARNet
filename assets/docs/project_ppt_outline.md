@@ -150,8 +150,8 @@
 
 **页面内容**
 
-- 默认后端：OpenCV 球场线检测。
-- 可选后端：MonoTrack 风格传统 CV 后端。
+- 默认后端：ShuttleCourt/YOLO 分割球场检测，结合白线吸附和标准球场模板估计单应性。
+- 可选后端：OpenCV 白线检测、MonoTrack 风格传统 CV 后端。
 - 统一接口：`create_court_line_detector(...)`、`predict_court_lines(...)`。
 - 输出：球场角点、标准模板投影、`image_to_court_h` 单应性矩阵。
 - 用途：球场线叠加、球员位置投影、热力图、击球区域和移动距离统计。
