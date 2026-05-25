@@ -54,6 +54,27 @@ class HeatmapRendererTest(unittest.TestCase):
         )
         self.assertTrue(bool(light_pixels.any()))
 
+    def test_recent_points_have_more_weight_when_decay_enabled(self) -> None:
+        renderer = HeatmapRenderer(
+            120,
+            180,
+            court_width=610.0,
+            court_height=1340.0,
+            config=HeatmapRenderConfig(sigma=1.5, show_contours=False, temporal_decay_floor=0.25),
+        )
+        density = renderer.build_density(
+            [
+                (60.0, 120.0),
+                (550.0, 1220.0),
+            ]
+        )
+        old_x = round(60.0 / 610.0 * (renderer.width - 1))
+        old_y = round(120.0 / 1340.0 * (renderer.height - 1))
+        recent_x = round(550.0 / 610.0 * (renderer.width - 1))
+        recent_y = round(1220.0 / 1340.0 * (renderer.height - 1))
+
+        self.assertGreater(float(density[recent_y, recent_x]), float(density[old_y, old_x]))
+
 
 if __name__ == "__main__":
     unittest.main()

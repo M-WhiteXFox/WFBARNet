@@ -8,8 +8,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PyQt6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, pyqtProperty, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QPainter, QPen
+from PyQt6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QUrl, pyqtProperty, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QLinearGradient, QPainter, QPen
 from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QPushButton,
     QProgressBar,
+    QTextBrowser,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -32,6 +33,15 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import QWebEngineSettings
+    WEBENGINE_IMPORT_ERROR = ""
+except Exception as exc:  # Optional dependency; the tab keeps working with QTextBrowser.
+    QWebEngineView = None
+    QWebEngineSettings = None
+    WEBENGINE_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 from apps.pyqt6.views.components.video_player_panel_runtime import (
     VideoPlayerWidget,
@@ -320,16 +330,19 @@ class CourtHeatmapWidget(QWidget):
         self._show_top_heatmap = True
         self._show_bottom_heatmap = True
         self._show_contours = True
-        self._heatmap_opacity = 0.9
+        self._heatmap_opacity = 0.82
         self._top_color_mode = "blue"
         self._bottom_color_mode = "red"
         self._heatmap_config = HeatmapRenderConfig(
-            sigma=20.0,
-            alpha_power=0.75,
-            min_alpha_threshold=0.015,
-            max_alpha=235,
-            contour_levels=7,
-            contour_alpha=110,
+            sigma=24.0,
+            alpha_power=0.62,
+            min_alpha_threshold=0.02,
+            max_alpha=205,
+            normalization_percentile=99.0,
+            temporal_decay_floor=0.50,
+            color_gamma=0.70,
+            contour_levels=(0.22, 0.36, 0.50, 0.64, 0.78),
+            contour_alpha=72,
             contour_thickness=1,
             heatmap_opacity=self._heatmap_opacity,
             top_color_mode=self._top_color_mode,
@@ -468,6 +481,7 @@ class CourtHeatmapWidget(QWidget):
         painter.setPen(QPen(QColor("#FFFFFF"), line_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.SquareCap))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         self._draw_court_lines(painter, court)
+        self._draw_heatmap_legend(painter, bounds, court)
         self._draw_player_projections(painter, court)
         self._draw_ball_projection(painter, court)
 
@@ -558,6 +572,44 @@ class CourtHeatmapWidget(QWidget):
         if self._show_bottom_heatmap and self._bottom_heatmap_pixmap is not None and not self._bottom_heatmap_pixmap.isNull():
             painter.drawPixmap(court.toRect(), self._bottom_heatmap_pixmap)
 
+    def _draw_heatmap_legend(self, painter: QPainter, bounds: QRectF, court: QRectF) -> None:
+        if not self._top_player_points and not self._bottom_player_points:
+            return
+        legend_width = min(168.0, max(118.0, bounds.width() * 0.28))
+        legend_height = 58.0
+        x = min(bounds.right() - legend_width - 10.0, court.right() - legend_width - 8.0)
+        y = court.top() + 10.0
+        legend = QRectF(x, y, legend_width, legend_height)
+
+        painter.save()
+        painter.setPen(QPen(QColor(15, 23, 42, 85), 1))
+        painter.setBrush(QColor(248, 250, 252, 218))
+        painter.drawRoundedRect(legend, 7, 7)
+
+        bar = QRectF(legend.left() + 12.0, legend.top() + 12.0, legend.width() - 24.0, 8.0)
+        gradient = QLinearGradient(bar.left(), bar.top(), bar.right(), bar.top())
+        gradient.setColorAt(0.0, QColor("#7DD3FC"))
+        gradient.setColorAt(0.34, QColor("#2563EB"))
+        gradient.setColorAt(0.66, QColor("#F97316"))
+        gradient.setColorAt(1.0, QColor("#991B1B"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(gradient)
+        painter.drawRoundedRect(bar, 4, 4)
+
+        painter.setPen(QPen(QColor("#334155"), 1))
+        font = painter.font()
+        font.setPointSize(max(7, font.pointSize() - 1))
+        painter.setFont(font)
+        top_text = f"上方 {len(self._top_player_points)}"
+        bottom_text = f"下方 {len(self._bottom_player_points)}"
+        painter.drawText(QRectF(legend.left() + 12.0, legend.top() + 26.0, legend.width() - 24.0, 14.0), Qt.AlignmentFlag.AlignLeft, top_text)
+        painter.drawText(QRectF(legend.left() + 12.0, legend.top() + 40.0, legend.width() - 24.0, 14.0), Qt.AlignmentFlag.AlignLeft, bottom_text)
+        painter.setPen(QPen(QColor("#0EA5E9"), 3))
+        painter.drawLine(QPointF(legend.right() - 44.0, legend.top() + 33.0), QPointF(legend.right() - 22.0, legend.top() + 33.0))
+        painter.setPen(QPen(QColor("#DC2626"), 3))
+        painter.drawLine(QPointF(legend.right() - 44.0, legend.top() + 47.0), QPointF(legend.right() - 22.0, legend.top() + 47.0))
+        painter.restore()
+
     def _draw_ball_projection(self, painter: QPainter, court: QRectF) -> None:
         if self._ball_court_xy is None:
             return
@@ -605,6 +657,162 @@ class CourtHeatmapWidget(QWidget):
 BadmintonCourtWidget = CourtHeatmapWidget
 
 
+class ReportPreviewWidget(QWidget):
+    """Right-side report tab backed by the Tabler template in assets/dist."""
+
+    def __init__(self, project_root: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._project_root = project_root
+        self._template_path = project_root / "assets" / "dist" / "index.html"
+        self._template_assets_dir = self._template_path.parent / "dist"
+        self._current_report_path: Path | None = self._template_path if self._template_path.exists() else None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        title = QLabel("训练报告")
+        title.setObjectName("sectionTitle")
+        self.report_path_label = QLabel("")
+        self.report_path_label.setObjectName("sectionNote")
+        self.report_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.backend_label = QLabel("")
+        self.backend_label.setObjectName("sectionNote")
+
+        self.btn_refresh_report = QPushButton("刷新")
+        self.btn_refresh_report.setObjectName("btnRefreshReport")
+        self.btn_open_report = QPushButton("浏览器打开")
+        self.btn_open_report.setObjectName("btnOpenReport")
+        self.btn_refresh_report.clicked.connect(self.reload)
+        self.btn_open_report.clicked.connect(self.open_external)
+
+        header.addWidget(title)
+        header.addWidget(self.report_path_label, stretch=1)
+        header.addWidget(self.backend_label)
+        header.addWidget(self.btn_refresh_report)
+        header.addWidget(self.btn_open_report)
+        layout.addLayout(header)
+
+        if QWebEngineView is not None:
+            self.viewer = QWebEngineView(self)
+            self.viewer.setObjectName("reportWebView")
+            self._configure_web_engine()
+            self._uses_web_engine = True
+        else:
+            self.viewer = QTextBrowser(self)
+            self.viewer.setObjectName("reportTextBrowser")
+            self.viewer.setOpenExternalLinks(True)
+            self._uses_web_engine = False
+            self.backend_label.setText("简化预览")
+            self.backend_label.setToolTip(
+                WEBENGINE_IMPORT_ERROR or "未检测到 PyQt6.QtWebEngineWidgets，已降级为 QTextBrowser。"
+            )
+
+        if self._uses_web_engine:
+            self.backend_label.setText("WebEngine")
+            self.backend_label.setToolTip("当前使用 QWebEngineView 渲染 Tabler 报告。")
+
+        layout.addWidget(self.viewer, stretch=1)
+        self.load_template()
+
+    def load_template(self) -> None:
+        self.load_report_file(self._template_path)
+
+    def load_report_file(self, path: Path | str) -> None:
+        report_path = Path(path)
+        self._current_report_path = report_path if report_path.exists() else None
+        self._update_path_label(report_path)
+        if not report_path.exists():
+            self._set_fallback_html(f"报告模板不存在：{report_path}")
+            return
+        self._ensure_report_assets(report_path)
+
+        if self._uses_web_engine:
+            self.viewer.load(QUrl.fromLocalFile(str(report_path.resolve())))
+        else:
+            self.viewer.setHtml(self._fallback_preview_html(report_path))
+
+    def load_report_html(self, html: str, base_path: Path | str | None = None) -> None:
+        base = Path(base_path) if base_path else self._template_path.parent
+        self._current_report_path = None
+        self.report_path_label.setText("当前报告：内存预览")
+        if self._uses_web_engine:
+            self.viewer.setHtml(html, self._directory_url(base))
+        else:
+            self.viewer.setHtml(html)
+
+    def reload(self) -> None:
+        if self._current_report_path is not None:
+            self.load_report_file(self._current_report_path)
+        else:
+            self.load_template()
+
+    def open_external(self) -> None:
+        if self._current_report_path is None or not self._current_report_path.exists():
+            return
+        self._ensure_report_assets(self._current_report_path)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._current_report_path.resolve())))
+
+    def _configure_web_engine(self) -> None:
+        if QWebEngineSettings is None:
+            return
+        settings = self.viewer.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
+
+    def _ensure_report_assets(self, report_path: Path) -> None:
+        if not self._template_assets_dir.exists():
+            return
+        destination = report_path.parent / "dist"
+        if destination.exists() and (destination / "css" / "tabler.css").exists():
+            return
+        import shutil
+
+        shutil.copytree(self._template_assets_dir, destination, dirs_exist_ok=True)
+
+    @staticmethod
+    def _directory_url(path: Path) -> QUrl:
+        directory = path if path.is_dir() else path.parent
+        value = str(directory.resolve()).replace("\\", "/")
+        if not value.endswith("/"):
+            value += "/"
+        return QUrl.fromLocalFile(value)
+
+    def _update_path_label(self, path: Path) -> None:
+        if path == self._template_path:
+            self.report_path_label.setText("当前报告：assets/dist/index.html")
+        else:
+            self.report_path_label.setText(f"当前报告：{path.name}")
+
+    def _set_fallback_html(self, message: str) -> None:
+        escaped = (
+            message.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        self.viewer.setHtml(f"<h3>报告预览不可用</h3><p>{escaped}</p>")
+
+    def _fallback_preview_html(self, report_path: Path) -> str:
+        body = report_path.read_text(encoding="utf-8")
+        reason = WEBENGINE_IMPORT_ERROR or "当前运行环境未启用 PyQt6-WebEngine。"
+        escaped_reason = (
+            reason.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        return (
+            "<div style='padding:10px;margin-bottom:12px;border:1px solid #f59f00;"
+            "background:#fff7e6;color:#5c3b00;font-family:Arial,sans-serif;'>"
+            "<strong>当前为简化 HTML 预览，未使用浏览器内核渲染。</strong>"
+            f"<br>原因：{escaped_reason}"
+            "<br>请使用 WFBARNet 环境从源码重启应用，或重新打包包含 PyQt6-WebEngine 的程序。"
+            "</div>"
+            f"{body}"
+        )
+
+
 class MainWindow(QMainWindow):
     """视图层：负责布局、控件实例化和基础状态展示。"""
 
@@ -612,12 +820,14 @@ class MainWindow(QMainWindow):
     trackModelBrowseRequested = pyqtSignal()
     modelSettingsApplyRequested = pyqtSignal(str, str)
     modelSettingsDefaultsRequested = pyqtSignal()
+    reportApiSettingsApplyRequested = pyqtSignal(dict)
     modelSwitchesChanged = pyqtSignal(bool, bool)
     debugCsvChanged = pyqtSignal(bool)
-    courtRedetectRequested = pyqtSignal()
+    manualCourtCalibrationRequested = pyqtSignal()
     batchFolderBrowseRequested = pyqtSignal()
     batchRallySelectionChanged = pyqtSignal(str)
     batchExportRequested = pyqtSignal()
+    reportExportRequested = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -790,10 +1000,10 @@ class MainWindow(QMainWindow):
         court_controls_layout.setSpacing(8)
         court_controls_layout.addStretch(1)
 
-        self.btn_redetect_court = QPushButton("重新预测球场线")
+        self.btn_redetect_court = QPushButton("手动标定球场")
         self.btn_redetect_court.setObjectName("btnRedetectCourt")
         self.btn_redetect_court.setEnabled(False)
-        self.btn_redetect_court.clicked.connect(self.courtRedetectRequested.emit)
+        self.btn_redetect_court.clicked.connect(self.manualCourtCalibrationRequested.emit)
         court_controls_layout.addWidget(self.btn_redetect_court)
 
         video_controls = QFrame()
@@ -828,6 +1038,10 @@ class MainWindow(QMainWindow):
         self.btn_export_batch.setObjectName("btnExportBatch")
         self.btn_export_batch.setEnabled(False)
         self.btn_export_batch.setVisible(False)
+        self.btn_export_report = QPushButton("导出报告")
+        self.btn_export_report.setObjectName("btnExportReport")
+        self.btn_export_report.setEnabled(False)
+        self.btn_export_report.setToolTip("将当前回合数据导出为 HTML 训练报告")
 
         controls_layout.addWidget(self.camera_device_combo)
         controls_layout.addWidget(self.btn_refresh_cameras)
@@ -835,10 +1049,12 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.batch_folder_edit, stretch=1)
         controls_layout.addWidget(self.batch_video_combo)
         controls_layout.addWidget(self.btn_export_batch)
+        controls_layout.addWidget(self.btn_export_report)
         controls_layout.addWidget(self.video_player.btn_force_stop)
         self.btn_select_batch_folder.clicked.connect(self.batchFolderBrowseRequested.emit)
         self.batch_video_combo.currentIndexChanged.connect(self._emit_batch_rally_selection)
         self.btn_export_batch.clicked.connect(self.batchExportRequested.emit)
+        self.btn_export_report.clicked.connect(self.reportExportRequested.emit)
 
         self.video_timeline = VideoTimelineWidget()
         timeline_bar = QWidget()
@@ -875,6 +1091,7 @@ class MainWindow(QMainWindow):
 
         self._build_overview_tab()
         self._build_data_tab()
+        self._build_report_tab()
         self._build_stats_tab()
         self._build_pose_tab()
         self._build_settings_tab()
@@ -989,6 +1206,10 @@ class MainWindow(QMainWindow):
         data_layout.addLayout(section_header)
         data_layout.addWidget(self.data_subtabs, stretch=1)
         self.tabs.addTab(tab_data, "数据")
+
+    def _build_report_tab(self) -> None:
+        self.report_preview = ReportPreviewWidget(PROJECT_ROOT)
+        self.tabs.addTab(self.report_preview, "报告")
 
     def _build_stats_tab(self) -> None:
         tab_stats = QWidget()
@@ -1120,6 +1341,24 @@ class MainWindow(QMainWindow):
         debug_note.setObjectName("sectionNote")
         debug_note.setWordWrap(True)
 
+        report_api_label = QLabel("报告 API")
+        report_api_label.setObjectName("styleLabel")
+        self.report_api_enabled = ToggleSwitch("启用报告模型 API")
+        self.report_api_enabled.setChecked(False)
+        self.report_api_provider_combo = QComboBox()
+        self.report_api_provider_combo.setObjectName("modelPathEdit")
+        self.report_api_provider_combo.addItem("阿里百炼 OpenAI 兼容", "bailian_openai")
+        self.report_api_endpoint_edit = QLineEdit()
+        self.report_api_endpoint_edit.setObjectName("modelPathEdit")
+        self.report_api_endpoint_edit.setPlaceholderText("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+        self.report_api_model_edit = QLineEdit()
+        self.report_api_model_edit.setObjectName("modelPathEdit")
+        self.report_api_model_edit.setPlaceholderText("qwen-plus")
+        self.report_api_key_edit = QLineEdit()
+        self.report_api_key_edit.setObjectName("modelPathEdit")
+        self.report_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.report_api_key_edit.setPlaceholderText("阿里百炼 API Key")
+
         settings_frame_layout.addWidget(pose_label, 0, 0)
         settings_frame_layout.addWidget(self.pose_model_enabled, 0, 1)
         settings_frame_layout.addWidget(self.pose_model_edit, 0, 2)
@@ -1131,6 +1370,15 @@ class MainWindow(QMainWindow):
         settings_frame_layout.addWidget(debug_label, 2, 0)
         settings_frame_layout.addWidget(self.debug_csv_enabled, 2, 1)
         settings_frame_layout.addWidget(debug_note, 2, 2, 1, 2)
+        settings_frame_layout.addWidget(report_api_label, 3, 0)
+        settings_frame_layout.addWidget(self.report_api_enabled, 3, 1)
+        settings_frame_layout.addWidget(self.report_api_provider_combo, 3, 2, 1, 2)
+        settings_frame_layout.addWidget(QLabel("Endpoint"), 4, 0)
+        settings_frame_layout.addWidget(self.report_api_endpoint_edit, 4, 1, 1, 3)
+        settings_frame_layout.addWidget(QLabel("模型"), 5, 0)
+        settings_frame_layout.addWidget(self.report_api_model_edit, 5, 1, 1, 3)
+        settings_frame_layout.addWidget(QLabel("API Key"), 6, 0)
+        settings_frame_layout.addWidget(self.report_api_key_edit, 6, 1, 1, 3)
         settings_frame_layout.setColumnStretch(2, 1)
 
         self.pose_model_enabled.stateChanged.connect(self._emit_model_switches_changed)
@@ -1143,9 +1391,13 @@ class MainWindow(QMainWindow):
         self.btn_model_defaults.setObjectName("btnModelDefaults")
         self.btn_apply_model_settings = QPushButton("应用设置")
         self.btn_apply_model_settings.setObjectName("btnApplyModelSettings")
+        self.btn_apply_report_api_settings = QPushButton("保存报告 API")
+        self.btn_apply_report_api_settings.setObjectName("btnApplyReportApiSettings")
         self.btn_model_defaults.clicked.connect(self.modelSettingsDefaultsRequested.emit)
         self.btn_apply_model_settings.clicked.connect(self._emit_model_settings_apply)
+        self.btn_apply_report_api_settings.clicked.connect(self._emit_report_api_settings_apply)
         action_row.addWidget(self.btn_model_defaults)
+        action_row.addWidget(self.btn_apply_report_api_settings)
         action_row.addWidget(self.btn_apply_model_settings)
 
         settings_layout.addLayout(section_header)
@@ -1211,6 +1463,7 @@ class MainWindow(QMainWindow):
         self.batch_folder_edit.setVisible(is_batch)
         self.batch_video_combo.setVisible(is_batch)
         self.btn_export_batch.setVisible(is_batch)
+        self.btn_export_report.setVisible(True)
         self.video_timeline.setVisible(not is_camera and not is_batch)
         self.btn_analyze.setText("开始推理" if is_camera else "开始分析")
         if is_batch:
@@ -1258,6 +1511,21 @@ class MainWindow(QMainWindow):
     def set_batch_export_enabled(self, enabled: bool) -> None:
         self.btn_export_batch.setEnabled(bool(enabled))
 
+    def set_report_export_enabled(self, enabled: bool) -> None:
+        self.btn_export_report.setEnabled(bool(enabled))
+
+    def set_report_preview_file(self, path: str | Path) -> None:
+        self.report_preview.load_report_file(Path(path))
+        index = self.tabs.indexOf(self.report_preview)
+        if index >= 0:
+            self.tabs.setCurrentIndex(index)
+
+    def set_report_preview_html(self, html: str, base_path: str | Path | None = None) -> None:
+        self.report_preview.load_report_html(html, base_path=base_path)
+        index = self.tabs.indexOf(self.report_preview)
+        if index >= 0:
+            self.tabs.setCurrentIndex(index)
+
     def _emit_batch_rally_selection(self, _index: int = -1) -> None:
         self.batchRallySelectionChanged.emit(self.selected_batch_rally_id())
 
@@ -1287,6 +1555,26 @@ class MainWindow(QMainWindow):
     def debug_csv_enabled_state(self) -> bool:
         return self.debug_csv_enabled.isChecked()
 
+    def set_report_api_settings(self, settings: dict[str, object]) -> None:
+        self.report_api_enabled.blockSignals(True)
+        self.report_api_enabled.setChecked(bool(settings.get("enabled")))
+        self.report_api_enabled.blockSignals(False)
+        provider = str(settings.get("provider") or "bailian_openai")
+        index = self.report_api_provider_combo.findData(provider)
+        self.report_api_provider_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.report_api_endpoint_edit.setText(str(settings.get("endpoint") or ""))
+        self.report_api_model_edit.setText(str(settings.get("model") or ""))
+        self.report_api_key_edit.setText(str(settings.get("api_key") or ""))
+
+    def report_api_settings(self) -> dict[str, object]:
+        return {
+            "enabled": self.report_api_enabled.isChecked(),
+            "provider": self.report_api_provider_combo.currentData(),
+            "endpoint": self.report_api_endpoint_edit.text().strip(),
+            "model": self.report_api_model_edit.text().strip(),
+            "api_key": self.report_api_key_edit.text().strip(),
+        }
+
     def set_model_settings_enabled(self, enabled: bool) -> None:
         widgets = (
             self.pose_model_enabled,
@@ -1297,7 +1585,13 @@ class MainWindow(QMainWindow):
             self.btn_browse_pose_model,
             self.btn_browse_track_model,
             self.btn_model_defaults,
+            self.btn_apply_report_api_settings,
             self.btn_apply_model_settings,
+            self.report_api_enabled,
+            self.report_api_provider_combo,
+            self.report_api_endpoint_edit,
+            self.report_api_model_edit,
+            self.report_api_key_edit,
         )
         for widget in widgets:
             widget.setEnabled(enabled)
@@ -1305,6 +1599,9 @@ class MainWindow(QMainWindow):
     def _emit_model_settings_apply(self) -> None:
         pose_model_path, track_model_path = self.model_settings()
         self.modelSettingsApplyRequested.emit(pose_model_path, track_model_path)
+
+    def _emit_report_api_settings_apply(self) -> None:
+        self.reportApiSettingsApplyRequested.emit(self.report_api_settings())
 
     def _emit_model_switches_changed(self) -> None:
         pose_enabled, track_enabled = self.model_switches()
@@ -1324,6 +1621,13 @@ class MainWindow(QMainWindow):
         self.court_widget.set_player_projections(player_projections)
         self.video_timeline.set_duration(duration_ms)
         self.video_timeline.set_position(position_ms)
+
+    def set_manual_court_capture_enabled(self, enabled: bool) -> None:
+        self.video_player.set_point_capture_enabled(enabled)
+        self.btn_redetect_court.setText("取消标定" if enabled else "手动标定球场")
+
+    def set_court_overlay(self, court: object | None) -> None:
+        self.video_player.set_court_overlay(court)
 
     def stop_video(self) -> None:
         self.video_player.stop()
@@ -1529,6 +1833,7 @@ class MainWindow(QMainWindow):
         self.lbl_valid_pose.setText("0.0 FPS")
         self.lbl_valid_track.setText("0")
         self.set_rally_data(None)
+        self.report_preview.load_template()
 
     def stroke_total_count(self) -> int:
         return self.stroke_pie_chart.total_count()

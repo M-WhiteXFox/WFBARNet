@@ -4,7 +4,16 @@
 
 ## 1. 当前结论
 
-当前球场线识别已经统一收口到 `src/court/court_line_detector.py`：
+当前 PyQt 主流程已临时停用自动球场线识别，改为手动四点标定。历史自动检测能力仍保留在 `src/court/court_line_detector.py`，但主页、视频推理和摄像头推理默认不再启动自动检测服务。
+
+临时手动标定路线：
+
+- PyQt 启动时创建 `ManualCourtCalibrationService`。
+- 用户点击主页 `手动标定球场`，在当前视频帧上依次点击外框四角 `TL, TR, BR, BL`。
+- 服务根据四点计算标准球场到图像的单应性矩阵，并投影完整标准球场线。
+- 下游姿态过滤、球轨过滤、统计与热力图继续读取统一 `CourtLinePrediction` 字段。
+
+历史自动球场线识别曾统一收口到 `src/court/court_line_detector.py`：
 
 - 默认后端是 `shuttlecourt_seg`，即基于 ShuttleCourtNet/YOLO 分割结果估计球场外框，再结合白线与标准球场模板计算单应性。
 - `opencv` 和 `monotrack` 仍然保留为可选传统 CV 后端。
@@ -95,7 +104,7 @@ court_prediction = court_detector.predict(
 
 ## 4. 默认后端：ShuttleCourt 分割检测
 
-`ShuttleCourtSegLineDetector` 的核心目标是把 YOLO 分割出的球场 mask 转换为标准羽毛球场模板与图像之间的单应性矩阵。
+`ShuttleCourtSegLineDetector` 的核心目标是把 YOLO 分割出的球场 mask 作为候选 ROI，再在 ROI 内通过 OpenCV 白线检测和标准模板拟合得到真实球场四边形与单应性矩阵。分割结果不再直接等同于最终球场外框。
 
 ### 4.1 模型与权重解析
 
@@ -115,17 +124,19 @@ court_prediction = court_detector.predict(
 1. 校验输入帧，并把 `timestamp_ms` 规范为非负整数。
 2. 根据 `force` 或 `should_redetect(...)` 判断本帧是否真正检测。
 3. 调用 YOLO `model.predict(...)`，获取 `masks.xy`、`boxes.conf` 和 `boxes.cls`。
-4. 调用公共核心逻辑 `create_white_line_mask(...)` 生成白线 mask 和绿色场地区域 mask，用于后续细化和评分。
+4. 调用公共核心逻辑 `create_white_line_mask(...)` 生成白线 mask 和绿色场地区域 mask，用于后续线检测、细化和评分。
 5. 遍历每个分割 polygon，过滤点数不足、面积过小或坐标异常的候选。
-6. 对 polygon 做凸包与 `approxPolyDP` 四边形近似；若无法得到合理四边形，则回退到 `minAreaRect`。
-7. 将四边形排序为 `top-left, top-right, bottom-right, bottom-left`。
-8. 通过标准球场外框计算 `court_to_image_h` 和 `image_to_court_h`。
-9. 沿标准球场模板线采样，在法线方向搜索附近白线像素，并用 RANSAC 重新拟合单应性。
-10. 若细化后的四边形仍然凸、面积有效且角点平均偏移不超过阈值，则接受细化结果。
-11. 投影完整标准球场线，生成 `projected_lines`。
-12. 计算 `mask_support`、`green_side_support`、`snap_points` 等质量指标。
-13. 综合分割置信度、几何合理性、图像边界、面积、画面中心位置、与上一结果的稳定性、白线支撑和绿色边界支撑进行评分。
-14. 从多个候选中选择 `rank` 最高的候选作为本帧 candidate。
+6. 将 polygon 填充为 ROI mask，并按 `seg_roi_dilate_px` 轻微扩张，避免分割边界刚好切掉白线。
+7. 在 ROI 内对白线 mask 做 Hough 线段检测、方向族聚合和两方向/三方向模板枚举，优先得到由真实白线支撑的球场四边形。
+8. 若 ROI 白线拟合结果面积相对分割区域过小，会按 `seg_line_min_area_ratio` 拒绝，避免把内部发球线错误当作外框。
+9. 通过标准球场外框计算 `court_to_image_h` 和 `image_to_court_h`。
+10. 沿标准球场模板线采样，在法线方向搜索附近白线像素，并用 RANSAC 重新拟合单应性。
+11. 若细化后的四边形仍然凸、面积有效且角点平均偏移不超过阈值，则接受细化结果。
+12. 投影完整标准球场线，生成 `projected_lines`。
+13. 计算 `mask_support`、`green_side_support`、`snap_points`、`seg_roi_support` 等质量指标。
+14. 若 ROI 白线拟合失败，才回退到旧的 polygon 四边形近似和白线吸附流程。
+15. 综合分割置信度、几何合理性、图像边界、面积、画面中心位置、与上一结果的稳定性、白线支撑和绿色边界支撑进行评分。
+16. 从多个候选中选择 `rank` 最高的候选作为本帧 candidate。
 
 ### 4.3 候选评分
 
@@ -141,6 +152,9 @@ ShuttleCourt 分割后端会把模型框置信度和几何/视觉质量融合：
 - `seg_line_support`：投影球场线与白线 mask 的重合度。
 - `seg_green_sides`：外框两侧是否有绿色场地支撑。
 - `seg_snap_points`：白线细化时的有效吸附点数量。
+- `seg_line_fit`：是否使用分割 ROI 内的 OpenCV 白线拟合结果。
+- `seg_roi_support`：投影后的标准场线是否仍落在分割 ROI 支持区域内。
+- `seg_line_area_ratio`：白线拟合出的球场面积与分割区域面积的比例。
 
 若候选形状不合理、明显越界、四边形质量弱，或首帧候选远离主球场区域，置信度会被降权。
 

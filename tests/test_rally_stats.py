@@ -207,6 +207,56 @@ class RallyStatsAccumulatorTest(unittest.TestCase):
         self.assertEqual(summary["rally_hit_count"], 1)
         self.assertEqual(summary["frame_count"], 0)
 
+    def test_can_continue_collecting_after_landing_end(self) -> None:
+        stats = RallyStatsAccumulator(freeze_after_rally_end=False)
+        stats.add_trajectory_event(
+            {
+                "event_type": "hit",
+                "frame_id": 1,
+                "timestamp_ms": 100,
+                "confidence": 0.72,
+            }
+        )
+        stats.add_trajectory_event(
+            {
+                "event_type": "landing",
+                "frame_id": 12,
+                "timestamp_ms": 480,
+                "confidence": 0.72,
+            }
+        )
+        stats.update_frame(
+            timestamp_ms=800,
+            player_points={0: (305.0, 550.0)},
+            ball_visible=True,
+            ball_xy=(320.0, 580.0),
+            ball_score=0.8,
+            court_valid=True,
+        )
+        stats.add_trajectory_event(
+            {
+                "event_type": "hit",
+                "frame_id": 20,
+                "timestamp_ms": 800,
+                "confidence": 0.8,
+            }
+        )
+        stats.add_bst_prediction(
+            {
+                "event_frame_id": 20,
+                "timestamp_ms": 800,
+                "pred_display_name": "Top_杀球",
+                "confidence": 0.9,
+            }
+        )
+
+        summary = stats.summary()
+        self.assertEqual(summary["rally_state"], "回合结束")
+        self.assertEqual(summary["rally_end_ms"], 480)
+        self.assertEqual(summary["rally_hit_count"], 2)
+        self.assertEqual(summary["frame_count"], 1)
+        self.assertEqual(summary["players"]["top"]["hit_count"], 1)
+
     def test_does_not_start_from_single_false_visible_ball(self) -> None:
         stats = RallyStatsAccumulator()
         stats.update_frame(

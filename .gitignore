@@ -90,7 +90,11 @@ runs/
 *.log
 *.log.*
 
+# Generated report/runtime snapshots
+assets/dist/report-data.json
+
 # Local IDE and shell caches
+.claude/
 .codex_deps/
 .vscode/
 .idea/
@@ -110,3 +114,9 @@ desktop.ini
 .env.*.local
 *.pem
 *.key
+
+# Local packaged app outputs and template scratch assets
+assets/temp/
+
+AGENTS.md
+AgentPlan.md

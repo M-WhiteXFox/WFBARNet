@@ -3,6 +3,7 @@
 numpy>=1.24
 opencv-python>=4.9
 PyQt6>=6.6
+PyQt6-WebEngine>=6.6
 torch>=2.2
 torchvision>=0.17
 ultralytics>=8.3

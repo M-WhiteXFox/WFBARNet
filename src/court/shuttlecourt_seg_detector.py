@@ -35,6 +35,8 @@ class ShuttleCourtSegConfig:
     small_candidate_area_ratio: float = 0.12
     small_candidate_min_line_support: float = 0.04
     approx_epsilon_ratio: float = 0.02
+    seg_roi_dilate_px: int = 18
+    seg_line_min_area_ratio: float = 0.45
     white_s_max: int = 130
     white_v_min: int = 120
     white_chroma_max: int = 96
@@ -48,12 +50,27 @@ class ShuttleCourtSegConfig:
     green_v_min: int = 35
     white_green_pair_offset_px: int = 8
     keep_all_green_rois: bool = False
+    detect_max_width: int = 960
+    hough_threshold: int = 45
+    min_line_length_ratio: float = 0.055
+    max_line_gap_ratio: float = 0.025
+    angle_bin_deg: float = 5.0
+    angle_tol_deg: float = 16.0
+    min_angle_separation_deg: float = 25.0
+    merge_rho_px: float = 18.0
+    max_lines_per_family: int = 3
     point_scheme: str = "auto"
     refine_homography: bool = True
     snap_search_px: float = 18.0
     snap_response_threshold: float = 0.18
     max_refine_corner_shift_ratio: float = 0.025
     green_side_offset_px: float = 14.0
+    min_outer_width_ratio: float = 0.08
+    min_outer_depth_ratio: float = 0.08
+    min_outer_width_depth_ratio: float = 0.18
+    max_outer_width_depth_ratio: float = 5.5
+    max_transverse_angle_deg: float = 35.0
+    jump_ratio_hard: float = 0.18
 
 
 class ShuttleCourtSegLineDetector:
@@ -183,12 +200,9 @@ class ShuttleCourtSegLineDetector:
                 continue
             confidence = float(confidences[index]) if index < len(confidences) else 1.0
             class_id = int(classes[index]) if index < len(classes) else 0
-            quad = _quad_from_polygon(polygon, frame.shape, self._args)
-            if quad is None:
-                rejected += 1
-                continue
-            detection = _detection_from_quad(
-                quad=quad,
+            detection = _detection_from_segmentation_lines(
+                polygon=polygon,
+                frame_shape=frame.shape,
                 confidence=confidence,
                 area_ratio=area / frame_area,
                 polygon_points=len(polygon),
@@ -196,12 +210,31 @@ class ShuttleCourtSegLineDetector:
                 rejected_masks=rejected,
                 line_mask=line_mask,
                 green_mask=green_mask,
+                previous=previous,
                 args=self._args,
             )
+            if detection is None:
+                quad = _quad_from_polygon(polygon, frame.shape, self._args)
+                if quad is None:
+                    rejected += 1
+                    continue
+                detection = _detection_from_quad(
+                    quad=quad,
+                    confidence=confidence,
+                    area_ratio=area / frame_area,
+                    polygon_points=len(polygon),
+                    class_id=class_id,
+                    rejected_masks=rejected,
+                    line_mask=line_mask,
+                    green_mask=green_mask,
+                    args=self._args,
+                )
             if detection is None:
                 rejected += 1
                 continue
 
+            line_fit = bool(detection.components.get("seg_line_fit"))
+            line_confidence = float(detection.confidence)
             rank, fused_confidence, components, reason = _score_segmentation_candidate(
                 quad=detection.corners,
                 frame_shape=frame.shape,
@@ -213,6 +246,10 @@ class ShuttleCourtSegLineDetector:
                 snap_points=detection.snap_points,
                 args=self._args,
             )
+            if line_fit:
+                fused_confidence = max(fused_confidence, 0.65 * line_confidence + 0.35 * fused_confidence)
+                rank += 0.20 * line_confidence
+                reason = f"segmentation ROI white-line fit: {reason}"
             detection.confidence = fused_confidence
             detection.reason = reason
             detection.components.update(components)
@@ -352,6 +389,112 @@ def _to_numpy(value: Any) -> np.ndarray:
     if hasattr(value, "numpy"):
         return value.numpy()
     return np.asarray(value)
+
+
+def _detection_from_segmentation_lines(
+    *,
+    polygon: np.ndarray,
+    frame_shape: tuple[int, ...],
+    confidence: float,
+    area_ratio: float,
+    polygon_points: int,
+    class_id: int,
+    rejected_masks: int,
+    line_mask: np.ndarray,
+    green_mask: np.ndarray,
+    previous: _court_core.CourtLineDetection | None,
+    args: SimpleNamespace,
+) -> _court_core.CourtLineDetection | None:
+    roi_mask = _segmentation_roi_mask(polygon, frame_shape, args)
+    if roi_mask is None or cv2.countNonZero(roi_mask) <= 0:
+        return None
+
+    line_roi = cv2.bitwise_and(line_mask, roi_mask)
+    if cv2.countNonZero(line_roi) <= 0:
+        return None
+
+    green_roi = cv2.bitwise_and(green_mask, roi_mask) if green_mask.size else green_mask
+    segments, _ = _court_core.detect_hough_segments(line_roi, args)
+    if len(segments) < 4:
+        return None
+
+    best = _best_line_detection_from_masks(
+        segments=segments,
+        line_mask=line_roi,
+        green_mask=green_roi,
+        previous=previous,
+        args=args,
+    )
+    if best is None:
+        return None
+
+    polygon_area = abs(float(cv2.contourArea(np.asarray(polygon, dtype=np.float32).reshape(-1, 1, 2))))
+    line_area = _court_core.polygon_area(best.corners)
+    area_ratio_to_seg = line_area / max(1.0, polygon_area)
+    if area_ratio_to_seg < max(0.0, float(getattr(args, "seg_line_min_area_ratio", 0.0))):
+        return None
+
+    roi_support = _projected_lines_roi_support(best.projected_lines, roi_mask)
+    best.scheme = "shuttlecourt_seg"
+    best.reason = f"segmentation ROI white-line fit: {best.reason}"
+    best.components.update(
+        {
+            "segmentation_area": float(np.clip(area_ratio, 0.0, 1.0)),
+            "box_confidence": float(np.clip(confidence, 0.0, 1.0)),
+            "polygon_points": float(polygon_points),
+            "class_id": float(class_id),
+            "rejected_masks": float(rejected_masks),
+            "seg_line_fit": 1.0,
+            "seg_roi_support": float(roi_support),
+            "seg_line_area_ratio": float(area_ratio_to_seg),
+        }
+    )
+    if roi_support < 0.35:
+        best.confidence *= 0.70
+        best.reason = f"{best.reason}; weak segmentation ROI support"
+    return best
+
+
+def _best_line_detection_from_masks(
+    *,
+    segments: list[_court_core.LineSegment],
+    line_mask: np.ndarray,
+    green_mask: np.ndarray,
+    previous: _court_core.CourtLineDetection | None,
+    args: SimpleNamespace,
+) -> _court_core.CourtLineDetection | None:
+    family_a_segments, family_b_segments, angles = _court_core.choose_direction_families(segments, args)
+    best: _court_core.CourtLineDetection | None = None
+    if angles is not None:
+        merged_a = _court_core.merge_line_family(family_a_segments, angles[0], args)
+        merged_b = _court_core.merge_line_family(family_b_segments, angles[1], args)
+        if len(merged_a) >= 2 and len(merged_b) >= 2:
+            intersections = _court_core.all_family_intersections(merged_a, merged_b, line_mask.shape)
+            if len(intersections) >= 4:
+                best = _court_core.find_best_court_quad(
+                    family_a=merged_a,
+                    family_b=merged_b,
+                    segments=segments,
+                    intersections=intersections,
+                    mask=line_mask,
+                    green_mask=green_mask,
+                    previous=previous,
+                    args=args,
+                )
+
+    if best is None or best.confidence < float(args.medium_conf):
+        clusters = _court_core.choose_angle_clusters(segments, args, max_clusters=4)
+        best_three = _court_core.find_best_court_quad_three_family(
+            clusters=clusters,
+            segments=segments,
+            mask=line_mask,
+            green_mask=green_mask,
+            previous=previous,
+            args=args,
+        )
+        if best_three is not None and (best is None or best_three.confidence > best.confidence):
+            best = best_three
+    return best
 
 
 def _detection_from_quad(
@@ -593,6 +736,50 @@ def _quad_from_polygon(
     if _is_reasonable_quad(ordered_box, frame_shape):
         return ordered_box
     return None
+
+
+def _segmentation_roi_mask(
+    polygon: np.ndarray,
+    frame_shape: tuple[int, ...],
+    args: SimpleNamespace,
+) -> np.ndarray | None:
+    height, width = frame_shape[:2]
+    points = np.asarray(polygon, dtype=np.float32).reshape(-1, 2).copy()
+    if points.shape[0] < 3 or not np.isfinite(points).all():
+        return None
+    points[:, 0] = np.clip(points[:, 0], 0.0, max(0.0, float(width - 1)))
+    points[:, 1] = np.clip(points[:, 1], 0.0, max(0.0, float(height - 1)))
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(mask, [points.astype(np.int32).reshape(-1, 1, 2)], 255)
+    dilation = max(0, int(getattr(args, "seg_roi_dilate_px", 0)))
+    if dilation > 0:
+        kernel_size = dilation * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+    return mask
+
+
+def _projected_lines_roi_support(projected_lines: dict[str, np.ndarray], roi_mask: np.ndarray) -> float:
+    if not projected_lines:
+        return 0.0
+    supports: list[float] = []
+    for points in projected_lines.values():
+        points_array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+        if len(points_array) < 2:
+            continue
+        total = 0
+        inside = 0
+        for p1, p2 in zip(points_array, points_array[1:]):
+            length = float(np.linalg.norm(p2 - p1))
+            samples = max(4, min(80, int(length / 12.0)))
+            for t in np.linspace(0.0, 1.0, samples, dtype=np.float32):
+                point = p1 * (1.0 - t) + p2 * t
+                total += 1
+                if _court_core.sample_mask(roi_mask, point) > 0:
+                    inside += 1
+        if total:
+            supports.append(inside / float(total))
+    return float(np.mean(supports)) if supports else 0.0
 
 
 def _order_quad(points: np.ndarray) -> np.ndarray:

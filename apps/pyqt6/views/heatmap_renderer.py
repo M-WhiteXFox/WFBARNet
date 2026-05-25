@@ -15,11 +15,14 @@ class HeatmapRenderConfig:
     heatmap_width: int = 320
     heatmap_height: int = 700
     sigma: float = 22.0
-    alpha_power: float = 0.75
-    min_alpha_threshold: float = 0.035
-    max_alpha: int = 220
+    alpha_power: float = 0.62
+    min_alpha_threshold: float = 0.025
+    max_alpha: int = 205
+    normalization_percentile: float = 99.2
+    temporal_decay_floor: float = 0.42
+    color_gamma: float = 0.72
     contour_levels: int | Sequence[float] = 7
-    contour_alpha: int = 85
+    contour_alpha: int = 70
     contour_thickness: int = 1
     top_color_mode: str = "blue"
     bottom_color_mode: str = "red"
@@ -59,7 +62,8 @@ class HeatmapRenderer:
 
         xs = np.clip(np.rint(clean_points[:, 0]).astype(np.int32), 0, self.width - 1)
         ys = np.clip(np.rint(clean_points[:, 1]).astype(np.int32), 0, self.height - 1)
-        np.add.at(density, (ys, xs), 1.0)
+        weights = self._point_weights(clean_points.shape[0])
+        np.add.at(density, (ys, xs), weights)
         return density
 
     def build_heatmap_rgba(
@@ -74,6 +78,7 @@ class HeatmapRenderer:
         density = self.build_density(points, normalized=normalized)
         blurred = self._blur_density(density)
         norm = self._normalize_density(blurred)
+        norm = self._polish_density(norm)
         layer_opacity = self.config.heatmap_opacity if opacity is None else float(opacity)
         rgba = self.density_to_rgba(norm, color_mode=color_mode, opacity=layer_opacity)
         if self.config.show_contours if show_contours is None else bool(show_contours):
@@ -126,8 +131,11 @@ class HeatmapRenderer:
         overlay = np.zeros_like(rgba, dtype=np.uint8)
         contour_alpha = max(0, min(int(self.config.contour_alpha), 255))
         thickness = max(1, int(self.config.contour_thickness))
+        contour_source = cv2.GaussianBlur(norm, (0, 0), sigmaX=1.15, sigmaY=1.15)
         for level in self._contour_levels():
-            mask = (norm >= float(level)).astype(np.uint8) * 255
+            mask = (contour_source >= float(level)).astype(np.uint8) * 255
+            kernel = np.ones((3, 3), dtype=np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
             contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             if contours:
                 cv2.drawContours(
@@ -161,10 +169,32 @@ class HeatmapRenderer:
         return cv2.GaussianBlur(density, (0, 0), sigmaX=sigma, sigmaY=sigma).astype(np.float32)
 
     def _normalize_density(self, density: np.ndarray) -> np.ndarray:
-        max_value = float(np.max(density)) if density.size else 0.0
-        if max_value <= 1e-12:
+        if not density.size:
             return np.zeros_like(density, dtype=np.float32)
-        return np.clip(density / max_value, 0.0, 1.0).astype(np.float32)
+        positive = density[density > 1e-12]
+        if positive.size == 0:
+            return np.zeros_like(density, dtype=np.float32)
+        percentile = max(50.0, min(float(self.config.normalization_percentile), 100.0))
+        scale = float(np.percentile(positive, percentile))
+        if scale <= 1e-12:
+            scale = float(np.max(positive))
+        if scale <= 1e-12:
+            return np.zeros_like(density, dtype=np.float32)
+        return np.clip(density / scale, 0.0, 1.0).astype(np.float32)
+
+    def _polish_density(self, density: np.ndarray) -> np.ndarray:
+        if density.size == 0 or float(density.max(initial=0.0)) <= 0.0:
+            return density.astype(np.float32, copy=True)
+        polished = cv2.GaussianBlur(density, (0, 0), sigmaX=0.65, sigmaY=0.65)
+        return np.clip(polished, 0.0, 1.0).astype(np.float32)
+
+    def _point_weights(self, count: int) -> np.ndarray:
+        if count <= 0:
+            return np.empty((0,), dtype=np.float32)
+        floor = max(0.0, min(float(self.config.temporal_decay_floor), 1.0))
+        if count == 1 or floor >= 1.0:
+            return np.ones((count,), dtype=np.float32)
+        return np.linspace(floor, 1.0, count, dtype=np.float32)
 
     def _contour_levels(self) -> list[float]:
         levels = self.config.contour_levels
@@ -207,16 +237,24 @@ class HeatmapRenderer:
         value = np.clip(norm[..., None], 0.0, 1.0)
         mode = color_mode.lower().strip()
         if mode == "red":
-            low = np.array([255, 150, 70], dtype=np.float32)
-            high = np.array([155, 12, 24], dtype=np.float32)
+            stops = (
+                (0.0, (255, 212, 117)),
+                (0.38, (249, 115, 22)),
+                (0.72, (220, 38, 38)),
+                (1.0, (127, 29, 29)),
+            )
         elif mode == "blue":
-            low = np.array([96, 205, 255], dtype=np.float32)
-            high = np.array([0, 46, 180], dtype=np.float32)
+            stops = (
+                (0.0, (125, 211, 252)),
+                (0.38, (14, 165, 233)),
+                (0.72, (37, 99, 235)),
+                (1.0, (30, 58, 138)),
+            )
         else:
             colored = cv2.applyColorMap(np.rint(norm * 255.0).astype(np.uint8), cv2.COLORMAP_TURBO)
             return cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
-        gamma = np.power(value, 0.85)
-        return np.rint(low * (1.0 - gamma) + high * gamma).astype(np.uint8)
+        gamma = np.power(norm, max(0.1, float(self.config.color_gamma)))
+        return _interpolate_color_stops(gamma, stops)
 
 
 def _alpha_composite_rgba(base: np.ndarray, overlay: np.ndarray) -> np.ndarray:
@@ -233,3 +271,25 @@ def _alpha_composite_rgba(base: np.ndarray, overlay: np.ndarray) -> np.ndarray:
     ) / out_a[valid]
     out = np.concatenate((out_rgb, out_a), axis=-1)
     return np.rint(np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def _interpolate_color_stops(norm: np.ndarray, stops: Sequence[tuple[float, tuple[int, int, int]]]) -> np.ndarray:
+    values = np.clip(norm, 0.0, 1.0).astype(np.float32)
+    output = np.zeros((*values.shape, 3), dtype=np.float32)
+    sorted_stops = sorted(stops, key=lambda item: item[0])
+    for index, (left_pos, left_color_raw) in enumerate(sorted_stops[:-1]):
+        right_pos, right_color_raw = sorted_stops[index + 1]
+        left_color = np.asarray(left_color_raw, dtype=np.float32)
+        right_color = np.asarray(right_color_raw, dtype=np.float32)
+        if index == len(sorted_stops) - 2:
+            mask = (values >= left_pos) & (values <= right_pos)
+        else:
+            mask = (values >= left_pos) & (values < right_pos)
+        if not bool(mask.any()):
+            continue
+        span = max(1e-6, float(right_pos - left_pos))
+        t = ((values[mask] - left_pos) / span)[..., None]
+        output[mask] = left_color * (1.0 - t) + right_color * t
+    output[values <= sorted_stops[0][0]] = np.asarray(sorted_stops[0][1], dtype=np.float32)
+    output[values >= sorted_stops[-1][0]] = np.asarray(sorted_stops[-1][1], dtype=np.float32)
+    return np.rint(output).astype(np.uint8)

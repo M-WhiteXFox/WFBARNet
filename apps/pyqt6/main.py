@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import QApplication, QLabel, QProgressBar, QVBoxLayout, QWi
 
 APP_NAME = "WFBARNet"
 APP_USER_MODEL_ID = "WFBARNet.Desktop"
+WEBENGINE_IMPORT_ERROR: str | None = None
 
 
 def runtime_root() -> Path:
@@ -27,6 +28,16 @@ def set_windows_app_user_model_id() -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
     except Exception:
         return
+
+
+def preload_web_engine() -> None:
+    """Import Qt WebEngine before QApplication is created when it is available."""
+    global WEBENGINE_IMPORT_ERROR
+    try:
+        from PyQt6.QtWebEngineCore import QWebEngineSettings  # noqa: F401
+        from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
+    except Exception as exc:
+        WEBENGINE_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
 PROJECT_ROOT = runtime_root()
@@ -117,6 +128,7 @@ class StartupSplash(QWidget):
 
 def main() -> int:
     set_windows_app_user_model_id()
+    preload_web_engine()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
@@ -148,10 +160,10 @@ def main() -> int:
     if not icon.isNull():
         window.setWindowIcon(icon)
 
-    update_startup(56, "正在初始化分析服务...")
-    from apps.pyqt6.services.court_detection_service import create_court_detection_service
+    update_startup(56, "正在初始化手动标定服务...")
+    from apps.pyqt6.services.manual_court_calibration_service import create_manual_court_calibration_service
 
-    court_service = create_court_detection_service()
+    court_service = create_manual_court_calibration_service()
 
     update_startup(78, "正在连接控制器...")
     from apps.pyqt6.controllers.analysis_controller_runtime import MainController

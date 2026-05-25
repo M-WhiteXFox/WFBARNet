@@ -2,6 +2,29 @@
 
 本文档按模块整理当前球场线检测相关内容，覆盖统一入口、默认后端、可选后端、运行集成、输出结构和排障注意事项。
 
+> 当前 PyQt 主流程临时停用自动球场线检测，改为手动四点标定。自动 `shuttlecourt_seg` / `opencv` / `monotrack` 后端代码仍保留，便于后续恢复或离线调试。
+
+## 临时手动标定接口
+
+PyQt 当前使用 `apps/pyqt6/services/manual_court_calibration_service.py`：
+
+```python
+service = create_manual_court_calibration_service()
+prediction = service.set_calibration(
+    [[x_tl, y_tl], [x_tr, y_tr], [x_br, y_br], [x_bl, y_bl]],
+    source_size=(width, height),
+)
+```
+
+手动标定输出仍是统一的 `CourtLinePrediction`，其中：
+
+- `scheme = "manual"`。
+- `corners` 为用户点击的四个外框角点。
+- `court_to_image_h` 和 `image_to_court_h` 由四点单应性计算得到。
+- `projected_lines` 为标准羽毛球场模板投影到画面后的完整场线。
+
+因此下游姿态过滤、球轨过滤、统计与标准球场视图不需要切换数据结构。
+
 ## 文档模块
 
 | 模块 | 内容 |
@@ -18,10 +41,10 @@
 
 ### 当前默认行为
 
-- `create_court_line_detector()` 默认创建 `ShuttleCourtSegLineDetector`。
+- 历史自动检测入口 `create_court_line_detector()` 默认创建 `ShuttleCourtSegLineDetector`。
 - `predict_court_lines(...)` 默认使用 `backend="shuttlecourt_seg"`，且快捷调用默认 `force=True`。
-- PyQt 实时播放和摄像头推理通过 `CourtDetectionService` 异步请求球场检测，服务默认后端同样是 `shuttlecourt_seg`。
-- 批处理流程直接创建检测器，并让检测器按 `redetect_interval` 和内部状态决定是否自动重检。
+- PyQt 实时播放和摄像头推理当前通过 `ManualCourtCalibrationService` 读取手动标定结果，不再异步请求自动球场检测。
+- 批处理流程当前不再创建自动球场检测器，球场投影相关指标在未提供手动标定时会降级。
 - `opencv` 和 `monotrack` 仍是可选传统 CV 后端，可通过 `backend` 显式选择。
 
 ### 代码文件分工
@@ -153,7 +176,7 @@ def predict_court_lines(
 
 ### 3.1 默认后端：ShuttleCourt 分割检测
 
-`ShuttleCourtSegLineDetector` 的核心目标是把 YOLO 分割出的球场 mask 转换为标准羽毛球场模板与图像之间的单应性矩阵。
+`ShuttleCourtSegLineDetector` 的核心目标是把 YOLO 分割出的球场 mask 作为候选 ROI，再在 ROI 内使用 OpenCV 白线检测和标准模板拟合得到真实球场四边形与单应性矩阵。分割区域只负责限制搜索范围，不再直接作为最终外框。
 
 默认配置：
 
@@ -176,6 +199,8 @@ class ShuttleCourtSegConfig:
     small_candidate_area_ratio: float = 0.12
     small_candidate_min_line_support: float = 0.04
     approx_epsilon_ratio: float = 0.02
+    seg_roi_dilate_px: int = 18
+    seg_line_min_area_ratio: float = 0.45
     white_s_max: int = 130
     white_v_min: int = 120
     white_chroma_max: int = 96
@@ -189,12 +214,27 @@ class ShuttleCourtSegConfig:
     green_v_min: int = 35
     white_green_pair_offset_px: int = 8
     keep_all_green_rois: bool = False
+    detect_max_width: int = 960
+    hough_threshold: int = 45
+    min_line_length_ratio: float = 0.055
+    max_line_gap_ratio: float = 0.025
+    angle_bin_deg: float = 5.0
+    angle_tol_deg: float = 16.0
+    min_angle_separation_deg: float = 25.0
+    merge_rho_px: float = 18.0
+    max_lines_per_family: int = 3
     point_scheme: str = "auto"
     refine_homography: bool = True
     snap_search_px: float = 18.0
     snap_response_threshold: float = 0.18
     max_refine_corner_shift_ratio: float = 0.025
     green_side_offset_px: float = 14.0
+    min_outer_width_ratio: float = 0.08
+    min_outer_depth_ratio: float = 0.08
+    min_outer_width_depth_ratio: float = 0.18
+    max_outer_width_depth_ratio: float = 5.5
+    max_transverse_angle_deg: float = 35.0
+    jump_ratio_hard: float = 0.18
 ```
 
 核心流程：
@@ -203,13 +243,15 @@ class ShuttleCourtSegConfig:
 2. 调用 `ultralytics.YOLO.predict(...)` 获取 `masks.xy`、`boxes.conf` 和 `boxes.cls`。
 3. 使用公共 OpenCV 核心逻辑生成白线 mask 和绿色场地 mask。
 4. 遍历分割 polygon，过滤面积过小、点数不足或坐标异常的候选。
-5. 对 polygon 做凸包与四边形近似，必要时回退到 `cv2.minAreaRect`。
-6. 将四边形排序为 `top-left, top-right, bottom-right, bottom-left`。
-7. 根据标准羽毛球场外框计算 `court_to_image_h` 与 `image_to_court_h`。
-8. 沿标准球场模板线采样，在法线方向搜索附近白线像素，并用 RANSAC 细化单应性。
-9. 投影完整标准球场线，生成 `projected_lines`。
-10. 按分割置信度、几何形状、边界、面积、画面中心、时间稳定性、白线支撑和绿色场地支撑综合评分。
-11. 选出评分最高的 candidate，并交给统一时序状态更新逻辑。
+5. 将 polygon 填充成 ROI mask，并按 `seg_roi_dilate_px` 轻微扩张。
+6. 在 ROI 内对白线 mask 执行 Hough 线段检测、方向族聚合和两方向/三方向模板枚举。
+7. 若白线拟合结果面积相对分割区域过小，会按 `seg_line_min_area_ratio` 拒绝，避免把内部线误当成外框。
+8. 根据白线拟合四边形计算 `court_to_image_h` 与 `image_to_court_h`。
+9. 沿标准球场模板线采样，在法线方向搜索附近白线像素，并用 RANSAC 细化单应性。
+10. 投影完整标准球场线，生成 `projected_lines`。
+11. 若 ROI 白线拟合失败，才回退到 polygon 四边形近似和 `cv2.minAreaRect`。
+12. 按分割置信度、几何形状、边界、面积、画面中心、时间稳定性、白线支撑和绿色场地支撑综合评分。
+13. 选出评分最高的 candidate，并交给统一时序状态更新逻辑。
 
 权重解析顺序：
 

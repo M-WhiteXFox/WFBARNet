@@ -23,7 +23,6 @@ from PyQt6.QtWidgets import QApplication, QFileDialog
 from apps.pyqt6.utils.style import apply_theme, discover_themes
 from apps.pyqt6.utils.theme_transition import start_theme_ripple_transition
 from apps.pyqt6.views.main_window_refined import MainWindow
-from src.court import create_court_line_detector
 from src.models.bst_runtime import build_bst_model
 from src.models.bst_stroke_runtime import BSTStrokeRecognizer
 from src.models.pose_branch import PoseBranch
@@ -34,6 +33,7 @@ from src.postprocess.rally_stats import RallyStatsAccumulator
 from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
 from src.postprocess.trajectory_events import RealtimeTrajectoryEventDetector
 from src.utils.exporters import TRACK_DEBUG_FIELDS, frame_result_log_record, write_frame_log_jsonl
+from src.utils.report_generation import OpenAICompatibleReportApiClient, generate_report_from_rally_record
 from src.utils.structures import FrameResult, PersonPoseResult, TrackResult
 from src.utils.visualize import TrackTrailRenderer
 
@@ -48,6 +48,8 @@ POSE_INFERENCE_STRIDE = 2
 POSE_YOLO_IMGSZ = 960
 POSE_CROP_IMGSZ = 640
 POSE_CROP_PADDING = 0.30
+DEFAULT_REPORT_API_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+DEFAULT_REPORT_API_MODEL = "qwen-plus"
 POSE_CROP_MIN_BOX_CONF = 0.45
 POSE_MAX_CROPS = 8
 
@@ -533,6 +535,7 @@ class TrackNetPlaybackWorker(QThread):
             rally_id=self._video_path,
             rally_name=Path(self._video_path).name,
             fps=fps,
+            freeze_after_rally_end=False,
         )
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=0.5)
         event_detector = RealtimeTrajectoryEventDetector(fps=fps)
@@ -912,6 +915,7 @@ class CameraInferenceWorker(QThread):
             rally_id=f"camera_{self._camera_index}",
             rally_name=f"摄像头 {self._camera_index}",
             fps=fps,
+            freeze_after_rally_end=False,
         )
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=0.5)
         event_detector = RealtimeTrajectoryEventDetector(fps=fps)
@@ -1306,13 +1310,13 @@ class BatchInferenceWorker(QThread):
         )
         distance_accumulator = PlayerDistanceAccumulator()
         event_detector = RealtimeTrajectoryEventDetector(fps=fps)
-        court_detector = create_court_line_detector()
         frame_height, frame_width = current_frame.shape[:2]
         bst_recognizer = self._create_bst_recognizer(frame_width, frame_height, fps)
         rally_stats = RallyStatsAccumulator(
             rally_id=str(video_path),
             rally_name=video_path.name,
             fps=fps,
+            freeze_after_rally_end=False,
         )
         pending_bst_errors: list[str] = []
         parallel_inference = (
@@ -1326,12 +1330,7 @@ class BatchInferenceWorker(QThread):
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wfb-batch-infer") as infer_executor:
                 while not self._stop_requested:
                     frame_id = int(round((current_ms / 1000.0) * fps)) if fps > 0 else processed_frames
-                    court_prediction = court_detector.predict(
-                        current_frame,
-                        frame_id,
-                        current_ms,
-                        force=processed_frames == 0,
-                    )
+                    court_prediction = None
                     pose_due = self._pose_enabled and processed_frames % self._pose_stride == 0
                     run_parallel = parallel_inference and pose_due
                     if run_parallel:
@@ -1485,6 +1484,75 @@ class BatchInferenceWorker(QThread):
         return record
 
 
+class ReportGenerationWorker(QThread):
+    reportFinished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        rally_record: dict[str, Any],
+        athlete_name: str,
+        video_name: str,
+        output_html_path: Path,
+        use_api: bool,
+        endpoint: str,
+        model: str,
+        api_key: str,
+    ) -> None:
+        super().__init__()
+        self._rally_record = rally_record
+        self._athlete_name = athlete_name
+        self._video_name = video_name
+        self._output_html_path = output_html_path
+        self._use_api = bool(use_api)
+        self._endpoint = endpoint
+        self._model = model
+        self._api_key = api_key
+
+    def run(self) -> None:
+        api_error = ""
+        try:
+            api_client = None
+            if self._use_api:
+                api_client = OpenAICompatibleReportApiClient(
+                    self._endpoint,
+                    model=self._model,
+                    api_key=self._api_key,
+                    timeout_s=60.0,
+                )
+            try:
+                response = generate_report_from_rally_record(
+                    self._rally_record,
+                    athlete_name=self._athlete_name,
+                    user_player="bottom",
+                    video_name=self._video_name,
+                    api_client=api_client,
+                    use_api=api_client is not None,
+                    output_html_path=self._output_html_path,
+                )
+            except Exception as exc:
+                if not self._use_api:
+                    raise
+                api_error = str(exc)
+                response = generate_report_from_rally_record(
+                    self._rally_record,
+                    athlete_name=self._athlete_name,
+                    user_player="bottom",
+                    video_name=self._video_name,
+                    output_html_path=self._output_html_path,
+                )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+
+        payload = response.to_dict()
+        if api_error:
+            payload["api_error"] = api_error
+        payload["output_html_path"] = str(self._output_html_path)
+        self.reportFinished.emit(payload)
+
+
 class MainController:
     """PyQt6 前端的多线程 TrackNetV3 预览控制器。"""
 
@@ -1501,6 +1569,11 @@ class MainController:
         self._pose_model_enabled = self._load_bool_setting("pose_model_enabled", True)
         self._track_model_enabled = self._load_bool_setting("track_model_enabled", True)
         self._debug_csv_enabled = self._load_bool_setting("debug_csv_enabled", False)
+        self._report_api_enabled = self._load_bool_setting("report_api_enabled", False)
+        self._report_api_provider = str(self._settings.value("report_api_provider", "bailian_openai") or "bailian_openai")
+        self._report_api_endpoint = str(self._settings.value("report_api_endpoint", DEFAULT_REPORT_API_ENDPOINT) or DEFAULT_REPORT_API_ENDPOINT)
+        self._report_api_model = str(self._settings.value("report_api_model", DEFAULT_REPORT_API_MODEL) or DEFAULT_REPORT_API_MODEL)
+        self._report_api_key = str(self._settings.value("report_api_key", "") or "")
         self._theme_dirs = discover_themes()
         self._active_theme_name = self._resolve_initial_theme_name()
         self._selected_video_path: str | None = None
@@ -1512,8 +1585,16 @@ class MainController:
         self._playback_worker: TrackNetPlaybackWorker | None = None
         self._camera_worker: CameraInferenceWorker | None = None
         self._batch_worker: BatchInferenceWorker | None = None
+        self._report_worker: ReportGenerationWorker | None = None
         self._batch_results: dict[str, dict[str, Any]] = {}
         self._batch_order: list[str] = []
+        self._current_rally_record: dict[str, Any] | None = None
+        self._live_rally_record: dict[str, Any] | None = None
+        self._last_live_record_save_time = 0.0
+        self._analysis_busy = False
+        self._auto_report_after_stop = False
+        self._manual_court_points: list[list[float]] = []
+        self._manual_court_active = False
         self._pending_seek_ms: int | None = None
         self._last_display_frame_time: float | None = None
         self._last_metrics_update_time: float | None = None
@@ -1525,6 +1606,15 @@ class MainController:
         self.view.set_model_settings(self._pose_model_path, self._track_model_path)
         self.view.set_model_switches(self._pose_model_enabled, self._track_model_enabled)
         self.view.set_debug_csv_enabled(self._debug_csv_enabled)
+        self.view.set_report_api_settings(
+            {
+                "enabled": self._report_api_enabled,
+                "provider": self._report_api_provider,
+                "endpoint": self._report_api_endpoint,
+                "model": self._report_api_model,
+                "api_key": self._report_api_key,
+            }
+        )
         self._track_branch = self._build_track_branch()
         self._pose_branch = self._build_pose_branch()
         self._bst_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1553,15 +1643,115 @@ class MainController:
                 self._court_service.request_prediction()
 
     def _request_court_prediction(self) -> None:
+        self.handle_manual_court_calibration()
+
+    def handle_manual_court_calibration(self) -> None:
+        if self._manual_court_active:
+            self._finish_manual_court_calibration(cancelled=True)
+            return
+        if self._is_inference_running():
+            self.view.append_log("[Court] 请先停止当前推理任务，再进行手动标定。")
+            return
+        if self._input_mode == "batch":
+            self.view.append_log("[Court] 批量模式暂不支持逐视频手动标定。")
+            return
+        if self.view.video_player.source_size() is None:
+            self.view.append_log("[Court] 请先选择视频或打开摄像头预览，再进行手动标定。")
+            return
+        self._manual_court_points = []
+        self._manual_court_active = True
+        self.view.set_manual_court_capture_enabled(True)
+        self.view.append_log("[Court] 手动标定开始：请依次点击外框四角 TL, TR, BR, BL。")
+
+    def handle_manual_court_point_selected(self, x: float, y: float) -> None:
+        if not self._manual_court_active:
+            return
+        self._manual_court_points.append([float(x), float(y)])
+        point_index = len(self._manual_court_points)
+        self.view.append_log(f"[Court] 标定点 {point_index}/4: ({x:.1f}, {y:.1f})")
+        if point_index < 4:
+            return
+
+        source_size = self.view.video_player.source_size()
+        if source_size is None:
+            self._finish_manual_court_calibration(cancelled=True)
+            self.view.append_log("[Court] 标定失败：当前没有可用视频帧。")
+            return
+        try:
+            set_calibration = getattr(self._court_service, "set_calibration", None)
+            if not callable(set_calibration):
+                raise RuntimeError("manual calibration service is not available")
+            prediction = set_calibration(
+                self._manual_court_points,
+                source_size=source_size,
+                frame_id=int(self._video_meta.get("frame_id", 0)),
+                timestamp_ms=int(self._video_meta.get("position_ms", 0)),
+            )
+        except Exception as exc:
+            self._finish_manual_court_calibration(cancelled=True)
+            self.view.append_log(f"[Court] 手动标定失败: {exc}")
+            return
+
+        payload = prediction.to_dict() if hasattr(prediction, "to_dict") else prediction
+        self.view.set_court_overlay(payload)
+        self._finish_manual_court_calibration(cancelled=False)
+        self.view.append_log("[Court] 手动标定完成，后续分析将使用该球场映射。")
+
+    def handle_manual_court_corner_dragged(self, corner_index: int, x: float, y: float) -> None:
+        if self._manual_court_active:
+            return
+        source_size = self.view.video_player.source_size()
+        latest = self._latest_court_prediction_dict()
+        corners = latest.get("corners") if isinstance(latest, dict) else None
+        if source_size is None or not isinstance(corners, list) or len(corners) != 4:
+            return
+        if corner_index < 0 or corner_index >= len(corners):
+            return
+
+        updated_corners = [[float(point[0]), float(point[1])] for point in corners]
+        updated_corners[corner_index] = [float(x), float(y)]
+        try:
+            set_calibration = getattr(self._court_service, "set_calibration", None)
+            if not callable(set_calibration):
+                return
+            prediction = set_calibration(
+                updated_corners,
+                source_size=source_size,
+                frame_id=int(self._video_meta.get("frame_id", 0)),
+                timestamp_ms=int(self._video_meta.get("position_ms", 0)),
+            )
+        except Exception:
+            return
+
+        payload = prediction.to_dict() if hasattr(prediction, "to_dict") else prediction
+        self.view.set_court_overlay(payload)
+
+    def _finish_manual_court_calibration(self, *, cancelled: bool) -> None:
+        self._manual_court_active = False
+        self._manual_court_points = []
+        self.view.set_manual_court_capture_enabled(False)
+        if cancelled:
+            self.view.append_log("[Court] 已取消手动标定。")
+
+    def _clear_manual_court_calibration(self) -> None:
+        self._finish_manual_court_calibration(cancelled=False)
+        clear_calibration = getattr(self._court_service, "clear_calibration", None)
+        if callable(clear_calibration):
+            clear_calibration()
+        self.view.set_court_overlay(None)
+
+    def _latest_court_prediction_dict(self) -> dict[str, Any] | None:
         if self._court_service is None:
-            self.view.append_log("[Court] ShuttleCourt court detector is unavailable.")
-            return
-        if not self._is_inference_running():
-            self.view.append_log("[Court] 请先开始视频播放或摄像头推理，再重新预测球场线。")
-            return
-        self._last_court_log_frame = -1
-        self._court_service.request_prediction()
-        self.view.append_log("[Court] 已请求重新预测球场线，将使用下一帧画面。")
+            return None
+        latest_dict = getattr(self._court_service, "latest_prediction_dict", None)
+        if callable(latest_dict):
+            value = latest_dict()
+            return value if isinstance(value, dict) else None
+        latest = getattr(self._court_service, "latest_prediction", None)
+        prediction = latest() if callable(latest) else None
+        to_dict = getattr(prediction, "to_dict", None)
+        value = to_dict() if callable(to_dict) else prediction
+        return value if isinstance(value, dict) else None
 
     def _on_court_prediction_ready(self, payload: object) -> None:
         if not isinstance(payload, dict):
@@ -1576,13 +1766,17 @@ class MainController:
             self._last_court_log_frame = frame_id
             confidence = float(payload.get("confidence", 0.0))
             detect_ms = float(payload.get("detect_ms", 0.0))
-            self.view.append_log(f"[Court] ShuttleCourt court updated | frame {frame_id} | conf {confidence:.2f} | {detect_ms:.0f} ms")
+            scheme = str(payload.get("scheme", "manual"))
+            if scheme == "manual":
+                self.view.append_log(f"[Court] manual calibration updated | frame {frame_id} | conf {confidence:.2f}")
+            else:
+                self.view.append_log(f"[Court] court updated | frame {frame_id} | conf {confidence:.2f} | {detect_ms:.0f} ms")
         elif not valid and self._last_court_log_frame < 0:
             self._last_court_log_frame = frame_id
-            self.view.append_log("[Court] ShuttleCourt court detector is running; waiting for a valid court.")
+            self.view.append_log("[Court] waiting for manual court calibration.")
 
     def _on_court_detection_failed(self, message: str) -> None:
-        self.view.append_log(f"[Court] ShuttleCourt court detector failed: {message}")
+        self.view.append_log(f"[Court] manual court calibration failed: {message}")
 
     def _load_model_path(self, key: str, default_path: str) -> str:
         raw_value = self._settings.value(key, default_path)
@@ -1629,6 +1823,61 @@ class MainController:
         if csv_path.name.endswith(suffix):
             return str(csv_path.with_name(f"{csv_path.name[:-len(suffix)]}_frame_log.jsonl"))
         return str(csv_path.with_suffix(".jsonl"))
+
+    def _runtime_data_dir(self) -> Path:
+        return self._project_root / "outputs" / "runtime_data"
+
+    def _write_json_file(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _save_live_rally_record(self, record: dict[str, Any] | None, *, force: bool = False) -> None:
+        if record is None:
+            return
+        now = perf_counter()
+        if not force and now - self._last_live_record_save_time < 1.0:
+            return
+        self._last_live_record_save_time = now
+        payload = {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "source": "live_analysis",
+            "record_state": "running" if self._analysis_busy else "idle",
+            "rally_record": record,
+        }
+        try:
+            self._write_json_file(self._runtime_data_dir() / "live_rally_record.json", payload)
+        except Exception as exc:
+            self.view.append_log(f"[报告] 实时数据保存失败: {exc}")
+
+    def _save_report_input_snapshot(
+        self,
+        record: dict[str, Any],
+        *,
+        trigger: str,
+        use_api: bool,
+    ) -> tuple[Path, Path]:
+        saved_at = datetime.now()
+        payload = {
+            "saved_at": saved_at.isoformat(timespec="seconds"),
+            "trigger": trigger,
+            "report_api": {
+                "enabled": bool(self._report_api_enabled),
+                "used": bool(use_api),
+                "provider": self._report_api_provider,
+                "endpoint": self._report_api_endpoint,
+                "model": self._report_api_model,
+                "api_key_configured": bool(self._report_api_key),
+            },
+            "rally_record": record,
+        }
+        runtime_dir = self._runtime_data_dir()
+        latest_path = runtime_dir / "latest_report_input.json"
+        timestamp_path = runtime_dir / f"report_input_{saved_at.strftime('%Y%m%d_%H%M%S')}.json"
+        dist_path = self._project_root / "assets" / "dist" / "report-data.json"
+        for path in (latest_path, timestamp_path, dist_path):
+            self._write_json_file(path, payload)
+        self._save_live_rally_record(record, force=True)
+        return latest_path, dist_path
 
     def _build_track_branch(self) -> TrackBranch:
         branch = self._create_track_branch(self._track_model_path)
@@ -1693,7 +1942,7 @@ class MainController:
             yolo_crop_min_box_conf=POSE_CROP_MIN_BOX_CONF,
             yolo_max_pose_crops=POSE_MAX_CROPS,
             yolo_court_filter=True,
-            yolo_court_required=True,
+            yolo_court_required=False,
             yolo_court_margin=POSE_COURT_MARGIN_CM,
         )
 
@@ -1711,6 +1960,10 @@ class MainController:
         self.view.batchFolderBrowseRequested.connect(self.handle_browse_batch_folder)
         self.view.batchRallySelectionChanged.connect(self.handle_batch_rally_selection)
         self.view.batchExportRequested.connect(self.handle_export_batch_results)
+        self.view.reportExportRequested.connect(self.handle_export_report)
+        self.view.manualCourtCalibrationRequested.connect(self.handle_manual_court_calibration)
+        self.view.video_player.framePointClicked.connect(self.handle_manual_court_point_selected)
+        self.view.video_player.courtCornerDragged.connect(self.handle_manual_court_corner_dragged)
         self.view._style_menu.triggered.connect(self._on_style_action_triggered)
         self.view.poseModelBrowseRequested.connect(self.handle_browse_pose_model)
         self.view.trackModelBrowseRequested.connect(self.handle_browse_track_model)
@@ -1718,9 +1971,10 @@ class MainController:
         self.view.modelSettingsDefaultsRequested.connect(self.handle_model_settings_defaults)
         self.view.modelSwitchesChanged.connect(self.handle_model_switches_changed)
         self.view.debugCsvChanged.connect(self.handle_debug_csv_changed)
-        self.view.courtRedetectRequested.connect(self._request_court_prediction)
+        self.view.reportApiSettingsApplyRequested.connect(self.handle_report_api_settings_apply)
 
     def _set_idle_state(self) -> None:
+        self._analysis_busy = False
         has_video = self._selected_video_path is not None
         has_camera = self.view.selected_camera_device() is not None
         has_batch_folder = self._selected_batch_folder is not None
@@ -1738,13 +1992,19 @@ class MainController:
         self.view.btn_select_batch_folder.setEnabled(self._input_mode == "batch")
         self.view.batch_video_combo.setEnabled(self._input_mode == "batch" and bool(self._batch_order))
         self.view.btn_export_batch.setEnabled(self._input_mode == "batch" and bool(self._batch_results))
+        self.view.set_report_export_enabled(
+            self._current_rally_record is not None
+            and not self._analysis_busy
+            and not self._is_report_generation_running()
+        )
         self.view.video_player.btn_force_stop.setEnabled(has_video if self._input_mode == "video" else False)
-        self.view.btn_redetect_court.setEnabled(False)
+        self.view.btn_redetect_court.setEnabled(self._input_mode != "batch")
         self.view.video_timeline.set_interactive(self._input_mode == "video")
         self.view.set_model_settings_enabled(True)
         self.view.set_status_state("idle")
 
     def _set_running_state(self) -> None:
+        self._analysis_busy = True
         self.view.btn_analyze.setEnabled(False)
         self.view.btn_reset.setEnabled(True)
         self.view.video_player.btn_select_video.setEnabled(False)
@@ -1753,8 +2013,9 @@ class MainController:
         self.view.btn_select_batch_folder.setEnabled(False)
         self.view.batch_video_combo.setEnabled(False)
         self.view.btn_export_batch.setEnabled(False)
+        self.view.set_report_export_enabled(False)
         self.view.video_player.btn_force_stop.setEnabled(True)
-        self.view.btn_redetect_court.setEnabled(self._court_service is not None and self._input_mode != "batch")
+        self.view.btn_redetect_court.setEnabled(False)
         self.view.video_timeline.set_interactive(False)
         self.view.set_model_settings_enabled(False)
         self.view.set_status_state("loading")
@@ -1855,10 +2116,15 @@ class MainController:
 
     def _is_inference_running(self) -> bool:
         return bool(
+            self._analysis_busy
+            or
             (self._playback_worker is not None and self._playback_worker.isRunning())
             or (self._camera_worker is not None and self._camera_worker.isRunning())
             or (self._batch_worker is not None and self._batch_worker.isRunning())
         )
+
+    def _is_report_generation_running(self) -> bool:
+        return bool(self._report_worker is not None and self._report_worker.isRunning())
 
     def _model_dialog_start_dir(self, current_path: str, default_path: str) -> str:
         current = self._resolve_model_path(current_path) if current_path.strip() else Path(default_path)
@@ -1922,6 +2188,30 @@ class MainController:
         self._settings.sync()
         state_text = "enabled" if self._debug_csv_enabled else "disabled"
         self.view.append_log(f"[TrackDebug] CSV debug output {state_text}.")
+
+    def handle_report_api_settings_apply(self, settings: dict[str, object]) -> None:
+        enabled = bool(settings.get("enabled"))
+        endpoint = str(settings.get("endpoint") or DEFAULT_REPORT_API_ENDPOINT).strip()
+        model = str(settings.get("model") or DEFAULT_REPORT_API_MODEL).strip()
+        api_key = str(settings.get("api_key") or "").strip()
+        provider = str(settings.get("provider") or "bailian_openai").strip()
+        if enabled and (not endpoint or not model or not api_key):
+            self.view.append_log("[报告] 启用 API 时需要填写 Endpoint、模型名和 API Key。")
+            return
+
+        self._report_api_enabled = enabled
+        self._report_api_provider = provider
+        self._report_api_endpoint = endpoint
+        self._report_api_model = model
+        self._report_api_key = api_key
+        self._settings.setValue("report_api_enabled", self._report_api_enabled)
+        self._settings.setValue("report_api_provider", self._report_api_provider)
+        self._settings.setValue("report_api_endpoint", self._report_api_endpoint)
+        self._settings.setValue("report_api_model", self._report_api_model)
+        self._settings.setValue("report_api_key", self._report_api_key)
+        self._settings.sync()
+        state_text = "启用" if enabled else "关闭"
+        self.view.append_log(f"[报告] 模型 API 已{state_text} | 平台 {provider} | 模型 {model}")
 
     def handle_model_settings_apply(self, pose_model_path: str, track_model_path: str) -> None:
         if self._is_inference_running():
@@ -2002,6 +2292,8 @@ class MainController:
         self._selected_video_path = file_path
         self._video_meta = {}
         self._reset_metrics()
+        self._set_current_rally_record(None)
+        self._clear_manual_court_calibration()
         self.view.set_video_path(file_path)
         self.view.set_video_state("loaded")
         self.view.append_log(f"[信息] 正在加载预览: {Path(file_path).name}")
@@ -2025,21 +2317,39 @@ class MainController:
         self._selected_batch_folder = folder_path
         self._batch_results.clear()
         self._batch_order.clear()
+        self._clear_manual_court_calibration()
         options = self._batch_video_options(folder_path)
         self.view.set_batch_folder_path(folder_path)
         self.view.set_batch_rally_options(options)
         self.view.set_batch_export_enabled(False)
-        self.view.set_rally_data(None)
+        self._set_current_rally_record(None)
         self.view.append_log(f"[批量推理] 已选择文件夹: {folder_path} | 视频 {len(options)} 个")
         self._set_idle_state()
 
     def handle_batch_rally_selection(self, rally_id: str) -> None:
         if not rally_id:
-            self.view.set_rally_data(None)
+            self._set_current_rally_record(None)
             return
         record = self._batch_results.get(rally_id)
         if record is not None:
-            self.view.set_rally_data(record)
+            self._set_current_rally_record(record)
+
+    def _set_current_rally_record(self, record: object | None) -> None:
+        current = record if self._is_reportable_rally_record(record) else None
+        self._current_rally_record = current
+        self._live_rally_record = current
+        self._save_live_rally_record(current)
+        self.view.set_rally_data(current)
+        self.view.set_report_export_enabled(
+            current is not None
+            and not self._analysis_busy
+            and not self._is_report_generation_running()
+        )
+
+    def _is_reportable_rally_record(self, record: object | None) -> bool:
+        if not isinstance(record, dict) or record.get("error"):
+            return False
+        return isinstance(record.get("summary"), dict) and isinstance(record.get("details"), dict)
 
     def _batch_video_options(self, folder_path: str) -> list[dict[str, Any]]:
         folder = Path(folder_path)
@@ -2092,6 +2402,7 @@ class MainController:
                 payload["image"],
                 int(payload.get("position_ms", 0)),
                 int(payload.get("duration_ms", 0)),
+                self._latest_court_prediction_dict(),
             )
             self.view.update_progress(0)
             self.view.set_video_state("loaded")
@@ -2156,6 +2467,7 @@ class MainController:
         self._batch_results.clear()
         self._batch_order.clear()
         self._reset_metrics()
+        self._set_current_rally_record(None)
         self.view.set_batch_rally_options(options)
         self.view.set_batch_export_enabled(False)
         self.view.video_player.clear_video()
@@ -2197,6 +2509,7 @@ class MainController:
             self.view.append_log("[信息] 正在等待上一项推理任务结束...")
             return
         self._reset_court_detection(request_initial_prediction=True)
+        self._set_current_rally_record(None)
         self._set_running_state()
         self.view.video_player.set_live_source(f"摄像头 {camera_index}")
         self.view.video_player.play()
@@ -2242,6 +2555,7 @@ class MainController:
             self.view.append_log("[信息] 正在等待上一项推理任务结束...")
             return
         self._reset_court_detection(request_initial_prediction=request_court_prediction)
+        self._set_current_rally_record(None)
         self._set_running_state()
         self.view.video_player.play()
         debug_csv_path = self._make_track_debug_csv_path(Path(self._selected_video_path).stem)
@@ -2297,7 +2611,7 @@ class MainController:
         self._log_track_debug_event(payload.get("track_debug"))
         self._append_trajectory_event(payload.get("trajectory_event"))
         self._append_bst_predictions(payload)
-        self.view.set_rally_data(payload.get("rally_record"))
+        self._set_current_rally_record(payload.get("rally_record"))
 
         progress = max(0, min(int(float(payload.get("progress", 0.0)) * 100), 100))
         self.view.update_progress(progress)
@@ -2334,7 +2648,7 @@ class MainController:
         self._log_track_debug_event(payload.get("track_debug"))
         self._append_trajectory_event(payload.get("trajectory_event"))
         self._append_bst_predictions(payload)
-        self.view.set_rally_data(payload.get("rally_record"))
+        self._set_current_rally_record(payload.get("rally_record"))
         if not self._should_update_metrics_text():
             return
 
@@ -2378,7 +2692,7 @@ class MainController:
         selected_id = self.view.selected_batch_rally_id() or rally_id
         self.view.set_batch_rally_options(self._batch_records_for_view(), selected_id)
         if selected_id == rally_id or len(self._batch_order) == 1:
-            self.view.set_rally_data(record)
+            self._set_current_rally_record(record)
         if record.get("error"):
             self.view.append_log(f"[批量推理] {record.get('video_name', rally_id)} 失败: {record.get('error')}")
             return
@@ -2573,8 +2887,9 @@ class MainController:
 
         self._append_player_distance_summary(payload)
         if isinstance(payload, dict):
-            self.view.set_rally_data(payload.get("rally_record"))
+            self._set_current_rally_record(payload.get("rally_record"))
         self._set_idle_state()
+        self._maybe_start_stopped_report(stopped)
 
     def _on_camera_failed(self, message: str) -> None:
         self.view.set_progress_busy(False)
@@ -2606,8 +2921,9 @@ class MainController:
 
         self._append_player_distance_summary(payload)
         if isinstance(payload, dict):
-            self.view.set_rally_data(payload.get("rally_record"))
+            self._set_current_rally_record(payload.get("rally_record"))
         self._set_idle_state()
+        self._maybe_start_stopped_report(stopped)
 
         if self._pending_seek_ms is not None and self._selected_video_path is not None:
             pending_seek_ms = self._pending_seek_ms
@@ -2626,6 +2942,7 @@ class MainController:
 
         self._video_meta["position_ms"] = position_ms
         if self._playback_worker is not None and self._playback_worker.isRunning():
+            self._auto_report_after_stop = False
             self._pending_seek_ms = position_ms
             self._playback_worker.request_stop()
             self.view.append_log(f"[信息] 正在跳转至 {position_ms / 1000:.2f}s")
@@ -2636,16 +2953,19 @@ class MainController:
 
     def handle_force_stop(self) -> None:
         if self._camera_worker is not None and self._camera_worker.isRunning():
+            self._auto_report_after_stop = True
             self.view.append_log("[信息] 正在停止摄像头实时推理...")
             self._camera_worker.request_stop()
             return
 
         if self._playback_worker is not None and self._playback_worker.isRunning():
+            self._auto_report_after_stop = True
             self.view.append_log("[信息] 正在停止 TrackNetV3 播放...")
             self._playback_worker.request_stop()
             return
 
         if self._batch_worker is not None and self._batch_worker.isRunning():
+            self._auto_report_after_stop = False
             self.view.append_log("[批量推理] 正在停止批量推理...")
             self._batch_worker.request_stop()
             return
@@ -2662,11 +2982,13 @@ class MainController:
         self._batch_results.clear()
         self._batch_order.clear()
         self._video_meta = {}
+        self._clear_manual_court_calibration()
         self.view.clear_video()
         self.view.set_input_mode(self._input_mode)
         self.view.set_batch_folder_path("")
         self.view.set_batch_rally_options([])
         self.view.set_batch_export_enabled(False)
+        self._set_current_rally_record(None)
         self.view.log_console.clear()
         self._reset_metrics()
         self._set_idle_state()
@@ -2675,6 +2997,7 @@ class MainController:
     def _stop_workers(self, *, clear_pending_seek: bool) -> None:
         if clear_pending_seek:
             self._pending_seek_ms = None
+            self._auto_report_after_stop = False
 
         if self._probe_worker is not None and self._probe_worker.isRunning():
             self._probe_worker.quit()
@@ -2703,6 +3026,12 @@ class MainController:
                 self._batch_worker = None
         elif self._batch_worker is not None:
             self._batch_worker = None
+        if self._report_worker is not None and self._report_worker.isRunning():
+            self._report_worker.quit()
+            if self._report_worker.wait(1000):
+                self._report_worker = None
+        elif self._report_worker is not None:
+            self._report_worker = None
         if self._court_service is not None:
             self._court_service.clear_pending()
         self.view.set_progress_busy(False)
@@ -2747,6 +3076,120 @@ class MainController:
             }
             output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self.view.append_log(f"[批量推理] 已导出数据: {output_path}")
+
+    def handle_export_report(self) -> None:
+        record = self._current_rally_record or self._live_rally_record
+        if record is None:
+            self.view.append_log("[报告] 暂无可导出的回合报告，请先完成一次分析。")
+            return
+        trigger = "manual_running" if self._analysis_busy else "manual"
+        self._start_report_generation(record, trigger=trigger)
+
+    def _maybe_start_stopped_report(self, stopped: bool) -> None:
+        if not stopped:
+            self._auto_report_after_stop = False
+            return
+        if not self._auto_report_after_stop:
+            return
+        self._auto_report_after_stop = False
+        record = self._current_rally_record or self._live_rally_record
+        if record is None:
+            self.view.append_log("[报告] 停止时没有可用统计快照，未调用报告 API。")
+            return
+        self._start_report_generation(record, trigger="stopped")
+
+    def _start_report_generation(self, record: dict[str, Any], *, trigger: str) -> None:
+        if self._report_worker is not None and self._report_worker.isRunning():
+            self.view.append_log("[报告] 上一次报告生成仍在进行，请稍后。")
+            return
+        use_api = self._report_api_enabled and bool(
+            self._report_api_endpoint and self._report_api_model and self._report_api_key
+        )
+        if self._report_api_enabled and not use_api:
+            self.view.append_log("[报告] API 未完整配置，已使用本地报告生成。")
+        if trigger == "stopped" and not use_api:
+            self.view.append_log("[报告] 已停止分析；未启用完整 API 配置，本次将生成本地报告。")
+
+        video_name = self._report_video_name(record)
+        output_path = self._project_root / "assets" / "dist" / "index.html"
+        try:
+            latest_path, dist_data_path = self._save_report_input_snapshot(
+                record,
+                trigger=trigger,
+                use_api=use_api,
+            )
+        except Exception as exc:
+            self.view.append_log(f"[报告] 报告输入数据保存失败: {exc}")
+            return
+        self._report_worker = ReportGenerationWorker(
+            rally_record=record,
+            athlete_name=self._report_athlete_name(record),
+            video_name=video_name,
+            output_html_path=output_path,
+            use_api=use_api,
+            endpoint=self._report_api_endpoint,
+            model=self._report_api_model,
+            api_key=self._report_api_key,
+        )
+        self._report_worker.reportFinished.connect(self._on_report_generation_finished)
+        self._report_worker.failed.connect(self._on_report_generation_failed)
+        self._report_worker.finished.connect(lambda worker=self._report_worker: self._release_report_worker(worker))
+        self.view.set_report_export_enabled(False)
+        provider_text = "API" if use_api else "本地"
+        if trigger == "stopped":
+            action_text = "停止后自动生成报告"
+        elif trigger == "manual_running":
+            action_text = "生成当前实时报告"
+        else:
+            action_text = "生成报告"
+        self.view.set_progress_busy(True, f"{action_text}中")
+        self.view.append_log(f"[报告] 已保存输入快照: {latest_path}")
+        self.view.append_log(f"[报告] 已同步 dist 数据: {dist_data_path}")
+        self.view.append_log(f"[报告] {action_text} | provider {provider_text}")
+        self._report_worker.start()
+
+    def _on_report_generation_finished(self, payload: object) -> None:
+        self.view.set_progress_busy(False)
+        if not isinstance(payload, dict):
+            self.view.append_log("[报告] 报告生成完成，但返回结果不可读。")
+            self._set_idle_state()
+            return
+        output_path = Path(str(payload.get("output_html_path") or self._project_root / "assets" / "dist" / "index.html"))
+        provider = str(payload.get("provider") or "unknown")
+        api_error = str(payload.get("api_error") or "")
+        if api_error:
+            self.view.append_log(f"[报告] API 调用失败，已回退本地报告: {api_error}")
+        self.view.append_log(f"[报告] 已写入 dist 报告文件: {output_path} | provider {provider}")
+        self.view.set_report_preview_file(output_path)
+        self._set_idle_state()
+
+    def _on_report_generation_failed(self, message: str) -> None:
+        self.view.set_progress_busy(False)
+        self.view.append_log(f"[报告] 生成失败: {message}")
+        self._set_idle_state()
+
+    def _release_report_worker(self, worker: object) -> None:
+        if self._report_worker is worker:
+            self._report_worker = None
+
+    def _report_video_name(self, record: dict[str, Any]) -> str:
+        summary = record.get("summary", {})
+        if not isinstance(summary, dict):
+            summary = {}
+        return str(
+            record.get("video_name")
+            or record.get("rally_name")
+            or summary.get("video_name")
+            or summary.get("rally_name")
+            or "rally_report"
+        )
+
+    def _report_athlete_name(self, record: dict[str, Any]) -> str:
+        summary = record.get("summary", {})
+        players = summary.get("players", {}) if isinstance(summary, dict) else {}
+        bottom = players.get("bottom", {}) if isinstance(players, dict) else {}
+        label = bottom.get("label") if isinstance(bottom, dict) else None
+        return str(label or "训练用户")
 
     def _write_batch_summary_csv(self, output_path: Path) -> None:
         fieldnames = [

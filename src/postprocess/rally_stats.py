@@ -63,6 +63,7 @@ class RallyStatsAccumulator:
         start_visible_frames: int = 5,
         start_min_motion_px: float = 30.0,
         start_min_avg_ball_score: float = 0.40,
+        freeze_after_rally_end: bool = True,
     ) -> None:
         self.rally_id = str(rally_id)
         self.rally_name = str(rally_name)
@@ -78,6 +79,7 @@ class RallyStatsAccumulator:
         self.start_visible_frames = max(1, int(start_visible_frames))
         self.start_min_motion_px = max(0.0, float(start_min_motion_px))
         self.start_min_avg_ball_score = max(0.0, float(start_min_avg_ball_score))
+        self.freeze_after_rally_end = bool(freeze_after_rally_end)
 
         self._players = {key: _PlayerMotionState() for key in PLAYER_KEYS}
         self._frame_count = 0
@@ -114,7 +116,7 @@ class RallyStatsAccumulator:
         court_valid: bool = False,
     ) -> None:
         timestamp_ms = max(0, int(timestamp_ms))
-        if self._rally_end_timestamp_ms is not None and timestamp_ms > self._rally_end_timestamp_ms:
+        if self.freeze_after_rally_end and self._rally_end_timestamp_ms is not None and timestamp_ms > self._rally_end_timestamp_ms:
             return
         if self._start_timestamp_ms is None:
             self._start_timestamp_ms = timestamp_ms
@@ -156,7 +158,7 @@ class RallyStatsAccumulator:
         if event_type not in {"hit", "landing", "out_of_frame"}:
             return
         timestamp_ms = max(0, int(event.get("timestamp_ms", 0)))
-        if self._rally_end_timestamp_ms is not None and timestamp_ms > self._rally_end_timestamp_ms:
+        if self.freeze_after_rally_end and self._rally_end_timestamp_ms is not None and timestamp_ms > self._rally_end_timestamp_ms:
             return
         if self._last_timestamp_ms is None or timestamp_ms > self._last_timestamp_ms:
             self._last_timestamp_ms = timestamp_ms
@@ -189,7 +191,7 @@ class RallyStatsAccumulator:
             return
 
         timestamp_ms = max(0, int(prediction.get("timestamp_ms", 0)))
-        if self._rally_end_timestamp_ms is not None and timestamp_ms > self._rally_end_timestamp_ms:
+        if self.freeze_after_rally_end and self._rally_end_timestamp_ms is not None and timestamp_ms > self._rally_end_timestamp_ms:
             return
         frame_id = int(prediction.get("event_frame_id", prediction.get("frame_id", -1)))
         key = self._hit_key(frame_id, timestamp_ms)

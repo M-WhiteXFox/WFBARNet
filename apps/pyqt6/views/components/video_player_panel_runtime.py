@@ -4,7 +4,7 @@ from __future__ import annotations
 from math import isfinite
 from typing import Any
 
-from PyQt6.QtCore import QPointF, QRect, QSize, Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import QEvent, QPointF, QRect, QSize, Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import (
     QFrame,
@@ -131,7 +131,14 @@ class CourtLineOverlayWidget(QWidget):
             self._draw_line_shape(painter, polygon, is_closed)
             painter.setPen(bright_pen)
             self._draw_line_shape(painter, polygon, is_closed)
+        self._draw_corner_handles(painter, court)
         painter.end()
+
+    def corners(self) -> list[tuple[float, float]]:
+        court = self._court
+        if not isinstance(court, dict) or not court.get("valid"):
+            return []
+        return self._points_from_object(court.get("corners"))
 
     def _normalize_court(self, court: object | None) -> dict[str, Any] | None:
         if court is None:
@@ -171,8 +178,14 @@ class CourtLineOverlayWidget(QWidget):
 
     def _polygon_from_points(self, points: object) -> QPolygonF:
         polygon = QPolygonF()
+        for x, y in self._points_from_object(points):
+            polygon.append(QPointF(x, y))
+        return polygon
+
+    def _points_from_object(self, points: object) -> list[tuple[float, float]]:
+        result: list[tuple[float, float]] = []
         if not isinstance(points, (list, tuple)):
-            return polygon
+            return result
         for point in points:
             if not isinstance(point, (list, tuple)) or len(point) < 2:
                 continue
@@ -182,8 +195,8 @@ class CourtLineOverlayWidget(QWidget):
             except (TypeError, ValueError):
                 continue
             if isfinite(x) and isfinite(y):
-                polygon.append(QPointF(x, y))
-        return polygon
+                result.append((x, y))
+        return result
 
     def _draw_line_shape(self, painter: QPainter, polygon: QPolygonF, closed: bool) -> None:
         if closed:
@@ -191,12 +204,36 @@ class CourtLineOverlayWidget(QWidget):
         else:
             painter.drawPolyline(polygon)
 
+    def _draw_corner_handles(self, painter: QPainter, court: dict[str, Any]) -> None:
+        corners = self._points_from_object(court.get("corners"))
+        if len(corners) != 4:
+            return
+
+        painter.resetTransform()
+        painter.setClipRect(self._display_rect)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        scale_x = self._display_rect.width() / max(1, self._source_size.width())
+        scale_y = self._display_rect.height() / max(1, self._source_size.height())
+        radius = 7.0
+        for x, y in corners:
+            label_x = self._display_rect.left() + x * scale_x
+            label_y = self._display_rect.top() + y * scale_y
+            center = QPointF(label_x, label_y)
+            painter.setPen(QPen(QColor(15, 55, 0), 3.0))
+            painter.setBrush(QColor(255, 255, 255, 235))
+            painter.drawEllipse(center, radius + 2.0, radius + 2.0)
+            painter.setPen(QPen(QColor(75, 190, 30), 2.0))
+            painter.setBrush(QColor(110, 245, 40, 240))
+            painter.drawEllipse(center, radius, radius)
+
 
 class VideoPlayerWidget(QFrame):
     """由外部帧驱动的纯显示视频预览组件。"""
 
     selectRequested = pyqtSignal()
     forceStopRequested = pyqtSignal()
+    framePointClicked = pyqtSignal(float, float)
+    courtCornerDragged = pyqtSignal(int, float, float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -207,6 +244,9 @@ class VideoPlayerWidget(QFrame):
         self._scaled_pixmap: QPixmap | None = None
         self._scaled_source_key: int | None = None
         self._scaled_label_size = QSize()
+        self._point_capture_enabled = False
+        self._dragging_court_corner_index: int | None = None
+        self._court_corner_hit_radius_px = 18.0
         self._status_text = ""
         self._status_state = ""
 
@@ -266,6 +306,8 @@ class VideoPlayerWidget(QFrame):
             QSizePolicy.Policy.Expanding,
         )
         self.video_label.setMinimumSize(320, 240)
+        self.video_label.setMouseTracking(True)
+        self.video_label.installEventFilter(self)
         self.court_overlay = CourtLineOverlayWidget(self.video_label)
         self.court_overlay.setGeometry(self.video_label.rect())
         self.court_overlay.raise_()
@@ -278,6 +320,52 @@ class VideoPlayerWidget(QFrame):
 
         self.btn_select_video.clicked.connect(self.selectRequested.emit)
         self.btn_force_stop.clicked.connect(self.forceStopRequested.emit)
+
+    def eventFilter(self, watched: object, event: object) -> bool:
+        if watched is self.video_label:
+            event_type = event.type()
+            if event_type == QEvent.Type.MouseButtonPress:
+                if getattr(event, "button", lambda: None)() != Qt.MouseButton.LeftButton:
+                    return False
+                position = event.position() if hasattr(event, "position") else event.pos()
+                if self._point_capture_enabled:
+                    point = self._image_point_from_label_pos(position)
+                    if point is None:
+                        return False
+                    self.framePointClicked.emit(point[0], point[1])
+                    return True
+                corner_index = self._court_corner_index_at_label_pos(position)
+                if corner_index is not None:
+                    self._dragging_court_corner_index = corner_index
+                    self.video_label.setCursor(Qt.CursorShape.ClosedHandCursor)
+                    return True
+            elif event_type == QEvent.Type.MouseMove:
+                position = event.position() if hasattr(event, "position") else event.pos()
+                if self._dragging_court_corner_index is not None:
+                    point = self._image_point_from_label_pos(position)
+                    if point is None:
+                        return True
+                    self.courtCornerDragged.emit(
+                        self._dragging_court_corner_index,
+                        point[0],
+                        point[1],
+                    )
+                    return True
+                self._update_court_corner_cursor(position)
+            elif event_type == QEvent.Type.MouseButtonRelease:
+                if self._dragging_court_corner_index is not None:
+                    position = event.position() if hasattr(event, "position") else event.pos()
+                    point = self._image_point_from_label_pos(position)
+                    if point is not None:
+                        self.courtCornerDragged.emit(
+                            self._dragging_court_corner_index,
+                            point[0],
+                            point[1],
+                        )
+                    self._dragging_court_corner_index = None
+                    self._update_court_corner_cursor(position)
+                    return True
+        return super().eventFilter(watched, event)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -344,9 +432,84 @@ class VideoPlayerWidget(QFrame):
         self._scaled_label_size = QSize()
         if self.preview_stack.currentWidget() is not self.video_label:
             self.preview_stack.setCurrentWidget(self.video_label)
-        self.court_overlay.set_court(court)
+        self.set_court_overlay(court)
         self._render_current_pixmap()
         self._set_status("帧已就绪", "loaded")
+
+    def set_point_capture_enabled(self, enabled: bool) -> None:
+        self._point_capture_enabled = bool(enabled)
+        if enabled:
+            self.video_label.setCursor(Qt.CursorShape.CrossCursor)
+        elif self._dragging_court_corner_index is None:
+            self.video_label.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def source_size(self) -> tuple[int, int] | None:
+        if self._current_pixmap is None:
+            return None
+        return self._current_pixmap.width(), self._current_pixmap.height()
+
+    def set_court_overlay(self, court: object | None) -> None:
+        self.court_overlay.set_court(court)
+        if not self.court_overlay.corners() and not self._point_capture_enabled:
+            self._dragging_court_corner_index = None
+            self.video_label.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _image_point_from_label_pos(self, position: object) -> tuple[float, float] | None:
+        if self._current_pixmap is None or self._scaled_pixmap is None or self._scaled_pixmap.isNull():
+            return None
+        x = float(position.x())
+        y = float(position.y())
+        display_rect = QRect(
+            (self.video_label.width() - self._scaled_pixmap.width()) // 2,
+            (self.video_label.height() - self._scaled_pixmap.height()) // 2,
+            self._scaled_pixmap.width(),
+            self._scaled_pixmap.height(),
+        )
+        if not display_rect.contains(int(round(x)), int(round(y))):
+            return None
+        source_x = (x - display_rect.left()) * self._current_pixmap.width() / max(1, display_rect.width())
+        source_y = (y - display_rect.top()) * self._current_pixmap.height() / max(1, display_rect.height())
+        return (
+            max(0.0, min(float(self._current_pixmap.width() - 1), source_x)),
+            max(0.0, min(float(self._current_pixmap.height() - 1), source_y)),
+        )
+
+    def _label_point_from_image_point(self, x: float, y: float) -> QPointF | None:
+        if self._current_pixmap is None or self._scaled_pixmap is None or self._scaled_pixmap.isNull():
+            return None
+        display_rect = QRect(
+            (self.video_label.width() - self._scaled_pixmap.width()) // 2,
+            (self.video_label.height() - self._scaled_pixmap.height()) // 2,
+            self._scaled_pixmap.width(),
+            self._scaled_pixmap.height(),
+        )
+        scale_x = display_rect.width() / max(1, self._current_pixmap.width())
+        scale_y = display_rect.height() / max(1, self._current_pixmap.height())
+        return QPointF(display_rect.left() + float(x) * scale_x, display_rect.top() + float(y) * scale_y)
+
+    def _court_corner_index_at_label_pos(self, position: object) -> int | None:
+        if self._point_capture_enabled:
+            return None
+        x = float(position.x())
+        y = float(position.y())
+        for index, (corner_x, corner_y) in enumerate(self.court_overlay.corners()):
+            label_point = self._label_point_from_image_point(corner_x, corner_y)
+            if label_point is None:
+                continue
+            dx = x - label_point.x()
+            dy = y - label_point.y()
+            if (dx * dx + dy * dy) ** 0.5 <= self._court_corner_hit_radius_px:
+                return index
+        return None
+
+    def _update_court_corner_cursor(self, position: object) -> None:
+        if self._point_capture_enabled:
+            self.video_label.setCursor(Qt.CursorShape.CrossCursor)
+            return
+        if self._court_corner_index_at_label_pos(position) is not None:
+            self.video_label.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.video_label.setCursor(Qt.CursorShape.ArrowCursor)
 
     def set_video_path(self, path: str) -> None:
         self._source_path = path
@@ -364,9 +527,11 @@ class VideoPlayerWidget(QFrame):
         self._scaled_pixmap = None
         self._scaled_source_key = None
         self._scaled_label_size = QSize()
+        self._dragging_court_corner_index = None
         self.path_edit.clear()
         self.path_edit.setToolTip("")
         self.video_label.clear()
+        self.video_label.setCursor(Qt.CursorShape.ArrowCursor)
         self.court_overlay.clear()
         self.court_overlay.set_video_geometry(QSize(), QRect())
         self._set_status("未加载视频", "idle")

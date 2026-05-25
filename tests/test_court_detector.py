@@ -262,6 +262,54 @@ class OpenCVCourtLineDetectorTest(unittest.TestCase):
         self.assertGreater(result.metrics.get("snap_points", 0), 10)
         self.assertLess(refined_error, coarse_error)
 
+    def test_shuttlecourt_segment_detector_uses_white_lines_when_segmentation_includes_outside_area(self) -> None:
+        frame = np.full((360, 520, 3), (45, 120, 45), dtype=np.uint8)
+        true_corners = np.asarray(
+            [
+                [130.0, 42.0],
+                [390.0, 48.0],
+                [448.0, 314.0],
+                [80.0, 304.0],
+            ],
+            dtype=np.float32,
+        )
+        court_to_image_h, _ = court_core.compute_homographies(true_corners)
+        if court_to_image_h is None:
+            raise AssertionError("synthetic court should produce a valid homography")
+        for name, points in court_core.project_template_lines(court_to_image_h).items():
+            line_points = np.asarray(points, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(frame, [line_points], name == "doubles_outer", (245, 245, 245), 5, lineType=cv2.LINE_AA)
+
+        oversized_seg = np.asarray(
+            [
+                [92.0, 18.0],
+                [428.0, 20.0],
+                [486.0, 340.0],
+                [48.0, 334.0],
+            ],
+            dtype=np.float32,
+        )
+        model = _FakeSegModel(_FakeSegResult([oversized_seg], [0.94]))
+        detector = ShuttleCourtSegLineDetector(
+            ShuttleCourtSegConfig(
+                device="cpu",
+                min_mask_area_ratio=0.001,
+                hough_threshold=20,
+                snap_response_threshold=0.08,
+            ),
+            model=model,
+        )
+
+        result = detector.predict(frame, frame_id=8, timestamp_ms=320, force=True)
+        detected = np.asarray(result.corners, dtype=np.float32)
+        seg_error = float(np.mean(np.linalg.norm(oversized_seg - true_corners, axis=1)))
+        detected_error = float(np.mean(np.linalg.norm(detected - true_corners, axis=1)))
+        components = result.metrics.get("components", {})
+
+        self.assertTrue(result.valid, result.to_dict())
+        self.assertEqual(components.get("seg_line_fit"), 1.0)
+        self.assertLess(detected_error, seg_error * 0.65)
+
     def test_blank_frame_returns_stable_payload(self) -> None:
         detector = OpenCVCourtLineDetector()
 
