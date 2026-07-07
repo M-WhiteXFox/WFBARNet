@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import QApplication, QFileDialog
 from apps.pyqt6.utils.style import apply_theme, discover_themes
 from apps.pyqt6.utils.theme_transition import start_theme_ripple_transition
 from apps.pyqt6.views.main_window_refined import MainWindow
+from src.court.batch_court import BatchCourtPredictor
 from src.models.bst_runtime import build_bst_model
 from src.models.bst_stroke_runtime import BSTStrokeRecognizer
 from src.models.pose_branch import PoseBranch
@@ -526,7 +527,7 @@ class TrackNetPlaybackWorker(QThread):
             court_margin=POSE_COURT_MARGIN_CM,
             detection_smoothing=0.78,
             velocity_smoothing=0.50,
-            court_required=True,
+            court_required=False,
             predict_missing_motion=True,
             motion_prediction_scale=0.55,
         )
@@ -906,7 +907,7 @@ class CameraInferenceWorker(QThread):
             court_margin=POSE_COURT_MARGIN_CM,
             detection_smoothing=0.78,
             velocity_smoothing=0.50,
-            court_required=True,
+            court_required=False,
             predict_missing_motion=True,
             motion_prediction_scale=0.55,
         )
@@ -1163,6 +1164,7 @@ class BatchInferenceWorker(QThread):
         pose_enabled: bool = True,
         bst_model: Any | None = None,
         bst_device: str = "cpu",
+        court_backends: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__()
         self._folder_path = folder_path
@@ -1173,6 +1175,7 @@ class BatchInferenceWorker(QThread):
         self._pose_enabled = pose_enabled
         self._bst_model = bst_model
         self._bst_device = bst_device
+        self._court_backends = court_backends
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -1304,9 +1307,14 @@ class BatchInferenceWorker(QThread):
             court_margin=POSE_COURT_MARGIN_CM,
             detection_smoothing=0.78,
             velocity_smoothing=0.50,
-            court_required=True,
+            court_required=False,
             predict_missing_motion=True,
             motion_prediction_scale=0.55,
+        )
+        court_predictor = (
+            BatchCourtPredictor(backends=tuple(self._court_backends))
+            if self._court_backends
+            else BatchCourtPredictor()
         )
         distance_accumulator = PlayerDistanceAccumulator()
         event_detector = RealtimeTrajectoryEventDetector(fps=fps)
@@ -1330,7 +1338,12 @@ class BatchInferenceWorker(QThread):
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wfb-batch-infer") as infer_executor:
                 while not self._stop_requested:
                     frame_id = int(round((current_ms / 1000.0) * fps)) if fps > 0 else processed_frames
-                    court_prediction = None
+                    court_prediction = court_predictor.predict(
+                        current_frame,
+                        frame_id,
+                        current_ms,
+                        force=processed_frames == 0,
+                    )
                     pose_due = self._pose_enabled and processed_frames % self._pose_stride == 0
                     run_parallel = parallel_inference and pose_due
                     if run_parallel:
@@ -1471,6 +1484,8 @@ class BatchInferenceWorker(QThread):
                 "avg_score": (score_sum / processed_frames) if processed_frames else 0.0,
                 "player_distances_m": distance_accumulator.totals_m(),
                 "bst_errors": pending_bst_errors,
+                "court_backend": court_predictor.active_backend or "none",
+                "court_errors": court_predictor.errors[:8],
             }
         )
         record.update(
@@ -1606,6 +1621,7 @@ class MainController:
         self.view.set_model_settings(self._pose_model_path, self._track_model_path)
         self.view.set_model_switches(self._pose_model_enabled, self._track_model_enabled)
         self.view.set_debug_csv_enabled(self._debug_csv_enabled)
+        self._log_missing_model_paths()
         self.view.set_report_api_settings(
             {
                 "enabled": self._report_api_enabled,
@@ -1615,19 +1631,28 @@ class MainController:
                 "api_key": self._report_api_key,
             }
         )
-        self._track_branch = self._build_track_branch()
-        self._pose_branch = self._build_pose_branch()
+        self._track_branch: TrackBranch | None = None
+        self._pose_branch: PoseBranch | None = None
         self._bst_device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._bst_model = self._build_bst_model()
+        self._bst_model: Any | None = None
+        self._bst_model_checked = False
 
         self._bind_court_service()
         self._bind_events()
         self.view.populate_stylesheets(self._theme_dirs, self._active_theme_name)
         self.view.video_timeline.set_interactive(True)
-        self._refresh_camera_devices(log=False)
         self._reset_metrics()
         self._set_idle_state()
-        self.view.append_log("[系统] 界面已就绪，请选择视频开始。")
+        self.view.append_log("[系统] 界面已就绪，请选择视频开始；模型将在分析前按需加载。")
+
+    def _log_missing_model_paths(self) -> None:
+        checks = [
+            ("骨骼模型", self._pose_model_path, self._pose_model_enabled),
+            ("球轨迹模型", self._track_model_path, self._track_model_enabled),
+        ]
+        for label, raw_path, enabled in checks:
+            if enabled and not self._resolve_model_path(raw_path).is_file():
+                self.view.append_log(f"[设置] {label}文件暂未找到，可稍后在设置页选择: {self._resolve_model_path(raw_path)}")
 
     def _bind_court_service(self) -> None:
         if self._court_service is None:
@@ -1885,6 +1910,43 @@ class MainController:
             f"[TrackNet] 模型已加载: {branch.device} | 后端 {branch.backend_name} | {Path(self._track_model_path).name}"
         )
         return branch
+
+    def _ensure_models_ready(self) -> bool:
+        if not self._track_model_enabled and not self._pose_model_enabled:
+            return True
+
+        self.view.set_progress_busy(True, "正在加载模型")
+        try:
+            if self._track_model_enabled and self._track_branch is None:
+                track_path = self._resolve_model_path(self._track_model_path)
+                if not track_path.is_file():
+                    raise FileNotFoundError(f"球轨迹模型文件不存在: {track_path}")
+                self._track_model_path = str(track_path)
+                self._track_branch = self._build_track_branch()
+
+            if self._pose_model_enabled and self._pose_branch is None:
+                pose_path = self._resolve_model_path(self._pose_model_path)
+                if not pose_path.is_file():
+                    raise FileNotFoundError(f"骨骼模型文件不存在: {pose_path}")
+                self._pose_model_path = str(pose_path)
+                self._pose_branch = self._build_pose_branch()
+
+            if (
+                self._track_model_enabled
+                and self._pose_model_enabled
+                and self._bst_model is None
+                and not self._bst_model_checked
+            ):
+                self._bst_model_checked = True
+                self._bst_model = self._build_bst_model()
+        except Exception as exc:
+            self.view.set_progress_busy(False)
+            self.view.set_status_state("error")
+            self.view.append_log(f"[模型] 加载失败: {exc}")
+            return False
+
+        self.view.set_progress_busy(False)
+        return True
 
     def _create_track_branch(self, model_weight: str) -> TrackBranch:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -2170,6 +2232,10 @@ class MainController:
 
         self._pose_model_enabled = pose_enabled
         self._track_model_enabled = track_enabled
+        self._pose_branch = None
+        self._track_branch = None
+        self._bst_model = None
+        self._bst_model_checked = False
         self._settings.setValue("pose_model_enabled", pose_enabled)
         self._settings.setValue("track_model_enabled", track_enabled)
         self._settings.sync()
@@ -2220,57 +2286,35 @@ class MainController:
 
         pose_path = self._resolve_model_path(pose_model_path)
         track_path = self._resolve_model_path(track_model_path)
-        missing_paths = [
-            ("骨骼模型", pose_path),
-            ("球轨迹模型", track_path),
-        ]
-        for label, path in missing_paths:
-            if not path.is_file():
-                self.view.set_status_state("error")
-                self.view.append_log(f"[设置] {label}文件不存在: {path}")
-                return
-
         pose_path_text = str(pose_path)
         track_path_text = str(track_path)
         requested_backend = "tensorrt" if track_path.suffix.lower() == ".engine" else "pytorch"
         if pose_path_text == self._pose_model_path and track_path_text == self._track_model_path:
             self.view.append_log(
-                f"[设置] 模型路径未变化，当前球轨迹后端: {getattr(self._track_branch, 'backend_name', 'unknown')}"
+                f"[设置] 模型路径未变化，当前球轨迹后端: {getattr(self._track_branch, 'backend_name', 'not loaded')}"
             )
             return
 
         self.view.append_log(
-            f"[设置] 正在应用模型 | 球轨迹: {track_path.name} | 目标后端 {requested_backend}"
+            f"[设置] 已保存模型路径 | 球轨迹: {track_path.name} | 目标后端 {requested_backend}"
         )
-        self.view.set_model_settings_enabled(False)
-        self.view.set_progress_busy(True, "正在加载模型")
-        try:
-            track_branch = self._create_track_branch(track_path_text)
-            pose_branch = self._create_pose_branch(pose_path_text)
-        except Exception as exc:
-            self.view.set_progress_busy(False)
-            self.view.set_model_settings_enabled(True)
-            self.view.set_status_state("error")
-            self.view.append_log(f"[设置] 模型加载失败: {exc}")
-            self.view.append_log(
-                f"[设置] 已保持当前模型 | 球轨迹: {Path(self._track_model_path).name} | "
-                f"后端 {getattr(self._track_branch, 'backend_name', 'unknown')}"
-            )
-            self.view.set_model_settings(self._pose_model_path, self._track_model_path)
-            return
 
         self._stop_workers(clear_pending_seek=True)
-        self._track_branch = track_branch
-        self._pose_branch = pose_branch
+        self._track_branch = None
+        self._pose_branch = None
+        self._bst_model = None
+        self._bst_model_checked = False
         self._pose_model_path = pose_path_text
         self._track_model_path = track_path_text
         self._settings.setValue("pose_model_path", pose_path_text)
         self._settings.setValue("track_model_path", track_path_text)
         self._settings.sync()
         self.view.set_model_settings(pose_path_text, track_path_text)
-        self.view.set_progress_busy(False)
-        self.view.append_log(f"[设置] 骨骼模型已应用: {pose_path.name}")
-        self.view.append_log(f"[设置] 球轨迹模型已应用: {track_path.name} | 后端 {track_branch.backend_name}")
+        if not pose_path.is_file():
+            self.view.append_log(f"[设置] 骨骼模型路径暂不可用，开始分析前会再次校验: {pose_path}")
+        if not track_path.is_file():
+            self.view.append_log(f"[设置] 球轨迹模型路径暂不可用，开始分析前会再次校验: {track_path}")
+        self.view.append_log("[设置] 模型缓存已清空，将在下次分析前加载。")
         self._set_idle_state()
 
     def handle_upload(self) -> None:
@@ -2454,6 +2498,9 @@ class MainController:
         if not options:
             self.view.append_log("[批量推理] 该文件夹中没有可分析的视频。")
             return
+        if not self._ensure_models_ready():
+            self._set_idle_state()
+            return
 
         self._stop_workers(clear_pending_seek=True)
         if (
@@ -2503,6 +2550,9 @@ class MainController:
         if camera_index is None:
             self.view.append_log("[警告] 请先选择可用摄像头设备。")
             return
+        if not self._ensure_models_ready():
+            self._set_idle_state()
+            return
 
         self._stop_workers(clear_pending_seek=True)
         if self._playback_worker is not None or self._camera_worker is not None:
@@ -2548,6 +2598,9 @@ class MainController:
 
     def _start_playback(self, *, start_ms: int = 0, request_court_prediction: bool = True) -> None:
         if self._selected_video_path is None:
+            return
+        if not self._ensure_models_ready():
+            self._set_idle_state()
             return
 
         self._stop_workers(clear_pending_seek=False)

@@ -15,9 +15,12 @@ from src.utils.user_report import build_user_report_data_from_rally_record, rend
 
 REPORT_INTERFACE_VERSION = "wfbar-report.v1"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-TABLER_REPORT_SOURCE_DIR = PROJECT_ROOT / "assets" / "temp"
+TABLER_REPORT_TEMPLATE_DIR = PROJECT_ROOT / "assets" / "report_template"
+TABLER_REPORT_TEMPLATE_PATH = TABLER_REPORT_TEMPLATE_DIR / "report-template.html"
+TABLER_REPORT_ASSETS_DIR = TABLER_REPORT_TEMPLATE_DIR / "static"
+TABLER_REPORT_LEGACY_SOURCE_DIR = PROJECT_ROOT / "assets" / "temp"
 TABLER_REPORT_DIST_DIR = PROJECT_ROOT / "assets" / "dist"
-TABLER_REPORT_TEMPLATE_PATH = TABLER_REPORT_SOURCE_DIR / "report-template.html"
+TABLER_REPORT_LEGACY_TEMPLATE_PATH = TABLER_REPORT_LEGACY_SOURCE_DIR / "report-template.html"
 TABLER_REPORT_FALLBACK_TEMPLATE_PATH = TABLER_REPORT_DIST_DIR / "report-template.html"
 TABLER_REPORT_OUTPUT_PATH = TABLER_REPORT_DIST_DIR / "index.html"
 
@@ -316,7 +319,7 @@ def generate_report_from_rally_record(
 
 
 def render_tabler_report_html(report_data: Mapping[str, Any]) -> str:
-    """Render the user report with the full interactive Tabler template in assets/temp."""
+    """Render the user report with the stable local report template."""
     template_path = _tabler_report_template_path()
     if template_path is None:
         return render_standalone_user_report_html(report_data)
@@ -384,15 +387,25 @@ def copy_tabler_report_assets(target_dir: Path) -> None:
     source = _tabler_report_assets_source()
     if not source.exists():
         return
-    destination = target_dir / "dist"
+    destination_name = "static" if source == TABLER_REPORT_ASSETS_DIR else "dist"
+    destination = target_dir / destination_name
     if source.resolve() == destination.resolve():
         return
+    if destination.exists() and not destination.is_dir():
+        if destination.stat().st_size == 0:
+            destination.unlink()
+        else:
+            raise FileExistsError(
+                f"报告静态资源目标路径已存在且不是目录，请手动检查：{destination}"
+            )
     shutil.copytree(source, destination, dirs_exist_ok=True)
 
 
 def _tabler_report_template_path() -> Path | None:
     if TABLER_REPORT_TEMPLATE_PATH.exists():
         return TABLER_REPORT_TEMPLATE_PATH
+    if TABLER_REPORT_LEGACY_TEMPLATE_PATH.exists():
+        return TABLER_REPORT_LEGACY_TEMPLATE_PATH
     if TABLER_REPORT_FALLBACK_TEMPLATE_PATH.exists():
         return TABLER_REPORT_FALLBACK_TEMPLATE_PATH
     if TABLER_REPORT_OUTPUT_PATH.exists():
@@ -401,8 +414,10 @@ def _tabler_report_template_path() -> Path | None:
 
 
 def _tabler_report_assets_source() -> Path:
-    source = TABLER_REPORT_SOURCE_DIR / "dist"
-    return source if source.exists() else TABLER_REPORT_DIST_DIR / "dist"
+    if TABLER_REPORT_ASSETS_DIR.exists():
+        return TABLER_REPORT_ASSETS_DIR
+    legacy = TABLER_REPORT_LEGACY_SOURCE_DIR / "dist"
+    return legacy if legacy.exists() else TABLER_REPORT_DIST_DIR / "dist"
 
 
 def _inject_tabler_report_data(template: str, payload: Mapping[str, Any]) -> str:

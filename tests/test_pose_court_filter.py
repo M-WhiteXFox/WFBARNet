@@ -149,6 +149,20 @@ class PoseCourtFilterTest(unittest.TestCase):
 
         self.assertEqual(result, [])
 
+    def test_tracker_degrades_without_court_when_not_required(self) -> None:
+        tracker = CourtPoseTargetTracker(max_missing_frames=2, court_required=False)
+
+        result = tracker.update(
+            [
+                _pose(0, [250.0, 140.0, 350.0, 500.0], 0.8),
+                _pose(1, [260.0, 720.0, 360.0, 1040.0], 0.7),
+            ],
+            {"valid": False},
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual([pose.person_id for pose in result], [0, 1])
+
     def test_tracker_clears_prediction_outside_court_margin(self) -> None:
         tracker = CourtPoseTargetTracker(
             max_missing_frames=3,

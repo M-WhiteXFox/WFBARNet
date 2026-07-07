@@ -8,10 +8,13 @@ from typing import Any, Mapping
 from src.utils.report_generation import (
     OpenAICompatibleReportApiClient,
     REPORT_INTERFACE_VERSION,
+    TABLER_REPORT_TEMPLATE_PATH,
     ReportApiClient,
     ReportGenerationRequest,
     ReportGenerationService,
+    copy_tabler_report_assets,
     generate_report_from_rally_record,
+    render_tabler_report_html,
 )
 
 
@@ -213,6 +216,40 @@ class ReportGenerationTest(unittest.TestCase):
             self.assertTrue(output_path.is_file())
             self.assertIn("羽毛球水平分析报告", output_path.read_text(encoding="utf-8"))
             self.assertEqual(response.status, "ok")
+
+    def test_stable_report_template_is_used_for_tabler_rendering(self) -> None:
+        self.assertTrue(TABLER_REPORT_TEMPLATE_PATH.is_file())
+
+        response = ReportGenerationService().generate(
+            ReportGenerationRequest.from_rally_record(_rally_record())
+        )
+        html = render_tabler_report_html(response.report_data)
+
+        self.assertIn("./static/css/tabler.css", html)
+        self.assertIn("羽毛球水平分析报告", html)
+
+    def test_report_assets_replace_empty_file_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target_dir = Path(tmp_dir)
+            destination = target_dir / "static"
+            destination.write_text("", encoding="utf-8")
+
+            copy_tabler_report_assets(target_dir)
+
+            self.assertTrue(destination.is_dir())
+            self.assertTrue((destination / "css" / "tabler.css").is_file())
+
+    def test_report_assets_keep_non_empty_file_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target_dir = Path(tmp_dir)
+            destination = target_dir / "static"
+            destination.write_text("keep me", encoding="utf-8")
+
+            with self.assertRaises(FileExistsError):
+                copy_tabler_report_assets(target_dir)
+
+            self.assertTrue(destination.is_file())
+            self.assertEqual(destination.read_text(encoding="utf-8"), "keep me")
 
 
 if __name__ == "__main__":

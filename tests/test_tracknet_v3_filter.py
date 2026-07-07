@@ -62,6 +62,27 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
         self.assertEqual([record["action"] for record in tracker.debug_records], ["accept", "accept", "accept"])
         self.assertTrue(all(record["coast_after"] == 0 for record in tracker.debug_records))
 
+    def test_prefers_motion_consistent_candidate_over_far_high_score_spike(self) -> None:
+        tracker = TrackNetV3TrajectoryFilter(debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+
+        tracker.update(_track(100.0, 200.0, 0.78), dt=1.0 / 60.0, frame_shape=frame_shape)
+        tracker.update(_track(112.0, 206.0, 0.76), dt=1.0 / 60.0, frame_shape=frame_shape)
+        tracker.update(_track(124.0, 212.0, 0.74), dt=1.0 / 60.0, frame_shape=frame_shape)
+
+        stable = tracker.update_candidates(
+            [
+                _track(780.0, 520.0, 0.96),
+                _track(136.0, 218.0, 0.58),
+            ],
+            dt=1.0 / 60.0,
+            frame_shape=frame_shape,
+        )
+
+        self.assertTrue(stable.visible)
+        self.assertEqual(stable.ball_xy, [136.0, 218.0])
+        self.assertEqual(tracker.debug_records[-1]["selected_candidate_index"], 1)
+
     def test_can_linearly_repair_missing_span_when_lag_allows_future_endpoint(self) -> None:
         tracker = TrackNetV3TrajectoryFilter(
             TrackNetV3TrajectoryFilterConfig(fps=25.0, fixed_lag_frames=5),

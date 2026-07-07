@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import argparse
+import json
 from dataclasses import dataclass, field
+from dataclasses import fields
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +54,66 @@ class RuntimeConfig:
 USER_CONFIG = RuntimeConfig(
     source="",
 )
+
+
+def runtime_config_from_mapping(data: dict[str, object]) -> RuntimeConfig:
+    field_names = {item.name for item in fields(RuntimeConfig)}
+    known: dict[str, object] = {}
+    extra: dict[str, object] = {}
+    for key, value in data.items():
+        if key in field_names and key != "extra":
+            known[key] = value
+        else:
+            extra[key] = value
+
+    for key in ("pose_input_size", "track_input_size"):
+        value = known.get(key)
+        if isinstance(value, list) and len(value) == 2:
+            known[key] = (int(value[0]), int(value[1]))
+
+    config = RuntimeConfig(**known)
+    config.extra.update(extra)
+    return config
+
+
+def load_runtime_config(path: str | Path) -> RuntimeConfig:
+    config_path = Path(path)
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Runtime config must be a JSON object: {config_path}")
+    return runtime_config_from_mapping(payload)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run WFBARNet GUI or command-line inference.")
+    parser.add_argument("--config", default="", help="Path to a JSON runtime config.")
+    parser.add_argument("--source", default=None, help="Video path, camera index, or frame directory.")
+    parser.add_argument("--pipeline", default=None, choices=["track_only", "pose_only", "track_realtime", "unified"])
+    parser.add_argument("--output-dir", default=None, help="Directory for exported inference outputs.")
+    parser.add_argument("--device", default=None, help="Inference device: auto, cpu, cuda, cuda:0, ...")
+    parser.add_argument("--pose-weight", default=None, help="YOLO/MMPose pose checkpoint path.")
+    parser.add_argument("--track-weight", default=None, help="TrackNet checkpoint or TensorRT engine path.")
+    parser.add_argument("--no-vis", action="store_true", help="Disable visualization video export.")
+    return parser.parse_args(argv)
+
+
+def build_runtime_config_from_args(argv: list[str] | None = None) -> RuntimeConfig:
+    args = parse_args(argv)
+    config = load_runtime_config(args.config) if args.config else RuntimeConfig()
+    overrides = {
+        "source": args.source,
+        "pipeline": args.pipeline,
+        "output_dir": args.output_dir,
+        "device": args.device,
+        "pose_weight": args.pose_weight,
+        "track_weight": args.track_weight,
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            setattr(config, key, value)
+    if args.no_vis:
+        config.save_vis = False
+    return config
 
 
 def launch_pyqt_app() -> int:
@@ -185,8 +248,8 @@ def run_pipeline(config: RuntimeConfig) -> None:
     )
 
 
-def main() -> int:
-    config = USER_CONFIG
+def main(argv: list[str] | None = None) -> int:
+    config = build_runtime_config_from_args(argv)
     if not config.source:
         return launch_pyqt_app()
 

@@ -48,6 +48,7 @@ from apps.pyqt6.views.components.video_player_panel_runtime import (
     VideoTimelineWidget,
 )
 from apps.pyqt6.views.heatmap_renderer import HeatmapRenderer, HeatmapRenderConfig
+from src.utils.report_generation import copy_tabler_report_assets
 
 
 class ToggleSwitch(QCheckBox):
@@ -658,14 +659,14 @@ BadmintonCourtWidget = CourtHeatmapWidget
 
 
 class ReportPreviewWidget(QWidget):
-    """Right-side report tab backed by the Tabler template in assets/dist."""
+    """Right-side report tab backed by the stable report template."""
 
     def __init__(self, project_root: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._project_root = project_root
-        self._template_path = project_root / "assets" / "dist" / "index.html"
-        self._template_assets_dir = self._template_path.parent / "dist"
-        self._current_report_path: Path | None = self._template_path if self._template_path.exists() else None
+        self._report_output_path = project_root / "assets" / "dist" / "index.html"
+        self._template_path = project_root / "assets" / "report_template" / "report-template.html"
+        self._current_report_path: Path | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -718,7 +719,8 @@ class ReportPreviewWidget(QWidget):
         self.load_template()
 
     def load_template(self) -> None:
-        self.load_report_file(self._template_path)
+        path = self._report_output_path if self._report_output_path.exists() else self._template_path
+        self.load_report_file(path)
 
     def load_report_file(self, path: Path | str) -> None:
         report_path = Path(path)
@@ -763,14 +765,7 @@ class ReportPreviewWidget(QWidget):
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
 
     def _ensure_report_assets(self, report_path: Path) -> None:
-        if not self._template_assets_dir.exists():
-            return
-        destination = report_path.parent / "dist"
-        if destination.exists() and (destination / "css" / "tabler.css").exists():
-            return
-        import shutil
-
-        shutil.copytree(self._template_assets_dir, destination, dirs_exist_ok=True)
+        copy_tabler_report_assets(report_path.parent)
 
     @staticmethod
     def _directory_url(path: Path) -> QUrl:
@@ -781,8 +776,10 @@ class ReportPreviewWidget(QWidget):
         return QUrl.fromLocalFile(value)
 
     def _update_path_label(self, path: Path) -> None:
-        if path == self._template_path:
+        if path == self._report_output_path:
             self.report_path_label.setText("当前报告：assets/dist/index.html")
+        elif path == self._template_path:
+            self.report_path_label.setText("当前报告：assets/report_template/report-template.html")
         else:
             self.report_path_label.setText(f"当前报告：{path.name}")
 

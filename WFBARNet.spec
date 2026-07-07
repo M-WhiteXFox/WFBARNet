@@ -1,7 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('apps\\pyqt6\\resources', 'apps\\pyqt6\\resources'), ('assets', 'assets'), ('configs', 'configs')]
+datas = [
+    ('apps\\pyqt6\\resources', 'apps\\pyqt6\\resources'),
+    ('assets\\report_template', 'assets\\report_template'),
+    ('assets\\weights\\README.md', 'assets\\weights'),
+    ('configs', 'configs'),
+]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('ultralytics')

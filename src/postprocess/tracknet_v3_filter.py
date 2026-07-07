@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from math import isfinite
+from math import hypot, isfinite
 from typing import Any, Sequence
 
 from src.postprocess.track_filter import BallTrackFilter, FrameShape, PersonBBoxes
@@ -17,6 +17,10 @@ FrameSize = tuple[float, float]
 class TrackNetV3TrajectoryFilterConfig:
     fps: float = 25.0
     candidate_min_confidence: float = 0.35
+    motion_consistency_enabled: bool = True
+    motion_consistency_gate_px: float = 96.0
+    motion_consistency_velocity_scale: float = 1.25
+    motion_consistency_score_distance_px: float = 120.0
     inpaint_top_threshold_px: float = 30.0
     inpaint_top_threshold_ratio: float = 0.05
     inpaint_score: float = 0.35
@@ -110,7 +114,7 @@ class TrackNetV3TrajectoryFilter:
         step_dt = self._resolve_dt(dt)
         frame_size = _frame_size(frame_shape)
         candidates = self._valid_candidates(tracks, frame_size)
-        selected = max(candidates, key=lambda item: (item.score, -item.index)) if candidates else None
+        selected = self._select_candidate(candidates)
         raw_track = selected.track if selected is not None else self._invisible(score=_max_score(tracks))
         last_visible_before = self._last_visible_point
         if selected is None:
@@ -172,6 +176,97 @@ class TrackNetV3TrajectoryFilter:
                 continue
             candidates.append(_Candidate(track=track, index=index, point=point, score=score))
         return candidates
+
+    def _select_candidate(self, candidates: Sequence[_Candidate]) -> _Candidate | None:
+        if not candidates:
+            return None
+
+        primary = max(candidates, key=lambda item: (item.score, -item.index))
+        if len(candidates) <= 1 or not self.config.motion_consistency_enabled:
+            return primary
+
+        prediction = self._predict_next_visible_point()
+        if prediction is None:
+            return primary
+
+        gate = self._motion_consistency_gate()
+        stable_candidates = [
+            candidate
+            for candidate in candidates
+            if _distance(candidate.point, prediction) <= gate
+        ]
+        if not stable_candidates:
+            return primary
+
+        return max(
+            stable_candidates,
+            key=lambda item: self._motion_consistency_rank(item, prediction),
+        )
+
+    def _predict_next_visible_point(self) -> Point | None:
+        visible_samples: list[_BufferedTrack] = []
+        for sample in reversed(self._buffer):
+            if sample.raw.visible and _track_point(sample.raw) is not None:
+                visible_samples.append(sample)
+                if len(visible_samples) >= 2:
+                    break
+        if len(visible_samples) < 2:
+            return None
+
+        last = visible_samples[0]
+        previous = visible_samples[1]
+        last_point = _track_point(last.raw)
+        previous_point = _track_point(previous.raw)
+        if last_point is None or previous_point is None:
+            return None
+
+        history_gap = max(1, last.frame_index - previous.frame_index)
+        target_gap = max(1, self._frame_index - last.frame_index)
+        velocity = (
+            (last_point[0] - previous_point[0]) / float(history_gap),
+            (last_point[1] - previous_point[1]) / float(history_gap),
+        )
+        return (
+            last_point[0] + velocity[0] * float(target_gap),
+            last_point[1] + velocity[1] * float(target_gap),
+        )
+
+    def _motion_consistency_gate(self) -> float:
+        base_gate = max(0.0, float(self.config.motion_consistency_gate_px))
+        recent_speed = self._recent_visible_speed_px_per_frame()
+        return max(
+            base_gate,
+            recent_speed * max(0.0, float(self.config.motion_consistency_velocity_scale)),
+        )
+
+    def _recent_visible_speed_px_per_frame(self) -> float:
+        visible_samples: list[_BufferedTrack] = []
+        for sample in reversed(self._buffer):
+            if sample.raw.visible and _track_point(sample.raw) is not None:
+                visible_samples.append(sample)
+                if len(visible_samples) >= 2:
+                    break
+        if len(visible_samples) < 2:
+            return 0.0
+
+        last = visible_samples[0]
+        previous = visible_samples[1]
+        last_point = _track_point(last.raw)
+        previous_point = _track_point(previous.raw)
+        if last_point is None or previous_point is None:
+            return 0.0
+
+        frame_gap = max(1, last.frame_index - previous.frame_index)
+        return _distance(last_point, previous_point) / float(frame_gap)
+
+    def _motion_consistency_rank(self, candidate: _Candidate, prediction: Point) -> tuple[float, float, int]:
+        distance = _distance(candidate.point, prediction)
+        distance_scale = max(1.0, float(self.config.motion_consistency_score_distance_px))
+        return (
+            candidate.score - distance / distance_scale,
+            -distance,
+            -candidate.index,
+        )
 
     def _apply_tracknet_v3_repair(self, frame_size: FrameSize | None) -> None:
         if not self._buffer:
@@ -487,6 +582,10 @@ def _max_score(tracks: Sequence[TrackResult]) -> float:
 def _point_inside_frame(point: Point, frame_size: FrameSize) -> bool:
     width, height = frame_size
     return 0.0 <= point[0] < width and 0.0 <= point[1] < height
+
+
+def _distance(a: Point, b: Point) -> float:
+    return hypot(a[0] - b[0], a[1] - b[1])
 
 
 def _near_edge(point: Point, frame_size: FrameSize) -> bool:

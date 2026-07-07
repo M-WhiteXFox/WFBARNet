@@ -1,19 +1,30 @@
-# WFBARNet runtime dependencies.
-# Python 3.10 is recommended for the current local environment.
-numpy>=1.24
-opencv-python>=4.9
+# WFBARNet runtime dependencies
+# Recommended Python: 3.10
+#
+# Note:
+# 1. Install the torch/torchvision build that matches your CUDA environment.
+# 2. TensorRT and MMPose are optional backends and should usually be installed manually.
+
+# Core inference and desktop app
+numpy>=1.24,<3
+opencv-python>=4.8
+Pillow>=10.0
 PyQt6>=6.6
 PyQt6-WebEngine>=6.6
 torch>=2.2
 torchvision>=0.17
-ultralytics>=8.3
 tqdm>=4.66
-Pillow>=10.0
+ultralytics>=8.3
 
-# Tools and export utilities.
-matplotlib>=3.8
+# Optional: TrackNet ONNX / TensorRT export
 onnx>=1.16
 
-# Optional: required only for TensorRT .engine inference/export.
-# Install the CUDA variant that matches your local CUDA/TensorRT setup, for example:
+# Optional: PPT generation tool
+python-pptx>=1.0
+
+# Optional: run the test suite with `pytest`
+pytest>=8.0
+
+# Optional backends installed on demand:
 # tensorrt-cu12>=10.0
+# mmpose
