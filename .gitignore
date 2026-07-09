@@ -120,4 +120,8 @@ assets/temp/
 tools/
 assets/docs/
 
+# README media should be committed.
+!assets/readme/
+!assets/readme/**
+
 AgentPlan.md
