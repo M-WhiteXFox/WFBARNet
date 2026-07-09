@@ -43,6 +43,18 @@ class _PlayerMotionState:
     zone_hits: Counter[str] = field(default_factory=Counter)
 
 
+@dataclass
+class _BallSpeedState:
+    last_point: tuple[float, float] | None = None
+    last_timestamp_ms: int | None = None
+    current_speed_mps: float = 0.0
+    current_valid: bool = False
+    speed_sum_mps: float = 0.0
+    speed_samples: int = 0
+    max_speed_mps: float = 0.0
+    recent_speed_mps: list[float] = field(default_factory=list)
+
+
 class RallyStatsAccumulator:
     """Accumulate rally-level metrics from court-plane player and hit events."""
 
@@ -60,6 +72,13 @@ class RallyStatsAccumulator:
         stop_speed_mps: float = 0.35,
         high_intensity_speed_mps: float = 3.00,
         passive_hit_speed_mps: float = 0.75,
+        ball_min_step_cm: float = 1.0,
+        ball_max_speed_mps: float = 120.0,
+        ball_speed_smoothing: float = 0.20,
+        ball_speed_window_size: int = 5,
+        ball_speed_outlier_delta_mps: float = 55.0,
+        ball_speed_outlier_ratio: float = 4.0,
+        ball_speed_max_accel_mps2: float = 120.0,
         start_visible_frames: int = 5,
         start_min_motion_px: float = 30.0,
         start_min_avg_ball_score: float = 0.40,
@@ -76,12 +95,20 @@ class RallyStatsAccumulator:
         self.stop_speed_mps = max(0.0, float(stop_speed_mps))
         self.high_intensity_speed_mps = max(0.0, float(high_intensity_speed_mps))
         self.passive_hit_speed_mps = max(0.0, float(passive_hit_speed_mps))
+        self.ball_min_step_cm = max(0.0, float(ball_min_step_cm))
+        self.ball_max_speed_mps = max(0.0, float(ball_max_speed_mps))
+        self.ball_speed_smoothing = max(0.0, min(float(ball_speed_smoothing), 1.0))
+        self.ball_speed_window_size = max(1, int(ball_speed_window_size))
+        self.ball_speed_outlier_delta_mps = max(0.0, float(ball_speed_outlier_delta_mps))
+        self.ball_speed_outlier_ratio = max(1.0, float(ball_speed_outlier_ratio))
+        self.ball_speed_max_accel_mps2 = max(0.0, float(ball_speed_max_accel_mps2))
         self.start_visible_frames = max(1, int(start_visible_frames))
         self.start_min_motion_px = max(0.0, float(start_min_motion_px))
         self.start_min_avg_ball_score = max(0.0, float(start_min_avg_ball_score))
         self.freeze_after_rally_end = bool(freeze_after_rally_end)
 
         self._players = {key: _PlayerMotionState() for key in PLAYER_KEYS}
+        self._ball_speed = _BallSpeedState()
         self._frame_count = 0
         self._ball_visible_frames = 0
         self._pose_valid_frames = 0
@@ -112,6 +139,7 @@ class RallyStatsAccumulator:
         player_points: Mapping[int, Sequence[float]] | None,
         ball_visible: bool,
         ball_xy: Sequence[float] | None = None,
+        ball_court_xy: Sequence[float] | None = None,
         ball_score: float = 0.0,
         court_valid: bool = False,
     ) -> None:
@@ -126,8 +154,11 @@ class RallyStatsAccumulator:
         self._court_valid_frames += int(bool(court_valid))
         self._track_score_sum += max(0.0, float(ball_score))
         self._track_score_samples += 1
-        if self._rally_start_timestamp_ms is None:
-            self._update_rally_start_candidate(timestamp_ms, bool(ball_visible), ball_xy, ball_score)
+        if self._should_track_rally_start(timestamp_ms):
+            restarted = self._update_rally_start_candidate(timestamp_ms, bool(ball_visible), ball_xy, ball_score)
+            if restarted:
+                self._rally_end_timestamp_ms = None
+        self._update_ball_speed(timestamp_ms, ball_court_xy if ball_visible else None)
 
         valid_points = self._clean_player_points(player_points)
         self._pose_valid_frames += int(bool(valid_points))
@@ -168,6 +199,14 @@ class RallyStatsAccumulator:
         if event_type == "hit":
             if self._rally_start_timestamp_ms is None:
                 self._rally_start_timestamp_ms = timestamp_ms
+            elif (
+                not self.freeze_after_rally_end
+                and self._rally_end_timestamp_ms is not None
+                and timestamp_ms > self._rally_end_timestamp_ms
+            ):
+                self._rally_start_timestamp_ms = timestamp_ms
+                self._rally_end_timestamp_ms = None
+                self._reset_rally_start_candidate()
             confidence = self._safe_float(event.get("confidence", 0.0))
             hit = self._ensure_hit_record(key, frame_id=frame_id, timestamp_ms=timestamp_ms)
             already_registered = bool(hit.get("_event_registered"))
@@ -183,6 +222,7 @@ class RallyStatsAccumulator:
         if event_type == "landing":
             self._landing_count += 1
             self._rally_end_timestamp_ms = timestamp_ms
+            self._reset_rally_start_candidate()
         elif event_type == "out_of_frame":
             self._out_of_frame_count += 1
 
@@ -268,6 +308,7 @@ class RallyStatsAccumulator:
             "players": player_summaries,
             "stroke_distribution": dict(self._stroke_counts),
             "hit_confidence_avg": self._hit_confidence_sum / max(1, self._hit_confidence_samples),
+            "ball_speed": self._ball_speed_summary(),
             "motion_intensity_score": motion_intensity_score,
             "high_intensity_count": high_intensity_total,
             "data_reliability": {
@@ -333,6 +374,105 @@ class RallyStatsAccumulator:
         state.last_point = point
         state.last_timestamp_ms = timestamp_ms
         state.last_speed_mps = speed_mps
+
+    def _update_ball_speed(
+        self,
+        timestamp_ms: int,
+        ball_court_xy: Sequence[float] | None,
+    ) -> None:
+        point = self._clean_point(ball_court_xy)
+        if point is None:
+            self._ball_speed.last_point = None
+            self._ball_speed.last_timestamp_ms = None
+            self._ball_speed.current_speed_mps = 0.0
+            self._ball_speed.current_valid = False
+            self._ball_speed.recent_speed_mps.clear()
+            return
+
+        state = self._ball_speed
+        if state.last_point is None or state.last_timestamp_ms is None:
+            state.last_point = point
+            state.last_timestamp_ms = timestamp_ms
+            state.current_speed_mps = 0.0
+            state.current_valid = False
+            return
+
+        dt_ms = max(0, timestamp_ms - state.last_timestamp_ms)
+        step_cm = hypot(point[0] - state.last_point[0], point[1] - state.last_point[1])
+        if dt_ms <= 0:
+            state.current_valid = False
+            return
+
+        dt_s = dt_ms / 1000.0
+        raw_speed_mps = 0.0 if step_cm < self.ball_min_step_cm else (step_cm / 100.0) / max(dt_s, 1e-6)
+        if self._is_ball_speed_outlier(raw_speed_mps):
+            state.current_valid = state.speed_samples > 0
+            return
+
+        state.last_point = point
+        state.last_timestamp_ms = timestamp_ms
+        self._append_ball_speed_sample(raw_speed_mps)
+        target_speed_mps = self._median_ball_speed()
+
+        if state.speed_samples <= 0 or not state.current_valid:
+            stable_speed_mps = target_speed_mps
+        else:
+            alpha = self.ball_speed_smoothing
+            stable_speed_mps = (alpha * target_speed_mps) + ((1.0 - alpha) * state.current_speed_mps)
+            max_delta = self.ball_speed_max_accel_mps2 * dt_s
+            if max_delta > 0.0:
+                delta = max(-max_delta, min(max_delta, stable_speed_mps - state.current_speed_mps))
+                stable_speed_mps = state.current_speed_mps + delta
+
+        state.current_speed_mps = stable_speed_mps
+        state.current_valid = True
+        state.speed_sum_mps += stable_speed_mps
+        state.speed_samples += 1
+        state.max_speed_mps = max(state.max_speed_mps, stable_speed_mps)
+
+    def _is_ball_speed_outlier(self, speed_mps: float) -> bool:
+        if self.ball_max_speed_mps > 0.0 and speed_mps > self.ball_max_speed_mps:
+            return True
+        recent = self._ball_speed.recent_speed_mps
+        if not recent:
+            return False
+        baseline = self._median_ball_speed()
+        threshold = max(
+            self.ball_speed_outlier_delta_mps,
+            abs(baseline) * self.ball_speed_outlier_ratio,
+        )
+        return abs(speed_mps - baseline) > threshold
+
+    def _append_ball_speed_sample(self, speed_mps: float) -> None:
+        recent = self._ball_speed.recent_speed_mps
+        recent.append(speed_mps)
+        if len(recent) > self.ball_speed_window_size:
+            del recent[0 : len(recent) - self.ball_speed_window_size]
+
+    def _median_ball_speed(self) -> float:
+        values = sorted(self._ball_speed.recent_speed_mps)
+        if not values:
+            return 0.0
+        middle = len(values) // 2
+        if len(values) % 2:
+            return values[middle]
+        return (values[middle - 1] + values[middle]) * 0.5
+
+    def _ball_speed_summary(self) -> dict[str, Any]:
+        state = self._ball_speed
+        avg_speed_mps = state.speed_sum_mps / max(1, state.speed_samples)
+        return {
+            "current_mps": state.current_speed_mps,
+            "current_kmh": state.current_speed_mps * 3.6,
+            "avg_mps": avg_speed_mps,
+            "avg_kmh": avg_speed_mps * 3.6,
+            "max_mps": state.max_speed_mps,
+            "max_kmh": state.max_speed_mps * 3.6,
+            "samples": state.speed_samples,
+            "current_valid": state.current_valid,
+            "source": "court_plane",
+            "filter": "median_ema_slew",
+        }
 
     def _update_motion_counts(self, state: _PlayerMotionState, speed_mps: float, step_m: float) -> None:
         was_moving = state.moving
@@ -468,24 +608,33 @@ class RallyStatsAccumulator:
             return "回合结束"
         return "回合中"
 
+    def _should_track_rally_start(self, timestamp_ms: int) -> bool:
+        if self._rally_start_timestamp_ms is None:
+            return True
+        return (
+            not self.freeze_after_rally_end
+            and self._rally_end_timestamp_ms is not None
+            and timestamp_ms > self._rally_end_timestamp_ms
+        )
+
     def _update_rally_start_candidate(
         self,
         timestamp_ms: int,
         ball_visible: bool,
         ball_xy: Sequence[float] | None,
         ball_score: float,
-    ) -> None:
+    ) -> bool:
         point = self._clean_point(ball_xy)
         if not ball_visible or point is None:
             self._reset_rally_start_candidate()
-            return
+            return False
         if self._start_candidate_point is None:
             self._start_candidate_timestamp_ms = timestamp_ms
             self._start_candidate_point = point
             self._start_candidate_visible_frames = 1
             self._start_candidate_score_sum = max(0.0, float(ball_score))
             self._start_candidate_max_motion_px = 0.0
-            return
+            return False
 
         self._start_candidate_visible_frames += 1
         self._start_candidate_score_sum += max(0.0, float(ball_score))
@@ -499,6 +648,9 @@ class RallyStatsAccumulator:
             and avg_score >= self.start_min_avg_ball_score
         ):
             self._rally_start_timestamp_ms = self._start_candidate_timestamp_ms
+            self._reset_rally_start_candidate()
+            return True
+        return False
 
     def _reset_rally_start_candidate(self) -> None:
         self._start_candidate_timestamp_ms = None

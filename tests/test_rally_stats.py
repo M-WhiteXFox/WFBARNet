@@ -35,6 +35,108 @@ class RallyStatsAccumulatorTest(unittest.TestCase):
         self.assertEqual(top["start_count"], 1)
         self.assertEqual(top["stop_count"], 1)
 
+    def test_computes_ball_speed_from_court_projection(self) -> None:
+        stats = RallyStatsAccumulator(ball_speed_smoothing=1.0)
+        stats.update_frame(
+            timestamp_ms=0,
+            player_points=None,
+            ball_visible=True,
+            ball_xy=(100.0, 120.0),
+            ball_court_xy=(200.0, 300.0),
+            ball_score=0.8,
+            court_valid=True,
+        )
+        stats.update_frame(
+            timestamp_ms=100,
+            player_points=None,
+            ball_visible=True,
+            ball_xy=(120.0, 120.0),
+            ball_court_xy=(300.0, 300.0),
+            ball_score=0.8,
+            court_valid=True,
+        )
+
+        speed = stats.summary()["ball_speed"]
+        self.assertEqual(speed["samples"], 1)
+        self.assertTrue(speed["current_valid"])
+        self.assertAlmostEqual(speed["current_mps"], 10.0, places=6)
+        self.assertAlmostEqual(speed["current_kmh"], 36.0, places=6)
+        self.assertAlmostEqual(speed["max_mps"], 10.0, places=6)
+
+    def test_ball_speed_requires_court_projection(self) -> None:
+        stats = RallyStatsAccumulator()
+        stats.update_frame(
+            timestamp_ms=0,
+            player_points=None,
+            ball_visible=True,
+            ball_xy=(100.0, 120.0),
+            ball_score=0.8,
+            court_valid=False,
+        )
+        stats.update_frame(
+            timestamp_ms=100,
+            player_points=None,
+            ball_visible=True,
+            ball_xy=(120.0, 120.0),
+            ball_score=0.8,
+            court_valid=False,
+        )
+
+        speed = stats.summary()["ball_speed"]
+        self.assertEqual(speed["samples"], 0)
+        self.assertFalse(speed["current_valid"])
+        self.assertEqual(speed["current_kmh"], 0.0)
+
+    def test_ball_speed_ignores_large_projection_spike(self) -> None:
+        stats = RallyStatsAccumulator(ball_speed_smoothing=1.0, ball_speed_window_size=3)
+        for timestamp_ms, point in (
+            (0, (0.0, 0.0)),
+            (100, (100.0, 0.0)),
+            (200, (200.0, 0.0)),
+            (300, (1000.0, 0.0)),
+        ):
+            stats.update_frame(
+                timestamp_ms=timestamp_ms,
+                player_points=None,
+                ball_visible=True,
+                ball_xy=(100.0, 120.0),
+                ball_court_xy=point,
+                ball_score=0.8,
+                court_valid=True,
+            )
+
+        speed = stats.summary()["ball_speed"]
+        self.assertEqual(speed["samples"], 2)
+        self.assertTrue(speed["current_valid"])
+        self.assertAlmostEqual(speed["current_mps"], 10.0, places=6)
+        self.assertAlmostEqual(speed["max_mps"], 10.0, places=6)
+
+    def test_ball_speed_limits_per_frame_display_change(self) -> None:
+        stats = RallyStatsAccumulator(
+            ball_speed_smoothing=1.0,
+            ball_speed_window_size=1,
+            ball_speed_max_accel_mps2=10.0,
+        )
+        for timestamp_ms, point in (
+            (0, (0.0, 0.0)),
+            (100, (100.0, 0.0)),
+            (200, (500.0, 0.0)),
+        ):
+            stats.update_frame(
+                timestamp_ms=timestamp_ms,
+                player_points=None,
+                ball_visible=True,
+                ball_xy=(100.0, 120.0),
+                ball_court_xy=point,
+                ball_score=0.8,
+                court_valid=True,
+            )
+
+        speed = stats.summary()["ball_speed"]
+        self.assertEqual(speed["samples"], 2)
+        self.assertAlmostEqual(speed["current_mps"], 11.0, places=6)
+        self.assertLess(speed["current_mps"], 40.0)
+
     def test_merges_trajectory_and_bst_hit_by_frame(self) -> None:
         stats = RallyStatsAccumulator()
         stats.update_frame(
@@ -251,11 +353,59 @@ class RallyStatsAccumulatorTest(unittest.TestCase):
         )
 
         summary = stats.summary()
-        self.assertEqual(summary["rally_state"], "回合结束")
-        self.assertEqual(summary["rally_end_ms"], 480)
+        self.assertEqual(summary["rally_state"], "回合中")
+        self.assertEqual(summary["rally_start_ms"], 800)
+        self.assertEqual(summary["rally_end_ms"], 800)
+        self.assertEqual(summary["landing_count"], 1)
         self.assertEqual(summary["rally_hit_count"], 2)
         self.assertEqual(summary["frame_count"], 1)
         self.assertEqual(summary["players"]["top"]["hit_count"], 1)
+
+    def test_continuous_mode_restarts_from_stable_ball_after_landing_end(self) -> None:
+        stats = RallyStatsAccumulator(
+            freeze_after_rally_end=False,
+            start_visible_frames=2,
+            start_min_motion_px=10.0,
+            start_min_avg_ball_score=0.4,
+        )
+        stats.add_trajectory_event(
+            {
+                "event_type": "hit",
+                "frame_id": 1,
+                "timestamp_ms": 100,
+                "confidence": 0.72,
+            }
+        )
+        stats.add_trajectory_event(
+            {
+                "event_type": "landing",
+                "frame_id": 12,
+                "timestamp_ms": 480,
+                "confidence": 0.72,
+            }
+        )
+        stats.update_frame(
+            timestamp_ms=800,
+            player_points=None,
+            ball_visible=True,
+            ball_xy=(100.0, 100.0),
+            ball_score=0.75,
+            court_valid=True,
+        )
+        stats.update_frame(
+            timestamp_ms=840,
+            player_points=None,
+            ball_visible=True,
+            ball_xy=(115.0, 100.0),
+            ball_score=0.76,
+            court_valid=True,
+        )
+
+        summary = stats.summary()
+        self.assertEqual(summary["rally_state"], "回合中")
+        self.assertEqual(summary["rally_start_ms"], 800)
+        self.assertEqual(summary["rally_end_ms"], 840)
+        self.assertEqual(summary["landing_count"], 1)
 
     def test_does_not_start_from_single_false_visible_ball(self) -> None:
         stats = RallyStatsAccumulator()

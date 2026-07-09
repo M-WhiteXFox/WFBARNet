@@ -26,6 +26,7 @@ QPushButton#btnAnalyze,
 QPushButton#btnReset,
 QPushButton#btnSelectVideo,
 QPushButton#btnForceStop,
+QPushButton#btnFullscreen,
 QPushButton#btnPreviewMode,
 QPushButton#btnCameraMode,
 QPushButton#btnBatchMode,
@@ -98,6 +99,19 @@ QPushButton#btnSelectVideo {
     min-width: 60px;
     background-color: #2A2F3A;
     color: #E8EDF5;
+}
+
+QPushButton#btnFullscreen {
+    min-width: 72px;
+    color: #6BB8F0;
+    background-color: #2A2F3A;
+    border-color: #4A5060;
+}
+
+QPushButton#btnFullscreen:checked {
+    color: #0F172A;
+    background-color: #4FA3E0;
+    border-color: #4FA3E0;
 }
 
 QPushButton#btnForceStop {

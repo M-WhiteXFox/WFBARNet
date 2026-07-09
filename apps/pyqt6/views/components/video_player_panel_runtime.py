@@ -232,6 +232,7 @@ class VideoPlayerWidget(QFrame):
 
     selectRequested = pyqtSignal()
     forceStopRequested = pyqtSignal()
+    fullscreenRequested = pyqtSignal()
     framePointClicked = pyqtSignal(float, float)
     courtCornerDragged = pyqtSignal(int, float, float)
 
@@ -265,6 +266,12 @@ class VideoPlayerWidget(QFrame):
 
         self.btn_force_stop = QPushButton("停止")
         self.btn_force_stop.setObjectName("btnForceStop")
+
+        self.btn_fullscreen = QPushButton("全屏")
+        self.btn_fullscreen.setObjectName("btnFullscreen")
+        self.btn_fullscreen.setCheckable(True)
+        self.btn_fullscreen.setToolTip("放大视频为全屏")
+        self.btn_fullscreen.setAccessibleName("全屏")
 
         self.preview_stack = QStackedWidget()
         self.preview_stack.setObjectName("videoStack")
@@ -320,6 +327,7 @@ class VideoPlayerWidget(QFrame):
 
         self.btn_select_video.clicked.connect(self.selectRequested.emit)
         self.btn_force_stop.clicked.connect(self.forceStopRequested.emit)
+        self.btn_fullscreen.clicked.connect(lambda _checked=False: self.fullscreenRequested.emit())
 
     def eventFilter(self, watched: object, event: object) -> bool:
         if watched is self.video_label:
@@ -557,6 +565,19 @@ class VideoPlayerWidget(QFrame):
             "error": "视频加载失败",
         }
         self._set_status(mapping.get(state, state), state)
+
+    def set_fullscreen_mode(self, enabled: bool) -> None:
+        self.btn_fullscreen.blockSignals(True)
+        self.btn_fullscreen.setChecked(bool(enabled))
+        self.btn_fullscreen.blockSignals(False)
+        if enabled:
+            self.btn_fullscreen.setText("退出全屏")
+            self.btn_fullscreen.setToolTip("退出全屏（Esc）")
+            self.btn_fullscreen.setAccessibleName("退出全屏")
+        else:
+            self.btn_fullscreen.setText("全屏")
+            self.btn_fullscreen.setToolTip("放大视频为全屏")
+            self.btn_fullscreen.setAccessibleName("全屏")
 
     def current_path(self) -> str:
         return self._source_path

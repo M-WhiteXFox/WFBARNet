@@ -1,0 +1,539 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta http-equiv="X-UA-Compatible" content="ie=edge" />
+    <title>羽毛球数据分析报告 - WFBARNet</title>
+    <link href="./static/css/tabler.css?1779152072" rel="stylesheet" />
+    <link href="./static/css/tabler-vendors.css?1779152072" rel="stylesheet" />
+    <link href="./static/css/tabler-themes.css?1779152072" rel="stylesheet" />
+    <style>
+      :root {
+        --report-accent: #1b7f5c;
+        --report-accent-soft: #e8f5ef;
+        --report-ink: #182433;
+        --report-muted: #667382;
+        --report-court: #1f8f64;
+        --report-court-line: rgba(255, 255, 255, 0.88);
+      }
+
+      body {
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--report-ink);
+        background: #f4f7f6;
+      }
+
+      .report-page {
+        min-height: 100vh;
+      }
+
+      .report-shell {
+        max-width: 1180px;
+      }
+
+      .report-header {
+        background:
+          linear-gradient(135deg, rgba(27, 127, 92, 0.96), rgba(25, 81, 121, 0.94)),
+          radial-gradient(circle at 82% 18%, rgba(255, 255, 255, 0.22), transparent 28%);
+        color: #fff;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+
+      .report-header .text-secondary {
+        color: rgba(255, 255, 255, 0.72) !important;
+      }
+
+      .report-title {
+        max-width: 720px;
+      }
+
+      .report-kicker {
+        font-size: 0.75rem;
+        letter-spacing: 0;
+        text-transform: uppercase;
+        opacity: 0.76;
+      }
+
+      .metric-card {
+        min-height: 138px;
+      }
+
+      .metric-value {
+        font-size: 2rem;
+        line-height: 1.05;
+        font-weight: 720;
+        letter-spacing: 0;
+      }
+
+      .metric-label {
+        color: var(--report-muted);
+        font-size: 0.82rem;
+      }
+
+      .status-dot {
+        display: inline-block;
+        width: 0.55rem;
+        height: 0.55rem;
+        border-radius: 999px;
+        background: var(--report-accent);
+      }
+
+      .court-panel {
+        background: #0c6b4a;
+        border-radius: 8px;
+        padding: 16px;
+      }
+
+      .court-svg {
+        width: 100%;
+        max-width: 360px;
+        display: block;
+        margin: 0 auto;
+      }
+
+      .bar-track {
+        height: 8px;
+        background: #edf2f0;
+        border-radius: 999px;
+        overflow: hidden;
+      }
+
+      .bar-fill {
+        height: 100%;
+        background: var(--report-accent);
+        border-radius: inherit;
+      }
+
+      .timeline {
+        position: relative;
+      }
+
+      .timeline::before {
+        content: "";
+        position: absolute;
+        top: 0.35rem;
+        bottom: 0.35rem;
+        left: 0.46rem;
+        width: 2px;
+        background: #d9e4df;
+      }
+
+      .timeline-item {
+        position: relative;
+        padding-left: 1.65rem;
+      }
+
+      .timeline-item::before {
+        content: "";
+        position: absolute;
+        left: 0.13rem;
+        top: 0.35rem;
+        width: 0.72rem;
+        height: 0.72rem;
+        border-radius: 50%;
+        background: #fff;
+        border: 2px solid var(--report-accent);
+      }
+
+      .insight-callout {
+        border-left: 4px solid var(--report-accent);
+        background: var(--report-accent-soft);
+      }
+
+      .table thead th {
+        color: var(--report-muted);
+        font-size: 0.78rem;
+        text-transform: none;
+      }
+
+      @media print {
+        body {
+          background: #fff;
+        }
+
+        .d-print-none {
+          display: none !important;
+        }
+
+        .report-shell {
+          max-width: none;
+        }
+
+        .card,
+        .report-header {
+          break-inside: avoid;
+          box-shadow: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <script src="./static/js/tabler-theme.min.js?1779152072"></script>
+    <div class="page report-page">
+      <header class="navbar navbar-expand-md d-print-none">
+        <div class="container-xl report-shell">
+          <div class="navbar-brand d-flex align-items-center gap-2">
+            <span class="avatar avatar-sm bg-green-lt text-green">
+              <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-1" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6 3l12 12" />
+                <path d="M5 14l4 4" />
+                <path d="M14 5l4 4" />
+                <path d="M3 21l6 -6" />
+                <path d="M15 9l6 -6" />
+              </svg>
+            </span>
+            <span>WFBARNet Report</span>
+          </div>
+          <div class="navbar-nav flex-row ms-auto">
+            <button class="btn btn-primary" type="button" onclick="window.print()">
+              <svg xmlns="http://www.w3.org/2000/svg" class="icon icon-1" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M6 9v-4h12v4" />
+                <path d="M6 18h12v-6h-12z" />
+                <path d="M6 14h-2a2 2 0 0 1 -2 -2v-1a2 2 0 0 1 2 -2h16a2 2 0 0 1 2 2v1a2 2 0 0 1 -2 2h-2" />
+              </svg>
+              打印报告
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main class="page-wrapper">
+        <div class="page-body">
+          <div class="container-xl report-shell">
+            <section class="report-header p-4 p-md-5 mb-4">
+              <div class="row g-4 align-items-end">
+                <div class="col-lg-8">
+                  <div class="report-kicker mb-2">Badminton Performance Analysis</div>
+                  <h1 class="report-title mb-3">羽毛球水平分析报告</h1>
+                  <p class="mb-0 text-secondary">
+                    基于视频轨迹、人体姿态、球场映射、击球事件和动作识别结果生成，用于训练复盘、技术诊断和阶段性能力跟踪。
+                  </p>
+                </div>
+                <div class="col-lg-4">
+                  <div class="row g-2">
+                    <div class="col-6">
+                      <div class="text-secondary">运动员</div>
+                      <div class="h3 mb-0" data-report-field="athlete_name">训练用户</div>
+                    </div>
+                    <div class="col-6">
+                      <div class="text-secondary">报告时间</div>
+                      <div class="h3 mb-0" data-report-field="generated_at">2026-05-20 16:43</div>
+                    </div>
+                    <div class="col-12">
+                      <div class="text-secondary">视频文件</div>
+                      <div class="h3 mb-0 text-truncate" data-report-field="video_name">training_clip.mp4</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <div class="row row-cards mb-4">
+              <div class="col-sm-6 col-lg-3">
+                <div class="card metric-card">
+                  <div class="card-body">
+                    <div class="metric-label">回合时长</div>
+                    <div class="metric-value mt-2" data-report-field="duration_s">0.00s</div>
+                    <div class="text-secondary mt-2">有效分析窗口</div>
+                  </div>
+                </div>
+              </div>
+              <div class="col-sm-6 col-lg-3">
+                <div class="card metric-card">
+                  <div class="card-body">
+                    <div class="metric-label">击球次数</div>
+                    <div class="metric-value mt-2" data-report-field="hit_count">0</div>
+                    <div class="text-secondary mt-2">轨迹事件识别</div>
+                  </div>
+                </div>
+              </div>
+              <div class="col-sm-6 col-lg-3">
+                <div class="card metric-card">
+                  <div class="card-body">
+                    <div class="metric-label">平均击球间隔</div>
+                    <div class="metric-value mt-2" data-report-field="avg_hit_interval">0.00s</div>
+                    <div class="text-secondary mt-2">节奏稳定性参考</div>
+                  </div>
+                </div>
+              </div>
+              <div class="col-sm-6 col-lg-3">
+                <div class="card metric-card">
+                  <div class="card-body">
+                    <div class="metric-label">数据可信度</div>
+                    <div class="metric-value mt-2" data-report-field="reliability_score">0%</div>
+                    <div class="text-secondary mt-2"><span class="status-dot me-1"></span>轨迹与姿态综合</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="row row-cards">
+              <div class="col-lg-7">
+                <div class="card h-100">
+                  <div class="card-header">
+                    <h2 class="card-title">场地区域与落点分布</h2>
+                  </div>
+                  <div class="card-body">
+                    <div class="row g-4 align-items-center">
+                      <div class="col-md-6">
+                        <div class="court-panel">
+                          <svg class="court-svg" viewBox="0 0 244 536" role="img" aria-label="羽毛球场热区示意">
+                            <rect x="10" y="10" width="224" height="516" rx="2" fill="var(--report-court)" stroke="var(--report-court-line)" stroke-width="4" />
+                            <path d="M10 92h224M10 444h224M10 268h224M52 10v516M192 10v516M122 10v516" stroke="var(--report-court-line)" stroke-width="2" />
+                            <path d="M52 148h140M52 388h140" stroke="var(--report-court-line)" stroke-width="2" />
+                            <circle cx="82" cy="354" r="28" fill="#ffdd57" fill-opacity="0.6" />
+                            <circle cx="154" cy="192" r="40" fill="#f76707" fill-opacity="0.48" />
+                            <circle cx="130" cy="286" r="54" fill="#d6336c" fill-opacity="0.32" />
+                            <circle cx="92" cy="110" r="10" fill="#fff" />
+                            <circle cx="166" cy="432" r="10" fill="#fff" />
+                          </svg>
+                        </div>
+                      </div>
+                      <div class="col-md-6">
+                        <div class="mb-3">
+                          <div class="d-flex justify-content-between mb-1">
+                            <span>前场</span><span data-report-field="front_zone">0%</span>
+                          </div>
+                          <div class="bar-track"><div class="bar-fill" style="width: 31%"></div></div>
+                        </div>
+                        <div class="mb-3">
+                          <div class="d-flex justify-content-between mb-1">
+                            <span>中场</span><span data-report-field="mid_zone">0%</span>
+                          </div>
+                          <div class="bar-track"><div class="bar-fill" style="width: 44%"></div></div>
+                        </div>
+                        <div class="mb-3">
+                          <div class="d-flex justify-content-between mb-1">
+                            <span>后场</span><span data-report-field="back_zone">0%</span>
+                          </div>
+                          <div class="bar-track"><div class="bar-fill" style="width: 25%"></div></div>
+                        </div>
+                        <div class="text-secondary">
+                          热区基于球场单应性矩阵，把像素坐标映射到标准羽毛球场平面后统计。
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-lg-5">
+                <div class="card h-100">
+                  <div class="card-header">
+                    <h2 class="card-title">AI 复盘摘要</h2>
+                  </div>
+                  <div class="card-body">
+                    <div class="insight-callout rounded p-3 mb-3">
+                      <div class="fw-bold mb-1">主要结论</div>
+                      <div data-report-field="ai_summary">暂无自动复盘摘要。</div>
+                    </div>
+                    <div class="d-flex align-items-start gap-3 mb-3">
+                      <span class="badge bg-green-lt text-green">优势</span>
+                      <div>连续多拍中保持较高击球稳定性，失误主要集中在被动后场。</div>
+                    </div>
+                    <div class="d-flex align-items-start gap-3 mb-3">
+                      <span class="badge bg-yellow-lt text-yellow">风险</span>
+                      <div>远端姿态与球点置信度波动时，部分击球类型需要人工复核。</div>
+                    </div>
+                    <div class="d-flex align-items-start gap-3">
+                      <span class="badge bg-blue-lt text-blue">训练</span>
+                      <div>建议安排后场两点启动、吊杀上网衔接和被动防守落点控制训练。</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-lg-4">
+                <div class="card h-100">
+                  <div class="card-header">
+                    <h2 class="card-title">击球类型分布</h2>
+                  </div>
+                  <div class="card-body">
+                    <div class="mb-3">
+                      <div class="d-flex justify-content-between mb-1"><span>高远球</span><span>28%</span></div>
+                      <div class="bar-track"><div class="bar-fill" style="width: 28%"></div></div>
+                    </div>
+                    <div class="mb-3">
+                      <div class="d-flex justify-content-between mb-1"><span>吊球</span><span>18%</span></div>
+                      <div class="bar-track"><div class="bar-fill" style="width: 18%"></div></div>
+                    </div>
+                    <div class="mb-3">
+                      <div class="d-flex justify-content-between mb-1"><span>杀球</span><span>22%</span></div>
+                      <div class="bar-track"><div class="bar-fill" style="width: 22%"></div></div>
+                    </div>
+                    <div class="mb-3">
+                      <div class="d-flex justify-content-between mb-1"><span>挑球/推挡</span><span>32%</span></div>
+                      <div class="bar-track"><div class="bar-fill" style="width: 32%"></div></div>
+                    </div>
+                    <div class="text-secondary">动作类型可由 BST 模型输出或由 API 报告服务填充。</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-lg-4">
+                <div class="card h-100">
+                  <div class="card-header">
+                    <h2 class="card-title">球员运动负荷</h2>
+                  </div>
+                  <div class="card-body">
+                    <div class="row g-3">
+                      <div class="col-6">
+                        <div class="metric-label">下方球员跑动</div>
+                        <div class="h1 mb-0" data-report-field="bottom_distance">0.0m</div>
+                      </div>
+                      <div class="col-6">
+                        <div class="metric-label">上方球员跑动</div>
+                        <div class="h1 mb-0" data-report-field="top_distance">0.0m</div>
+                      </div>
+                      <div class="col-12">
+                        <div class="metric-label mb-1">平均移动速度</div>
+                        <div class="bar-track"><div class="bar-fill" style="width: 67%"></div></div>
+                        <div class="text-secondary mt-2">基于脚点投影与球场坐标累计估算。</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-lg-4">
+                <div class="card h-100">
+                  <div class="card-header">
+                    <h2 class="card-title">模型质量监控</h2>
+                  </div>
+                  <div class="card-body">
+                    <div class="d-flex justify-content-between mb-2">
+                      <span>球点可见率</span><strong data-report-field="track_visible_rate">0%</strong>
+                    </div>
+                    <div class="d-flex justify-content-between mb-2">
+                      <span>姿态有效帧</span><strong data-report-field="pose_valid_rate">0%</strong>
+                    </div>
+                    <div class="d-flex justify-content-between mb-2">
+                      <span>球场标定</span><strong data-report-field="court_status">manual</strong>
+                    </div>
+                    <div class="d-flex justify-content-between mb-3">
+                      <span>动作识别覆盖</span><strong data-report-field="bst_coverage">0%</strong>
+                    </div>
+                    <div class="alert alert-info mb-0">
+                      报告应同时展示指标和可信度，避免把低置信度片段误读为确定结论。
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-lg-5">
+                <div class="card h-100">
+                  <div class="card-header">
+                    <h2 class="card-title">关键事件时间线</h2>
+                  </div>
+                  <div class="card-body">
+                    <div class="timeline">
+                      <div class="timeline-item mb-3">
+                        <div class="fw-bold">00:04.20 连续后场对抗</div>
+                        <div class="text-secondary">球速提升，落点集中在右后场。</div>
+                      </div>
+                      <div class="timeline-item mb-3">
+                        <div class="fw-bold">00:12.84 网前转换</div>
+                        <div class="text-secondary">下方球员上网完成度较好，但回中速度下降。</div>
+                      </div>
+                      <div class="timeline-item mb-3">
+                        <div class="fw-bold">00:23.16 被动防守</div>
+                        <div class="text-secondary">姿态重心偏后，下一拍击球质量降低。</div>
+                      </div>
+                      <div class="timeline-item">
+                        <div class="fw-bold">00:35.40 回合结束</div>
+                        <div class="text-secondary">球点轨迹出界，建议复核垂直落点估计。</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-lg-7">
+                <div class="card h-100">
+                  <div class="card-header">
+                    <h2 class="card-title">指标明细</h2>
+                  </div>
+                  <div class="table-responsive">
+                    <table class="table table-vcenter card-table">
+                      <thead>
+                        <tr>
+                          <th>模块</th>
+                          <th>指标</th>
+                          <th>当前值</th>
+                          <th>解释</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr>
+                          <td>TrackNet V3</td>
+                          <td>轨迹连续性</td>
+                          <td>高</td>
+                          <td>短时丢失由滤波补偿，长丢失片段应标为低可信。</td>
+                        </tr>
+                        <tr>
+                          <td>Pose</td>
+                          <td>双人识别稳定性</td>
+                          <td>中</td>
+                          <td>远端球员丢失会影响移动距离和动作识别覆盖。</td>
+                        </tr>
+                        <tr>
+                          <td>Court</td>
+                          <td>场地映射</td>
+                          <td>手动标定</td>
+                          <td>四角点标定后可拖动微调，映射结果用于热区和距离。</td>
+                        </tr>
+                        <tr>
+                          <td>BST</td>
+                          <td>动作类型</td>
+                          <td>参考</td>
+                          <td>模型输出需要结合姿态质量和关键点格式一致性解释。</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-12">
+                <div class="card">
+                  <div class="card-header">
+                    <h2 class="card-title">训练建议</h2>
+                  </div>
+                  <div class="card-body">
+                    <div class="row g-3">
+                      <div class="col-md-4">
+                        <div class="fw-bold mb-1">后场启动</div>
+                        <div class="text-secondary">两点后场启动，每组 45 秒，关注第一步方向和回中节奏。</div>
+                      </div>
+                      <div class="col-md-4">
+                        <div class="fw-bold mb-1">网前衔接</div>
+                        <div class="text-secondary">吊杀上网组合练习，记录上网后下一拍击球质量。</div>
+                      </div>
+                      <div class="col-md-4">
+                        <div class="fw-bold mb-1">落点控制</div>
+                        <div class="text-secondary">后场被动球落点分区训练，减少中场半高球回放。</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script src="./static/js/tabler.min.js?1779152072" defer></script>
+    <script>
+      document.addEventListener("DOMContentLoaded", function () {
+        var generatedAt = document.querySelector('[data-report-field="generated_at"]');
+        if (generatedAt && generatedAt.textContent.trim() === "2026-05-19") {
+          generatedAt.textContent = new Date().toLocaleDateString("zh-CN");
+        }
+      });
+    </script>
+  </body>
+</html>

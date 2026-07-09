@@ -8,11 +8,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PyQt6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QUrl, pyqtProperty, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QSize, Qt, QUrl, pyqtProperty, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QDesktopServices, QLinearGradient, QPainter, QPen
 from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QHeaderView,
     QCheckBox,
@@ -374,7 +375,7 @@ class CourtHeatmapWidget(QWidget):
             self.refresh_heatmap()
 
     def set_ball_projection(self, court_xy: tuple[float, float] | None) -> None:
-        self._ball_court_xy = court_xy
+        self._ball_court_xy = self._clean_ball_projection(court_xy)
         self.update()
 
     def set_player_projections(self, court_points: list[tuple[float, float]] | None) -> None:
@@ -618,14 +619,42 @@ class CourtHeatmapWidget(QWidget):
         court_x, court_y = self._ball_court_xy
         marker_x = court.left() + court.width() * (court_x / self.COURT_WIDTH_CM)
         marker_y = court.top() + court.height() * (court_y / self.COURT_LENGTH_CM)
-        radius = max(5.0, min(court.width(), court.height()) * 0.018)
+        radius = max(6.0, min(court.width(), court.height()) * 0.022)
+        center = QPointF(marker_x, marker_y)
 
-        painter.setPen(QPen(QColor("#FFFFFF"), max(2, int(radius * 0.35))))
-        painter.setBrush(QColor("#F97316"))
-        painter.drawEllipse(QPointF(marker_x, marker_y), radius, radius)
+        painter.save()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 190))
-        painter.drawEllipse(QPointF(marker_x, marker_y), radius * 0.36, radius * 0.36)
+        painter.setBrush(QColor(249, 115, 22, 70))
+        painter.drawEllipse(center, radius * 2.15, radius * 2.15)
+
+        painter.setPen(QPen(QColor("#7C2D12"), max(2, int(radius * 0.36))))
+        painter.setBrush(QColor("#FDBA74"))
+        painter.drawEllipse(center, radius, radius)
+        painter.setPen(QPen(QColor("#FFFFFF"), max(1, int(radius * 0.18))))
+        painter.setBrush(QColor("#F97316"))
+        painter.drawEllipse(center, radius * 0.62, radius * 0.62)
+
+        cross_len = radius * 1.85
+        painter.setPen(QPen(QColor("#FFFFFF"), max(1, int(radius * 0.18))))
+        painter.drawLine(QPointF(marker_x - cross_len, marker_y), QPointF(marker_x + cross_len, marker_y))
+        painter.drawLine(QPointF(marker_x, marker_y - cross_len), QPointF(marker_x, marker_y + cross_len))
+
+        label = "球"
+        font = painter.font()
+        font.setPointSize(max(8, font.pointSize() - 1))
+        font.setBold(True)
+        painter.setFont(font)
+        label_width = 26.0
+        label_height = 18.0
+        label_x = min(court.right() - label_width, max(court.left(), marker_x + radius + 5.0))
+        label_y = min(court.bottom() - label_height, max(court.top(), marker_y - label_height * 0.5))
+        label_rect = QRectF(label_x, label_y, label_width, label_height)
+        painter.setPen(QPen(QColor(124, 45, 18, 185), 1))
+        painter.setBrush(QColor(255, 247, 237, 228))
+        painter.drawRoundedRect(label_rect, 5, 5)
+        painter.setPen(QPen(QColor("#7C2D12"), 1))
+        painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, label)
+        painter.restore()
 
     def _draw_player_projections(self, painter: QPainter, court: QRectF) -> None:
         colors = (QColor("#38BDF8"), QColor("#FACC15"), QColor("#A78BFA"), QColor("#34D399"))
@@ -644,6 +673,20 @@ class CourtHeatmapWidget(QWidget):
             label_rect = QRectF(marker_x - radius, marker_y - radius, radius * 2.0, radius * 2.0)
             painter.setPen(QPen(QColor("#0F172A"), 1))
             painter.drawText(label_rect, Qt.AlignmentFlag.AlignCenter, str(index + 1))
+
+    def _clean_ball_projection(self, court_xy: object | None) -> tuple[float, float] | None:
+        if not isinstance(court_xy, (list, tuple)) or len(court_xy) < 2:
+            return None
+        try:
+            court_x = float(court_xy[0])
+            court_y = float(court_xy[1])
+        except (TypeError, ValueError):
+            return None
+        if court_x != court_x or court_y != court_y:
+            return None
+        court_x = min(self.COURT_WIDTH_CM, max(0.0, court_x))
+        court_y = min(self.COURT_LENGTH_CM, max(0.0, court_y))
+        return court_x, court_y
 
     def _scale(self, court: QRectF) -> float:
         return min(court.width() / self.COURT_WIDTH_MM, court.height() / self.COURT_LENGTH_MM)
@@ -831,6 +874,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("羽毛球动作识别分析平台")
         self.resize(1360, 860)
         self.setMinimumSize(1200, 760)
+        self._video_fullscreen = False
+        self._video_fullscreen_previous_state = Qt.WindowState.WindowNoState
+        self._normal_root_margins = (20, 20, 20, 20)
+        self._analytics_opacity_effect: QGraphicsOpacityEffect | None = None
+        self._analytics_panel_overlay = False
 
         self.central_widget = QWidget()
         self.central_widget.setObjectName("appRoot")
@@ -931,7 +979,8 @@ class MainWindow(QMainWindow):
         self.style_btn.setText(f"{active_label}  ▾")
 
     def _build_body(self) -> None:
-        body_layout = QHBoxLayout()
+        self.body_layout = QHBoxLayout()
+        body_layout = self.body_layout
         body_layout.setSpacing(16)
 
         self._build_preview_panel(body_layout)
@@ -940,7 +989,8 @@ class MainWindow(QMainWindow):
         self.root_layout.addLayout(body_layout, stretch=1)
 
     def _build_preview_panel(self, body_layout: QHBoxLayout) -> None:
-        preview_shell = QWidget()
+        self.preview_shell = QWidget()
+        preview_shell = self.preview_shell
         preview_shell.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
@@ -949,7 +999,8 @@ class MainWindow(QMainWindow):
         preview_shell_layout.setContentsMargins(0, 0, 0, 0)
         preview_shell_layout.setSpacing(0)
 
-        preview_panel = QFrame()
+        self.preview_panel = QFrame()
+        preview_panel = self.preview_panel
         preview_panel.setObjectName("previewCard")
         preview_panel.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -959,7 +1010,9 @@ class MainWindow(QMainWindow):
         preview_layout.setContentsMargins(18, 18, 18, 18)
         preview_layout.setSpacing(14)
 
-        preview_header = QHBoxLayout()
+        self.preview_mode_bar = QWidget()
+        preview_header = QHBoxLayout(self.preview_mode_bar)
+        preview_header.setContentsMargins(0, 0, 0, 0)
         preview_header.setSpacing(2)
 
         self.btn_preview_mode = QPushButton("视频预览")
@@ -989,6 +1042,7 @@ class MainWindow(QMainWindow):
 
         self.video_player = VideoPlayerWidget()
         self.video_player.setMinimumHeight(360)
+        self.video_player.fullscreenRequested.connect(self.toggle_video_fullscreen)
 
         court_controls = QFrame()
         court_controls.setObjectName("courtControlsBar")
@@ -1047,6 +1101,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.batch_video_combo)
         controls_layout.addWidget(self.btn_export_batch)
         controls_layout.addWidget(self.btn_export_report)
+        controls_layout.addWidget(self.video_player.btn_fullscreen)
         controls_layout.addWidget(self.video_player.btn_force_stop)
         self.btn_select_batch_folder.clicked.connect(self.batchFolderBrowseRequested.emit)
         self.batch_video_combo.currentIndexChanged.connect(self._emit_batch_rally_selection)
@@ -1069,13 +1124,14 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(self.video_player, 1)
         preview_layout.addWidget(timeline_bar, 0)
 
-        preview_shell_layout.addLayout(preview_header)
+        preview_shell_layout.addWidget(self.preview_mode_bar, 0)
         preview_shell_layout.addWidget(preview_panel, stretch=1)
 
         body_layout.addWidget(preview_shell, stretch=6)
 
     def _build_analytics_panel(self, body_layout: QHBoxLayout) -> None:
-        analytics_panel = QFrame()
+        self.analytics_panel = QFrame()
+        analytics_panel = self.analytics_panel
         analytics_panel.setObjectName("analyticsCard")
         analytics_layout = QHBoxLayout(analytics_panel)
         analytics_layout.setContentsMargins(0, 0, 0, 0)
@@ -1109,7 +1165,7 @@ class MainWindow(QMainWindow):
         card1, self.lbl_realtime_fps = self._create_metric_card("实时帧数", "0.0 FPS")
         card2, self.lbl_rally_state = self._create_rally_state_card()
         card3, self.lbl_valid_pose = self._create_metric_card("推理 FPS", "0.0 FPS")
-        card4, self.lbl_valid_track = self._create_metric_card("击球次数", "0")
+        card4, self.lbl_ball_speed = self._create_metric_card("当前球速", "-- km/h")
         for index, card in enumerate((card1, card2, card3, card4)):
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             metrics_grid.addWidget(card, index // 2, index % 2)
@@ -1440,6 +1496,102 @@ class MainWindow(QMainWindow):
         widget.style().polish(widget)
         widget.update()
 
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape and self._video_fullscreen:
+            self.set_video_fullscreen(False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_fullscreen_analytics_panel()
+
+    def toggle_video_fullscreen(self) -> None:
+        self.set_video_fullscreen(not self._video_fullscreen)
+
+    def set_video_fullscreen(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._video_fullscreen:
+            self.video_player.set_fullscreen_mode(enabled)
+            return
+
+        if enabled:
+            self._video_fullscreen_previous_state = self.windowState() & ~Qt.WindowState.WindowFullScreen
+
+        self._video_fullscreen = enabled
+        self.header_card.setVisible(not enabled)
+        self.preview_mode_bar.setVisible(not enabled)
+
+        margins = (6, 6, 6, 6) if enabled else self._normal_root_margins
+        self.root_layout.setContentsMargins(*margins)
+        self.root_layout.setSpacing(8 if enabled else 16)
+        self.body_layout.setSpacing(8 if enabled else 16)
+        self._set_analytics_panel_opacity(0.46 if enabled else 1.0)
+        self.video_player.set_fullscreen_mode(enabled)
+
+        if enabled:
+            self._float_analytics_panel()
+            self.showFullScreen()
+            self._position_fullscreen_analytics_panel()
+        elif self._video_fullscreen_previous_state & Qt.WindowState.WindowMaximized:
+            self._dock_analytics_panel()
+            self.showMaximized()
+        else:
+            self._dock_analytics_panel()
+            self.showNormal()
+
+    def _float_analytics_panel(self) -> None:
+        if self._analytics_panel_overlay:
+            return
+        self.body_layout.removeWidget(self.analytics_panel)
+        self.body_layout.setStretch(0, 1)
+        self.analytics_panel.setParent(self.central_widget)
+        self.analytics_panel.show()
+        self.analytics_panel.raise_()
+        self._analytics_panel_overlay = True
+
+    def _dock_analytics_panel(self) -> None:
+        if not self._analytics_panel_overlay:
+            self.body_layout.setStretch(0, 6)
+            self.body_layout.setStretch(1, 5)
+            return
+        self.body_layout.addWidget(self.analytics_panel, stretch=5)
+        self.body_layout.setStretch(0, 6)
+        self.body_layout.setStretch(1, 5)
+        self.analytics_panel.show()
+        self._analytics_panel_overlay = False
+
+    def _position_fullscreen_analytics_panel(self) -> None:
+        if not self._analytics_panel_overlay:
+            return
+        bounds = self.central_widget.rect().adjusted(8, 8, -8, -8)
+        if bounds.width() <= 0 or bounds.height() <= 0:
+            return
+        panel_width = min(bounds.width(), max(420, int(bounds.width() * 0.46)))
+        panel_height = min(bounds.height(), max(300, int(bounds.height() * 0.48)))
+        self.analytics_panel.setGeometry(
+            QRect(
+                bounds.right() - panel_width + 1,
+                bounds.bottom() - panel_height + 1,
+                panel_width,
+                panel_height,
+            )
+        )
+        self.analytics_panel.raise_()
+
+    def _set_analytics_panel_opacity(self, opacity: float) -> None:
+        opacity = max(0.0, min(float(opacity), 1.0))
+        if opacity >= 0.999:
+            if self._analytics_opacity_effect is not None:
+                self.analytics_panel.setGraphicsEffect(None)
+                self._analytics_opacity_effect = None
+            return
+        if self._analytics_opacity_effect is None:
+            self._analytics_opacity_effect = QGraphicsOpacityEffect(self.analytics_panel)
+            self.analytics_panel.setGraphicsEffect(self._analytics_opacity_effect)
+        self._analytics_opacity_effect.setOpacity(opacity)
+
     def set_video_state(self, state: str) -> None:
         self.video_player.set_video_state(state)
 
@@ -1662,10 +1814,12 @@ class MainWindow(QMainWindow):
             self.table_data_summary.setRowCount(0)
             self.table_data_details.setRowCount(0)
             self._set_rally_state(None)
+            self._set_ball_speed(None)
             return
         summary = record.get("summary", {})
         details = record.get("details", {})
         self._set_rally_state(summary.get("rally_state") if isinstance(summary, dict) else None)
+        self._set_ball_speed(summary.get("ball_speed") if isinstance(summary, dict) else None)
         self._populate_rally_summary(summary if isinstance(summary, dict) else {})
         self._populate_rally_details(details if isinstance(details, dict) else {})
 
@@ -1678,11 +1832,17 @@ class MainWindow(QMainWindow):
         reliability = summary.get("data_reliability", {})
         if not isinstance(reliability, dict):
             reliability = {}
+        ball_speed = summary.get("ball_speed", {})
+        if not isinstance(ball_speed, dict):
+            ball_speed = {}
 
         rows = [
             ("累计跑动距离", self._fmt_m(top.get("distance_m")), self._fmt_m(bottom.get("distance_m")), self._fmt_m(self._num(top.get("distance_m")) + self._num(bottom.get("distance_m")))),
             ("平均速度", self._fmt_speed(top.get("avg_speed_mps")), self._fmt_speed(bottom.get("avg_speed_mps")), ""),
             ("最大速度", self._fmt_speed(top.get("max_speed_mps")), self._fmt_speed(bottom.get("max_speed_mps")), ""),
+            ("当前球速", "", "", self._fmt_ball_speed(ball_speed, "current_kmh")),
+            ("平均球速", "", "", self._fmt_ball_speed(ball_speed, "avg_kmh")),
+            ("最大球速", "", "", self._fmt_ball_speed(ball_speed, "max_kmh")),
             ("急停次数", str(int(self._num(top.get("stop_count")))), str(int(self._num(bottom.get("stop_count")))), ""),
             ("启动次数", str(int(self._num(top.get("start_count")))), str(int(self._num(bottom.get("start_count")))), ""),
             ("前场击球次数", str(self._zone_count(top, "front")), str(self._zone_count(bottom, "front")), ""),
@@ -1756,6 +1916,16 @@ class MainWindow(QMainWindow):
         }
         self.lbl_rally_state.setText(mapping.get(state_text, "未开始"))
 
+    def _set_ball_speed(self, speed: object | None) -> None:
+        if (
+            not isinstance(speed, dict)
+            or int(self._num(speed.get("samples"))) <= 0
+            or not bool(speed.get("current_valid"))
+        ):
+            self.lbl_ball_speed.setText("-- km/h")
+            return
+        self.lbl_ball_speed.setText(self._fmt_ball_speed(speed, "current_kmh"))
+
     def _zone_count(self, player: dict[str, object], zone: str) -> int:
         zones = player.get("zone_hits", {})
         if not isinstance(zones, dict):
@@ -1781,6 +1951,13 @@ class MainWindow(QMainWindow):
 
     def _fmt_speed(self, value: object) -> str:
         return f"{self._num(value):.2f} m/s"
+
+    def _fmt_ball_speed(self, speed: dict[str, object], key: str) -> str:
+        if int(self._num(speed.get("samples"))) <= 0:
+            return "-- km/h"
+        if key.startswith("current") and not bool(speed.get("current_valid")):
+            return "-- km/h"
+        return f"{self._num(speed.get(key)):.1f} km/h"
 
     def _fmt_percent(self, value: object) -> str:
         return f"{self._num(value) * 100:.1f}%"
@@ -1828,7 +2005,7 @@ class MainWindow(QMainWindow):
         self.lbl_realtime_fps.setText("0.0 FPS")
         self.lbl_rally_state.setText("未开始")
         self.lbl_valid_pose.setText("0.0 FPS")
-        self.lbl_valid_track.setText("0")
+        self.lbl_ball_speed.setText("-- km/h")
         self.set_rally_data(None)
         self.report_preview.load_template()
 
@@ -1871,4 +2048,3 @@ class MainWindow(QMainWindow):
     def _refresh_stroke_total(self) -> None:
         total = self.stroke_total_count()
         self.lbl_stroke_total.setText(f"总击球 {total} 次")
-        self.lbl_valid_track.setText(str(total))

@@ -21,6 +21,18 @@ def _missing(score: float = 0.05) -> TrackResult:
     return TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=score, heatmap_shape=[288, 512])
 
 
+def _court_prediction() -> dict[str, object]:
+    return {
+        "valid": True,
+        "corners": [
+            [300.0, 200.0],
+            [980.0, 200.0],
+            [980.0, 650.0],
+            [300.0, 650.0],
+        ],
+    }
+
+
 class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
     def test_generates_inpaint_mask_for_middle_disappearance(self) -> None:
         mask = generate_tracknet_v3_inpaint_mask(
@@ -46,7 +58,7 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
             [0, 1, 1, 0],
         )
 
-        self.assertEqual(interpolated, [10.0, 10.0, 10.0, 40.0])
+        self.assertEqual(interpolated, [10.0, 20.0, 30.0, 40.0])
 
     def test_keeps_post_hit_direction_change_without_kalman_coast(self) -> None:
         tracker = TrackNetV3TrajectoryFilter(debug_enabled=True)
@@ -83,6 +95,77 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
         self.assertEqual(stable.ball_xy, [136.0, 218.0])
         self.assertEqual(tracker.debug_records[-1]["selected_candidate_index"], 1)
 
+    def test_directional_drift_guard_rejects_single_far_wrong_way_candidate(self) -> None:
+        tracker = TrackNetV3TrajectoryFilter(debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+        tracker.update(_track(100.0, 200.0, 0.80), dt=1.0 / 30.0, frame_shape=frame_shape)
+        tracker.update(_track(112.0, 208.0, 0.78), dt=1.0 / 30.0, frame_shape=frame_shape)
+
+        guarded = tracker.update_candidates(
+            [_track(40.0, 520.0, 0.96)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+        )
+
+        self.assertTrue(guarded.visible)
+        self.assertEqual(guarded.ball_xy, [124.0, 216.0])
+        self.assertEqual(tracker.debug_records[-1]["selected_candidate_index"], -1)
+        self.assertEqual(tracker.debug_records[-1]["reason"], "tracknetv2_short_gap_bridge")
+
+    def test_directional_drift_guard_keeps_likely_upward_impact(self) -> None:
+        tracker = TrackNetV3TrajectoryFilter(debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+        tracker.update(_track(670.0, 360.0, 0.80), dt=1.0 / 30.0, frame_shape=frame_shape)
+        tracker.update(_track(684.0, 492.0, 0.78), dt=1.0 / 30.0, frame_shape=frame_shape)
+
+        impact = tracker.update_candidates(
+            [_track(687.0, 385.0, 0.96)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+        )
+
+        self.assertTrue(impact.visible)
+        self.assertEqual(impact.ball_xy, [687.0, 385.0])
+        self.assertEqual(tracker.debug_records[-1]["selected_candidate_index"], 0)
+        self.assertEqual(tracker.debug_records[-1]["reason"], "tracknet_v3_candidate")
+
+    def test_court_filter_rejects_other_court_candidate(self) -> None:
+        tracker = TrackNetV3TrajectoryFilter(debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+        court = _court_prediction()
+        tracker.update(_track(500.0, 400.0, 0.80), dt=1.0 / 30.0, frame_shape=frame_shape, court_prediction=court)
+        tracker.update(_track(510.0, 410.0, 0.78), dt=1.0 / 30.0, frame_shape=frame_shape, court_prediction=court)
+
+        guarded = tracker.update_candidates(
+            [_track(120.0, 430.0, 0.96)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+            court_prediction=court,
+        )
+
+        self.assertTrue(guarded.visible)
+        self.assertEqual(guarded.ball_xy, [520.0, 420.0])
+        self.assertEqual(tracker.debug_records[-1]["candidate_count"], 0)
+        self.assertEqual(tracker.debug_records[-1]["court_filter_active"], 1)
+        self.assertEqual(tracker.debug_records[-1]["court_filtered_count"], 1)
+        self.assertEqual(tracker.debug_records[-1]["reason"], "tracknetv2_short_gap_bridge")
+
+    def test_court_filter_keeps_high_air_ball_above_current_court(self) -> None:
+        tracker = TrackNetV3TrajectoryFilter(debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+
+        accepted = tracker.update_candidates(
+            [_track(640.0, 40.0, 0.82)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+            court_prediction=_court_prediction(),
+        )
+
+        self.assertTrue(accepted.visible)
+        self.assertEqual(accepted.ball_xy, [640.0, 40.0])
+        self.assertEqual(tracker.debug_records[-1]["court_filtered_count"], 0)
+        self.assertEqual(tracker.debug_records[-1]["reason"], "tracknet_v3_candidate")
+
     def test_can_linearly_repair_missing_span_when_lag_allows_future_endpoint(self) -> None:
         tracker = TrackNetV3TrajectoryFilter(
             TrackNetV3TrajectoryFilterConfig(fps=25.0, fixed_lag_frames=5),
@@ -100,8 +183,32 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
         repaired = tracker.update(_track(80.0, 170.0, 0.8), dt=0.04, frame_shape=frame_shape)
 
         self.assertTrue(repaired.visible)
-        self.assertEqual(repaired.ball_xy, [20.0, 110.0])
+        self.assertEqual(repaired.ball_xy, [30.0, 120.0])
         self.assertEqual(tracker.debug_records[-1]["action"], "inpaint")
+
+    def test_default_short_gap_bridge_uses_recent_velocity_without_latency(self) -> None:
+        tracker = TrackNetV3TrajectoryFilter(debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+        tracker.update(_track(10.0, 100.0, 0.8), dt=1.0 / 30.0, frame_shape=frame_shape)
+        tracker.update(_track(20.0, 110.0, 0.8), dt=1.0 / 30.0, frame_shape=frame_shape)
+
+        bridged = tracker.update(_missing(), dt=1.0 / 30.0, frame_shape=frame_shape)
+
+        self.assertTrue(bridged.visible)
+        self.assertEqual(bridged.ball_xy, [30.0, 120.0])
+        self.assertEqual(tracker.debug_records[-1]["action"], "inpaint")
+        self.assertEqual(tracker.debug_records[-1]["reason"], "tracknetv2_short_gap_bridge")
+
+    def test_short_gap_bridge_does_not_extend_top_exit(self) -> None:
+        tracker = TrackNetV3TrajectoryFilter(debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+        tracker.update(_track(200.0, 60.0, 0.8), dt=1.0 / 30.0, frame_shape=frame_shape)
+        tracker.update(_track(205.0, 30.0, 0.8), dt=1.0 / 30.0, frame_shape=frame_shape)
+
+        missing = tracker.update(_missing(), dt=1.0 / 30.0, frame_shape=frame_shape)
+
+        self.assertFalse(missing.visible)
+        self.assertEqual(tracker.debug_records[-1]["reason"], "missing_or_low_confidence")
 
     def test_can_be_plugged_into_ball_track_filter_interface(self) -> None:
         algorithm = TrackNetV3TrajectoryFilter(debug_enabled=True)

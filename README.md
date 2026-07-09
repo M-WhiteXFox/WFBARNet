@@ -1,146 +1,97 @@
 # WFBARNet
 
-WFBARNet 是一个面向羽毛球视频分析的本地智能分析系统，目标是把比赛、训练或摄像头画面转成可复盘、可量化、可导出的结构化数据。项目围绕“羽毛球、球员、球场”三类目标组织分析流程，提供轨迹跟踪、姿态估计、球场映射、击球事件识别、动作分类、热力图统计和 HTML 报告导出能力。
+WFBARNet 是一款面向羽毛球训练与比赛复盘的本地视频分析工具。你可以把比赛录像、训练片段或摄像头画面导入系统，查看羽毛球轨迹、球员移动、击球事件、场地区域分布和训练报告，帮助教练、运动员和研究者更快整理视频中的关键信息。
 
-这个仓库更偏向“可调试的工程化分析平台”，而不是单一论文复现。它适合做训练复盘、算法验证、批量视频整理和后续模型实验，也保留了桌面 GUI、调试导出和单元测试等工程组件。
+项目可以在本地电脑运行，核心分析不依赖云端服务。本仓库以 [Apache License 2.0](LICENSE) 协议开源。
 
-本仓库以 [Apache License 2.0](LICENSE) 协议开源。
+## 适合谁使用
 
-## 项目亮点
+- 教练：快速查看训练片段，辅助复盘击球、移动和回合表现。
+- 运动员：通过可视化结果了解自己的跑动、落点和回合变化。
+- 教学与科研团队：基于开源项目开展羽毛球视频分析、课程展示或实验验证。
+- 开发者：在现有桌面应用和分析流程上继续扩展功能。
 
-- 本地运行：支持桌面端 PyQt6 图形界面，不依赖在线服务即可完成核心分析。
-- 多模态融合：联合使用球轨迹、人体姿态和球场单应性，避免只看单一视觉分支。
-- 可解释后处理：轨迹修复、击球候选、落点事件和回合统计使用可检查的规则式流程。
-- 可扩展模型接入：当前集成 TrackNetV3 风格轨迹分支、YOLO pose、可选 MMPose、BST 风格时序动作识别。
-- 面向分析输出：支持 JSON、CSV、NPY、调试 CSV、可视化视频和 HTML 报告。
+## 主要能力
 
-## 核心功能
+- 视频分析：导入本地视频后，自动识别羽毛球、球员和球场。
+- 摄像头分析：支持使用摄像头进行实时画面分析。
+- 手动球场标定：当自动识别不够稳定时，可以手动点选四个角完成标定。
+- 实时预览：在桌面界面中查看轨迹、姿态、球场线和统计结果。
+- 数据统计：展示回合状态、击球事件、球速估计、移动距离和区域分布。
+- 热力图：把球员活动和落点分布展示在羽毛球场平面上。
+- 训练报告：导出可浏览的 HTML 报告，便于保存、分享和复盘。
 
-### 1. 羽毛球轨迹跟踪
+## 界面与使用方式
 
-系统使用 TrackNetV3 风格的三帧窗口轨迹模型定位羽毛球，并结合候选点解码、轨迹修复和滤波输出逐帧球点结果。
+启动后会进入桌面图形界面。常见流程如下：
 
-对应实现：
+1. 打开视频、选择摄像头，或进入批量分析。
+2. 根据画面情况手动标定球场，或使用已有标定结果。
+3. 点击开始分析，等待系统识别轨迹、球员和回合事件。
+4. 在右侧面板查看概览、数据、统计、姿态、报告和日志。
+5. 分析结束后导出报告或查看输出文件。
 
-- `src/models/tracknet_v3.py`
-- `src/models/track_branch.py`
-- `src/postprocess/tracknet_v3_filter.py`
-
-### 2. 球员姿态估计
-
-系统默认使用 YOLO pose 后端检测人体框和关键点，也保留了 MMPose 接入能力。姿态结果用于球员身份稳定、脚下位置估计、移动距离统计和 BST 动作识别输入构建。
-
-对应实现：
-
-- `src/models/pose_branch.py`
-- `src/models/yolo_pose_backend.py`
-- `src/models/mmpose_backend.py`
-
-### 3. 球场线检测与单应性映射
-
-系统通过球场线检测或手动四点标定恢复标准羽毛球场模板与图像平面的映射关系，使球点与球员位置可以投影到真实球场坐标系。
-
-对应实现：
-
-- `src/court/`
-- `apps/pyqt6/services/manual_court_calibration_service.py`
-
-### 4. 轨迹事件识别
-
-系统基于轨迹速度、方向、局部极值和可见性变化识别 `hit`、`landing`、`out_of_frame` 等关键事件，作为回合统计和动作识别的上游输入。
-
-对应实现：
-
-- `src/postprocess/trajectory_events.py`
-- `src/postprocess/rally_stats.py`
-
-### 5. BST 动作识别
-
-当本地提供 BST 权重时，系统会围绕击球事件截取时序片段，组合人体姿态、羽毛球位置和球员场地位置进行动作分类。没有 BST 权重时，其余分析流程仍可独立运行。
-
-对应实现：
-
-- `src/models/bst_model.py`
-- `src/models/bst_runtime.py`
-- `src/models/bst_stroke_runtime.py`
-- `src/builders/bst_input_adapter.py`
-
-### 6. 可视化与报告输出
-
-项目包含桌面 GUI、回合统计面板、球场热力图、日志区、HTML 报告生成和结构化结果导出。
-
-对应实现：
-
-- `apps/pyqt6/`
-- `src/utils/user_report.py`
-- `src/utils/report_generation.py`
-- `src/utils/exporters.py`
-
-## 项目结构
-
-```text
-WFBARNet/
-├─ apps/pyqt6/                # PyQt6 桌面应用
-├─ assets/report_template/    # 可跟踪的 HTML 报告模板和最小静态资源
-├─ configs/                   # 运行配置示例
-├─ src/
-│  ├─ builders/               # BST 输入构造
-│  ├─ court/                  # 球场检测与单应性
-│  ├─ models/                 # 轨迹、姿态、BST 等模型封装
-│  ├─ postprocess/            # 轨迹修复、事件识别、统计
-│  ├─ preprocess/             # 输入预处理
-│  ├─ runners/                # 视频/实时/统一推理入口
-│  └─ utils/                  # 导出、报告、可视化、设备工具
-├─ tests/                     # 单元测试
-├─ tools/                     # demo、导出、实验脚本
-├─ assets/weights/            # 本地权重放置目录
-└─ main.py                    # 默认入口
-```
+如果模型权重齐全，系统会提供完整分析能力；如果缺少部分可选权重，界面仍可启动，并会在开始分析时提示缺失内容。
 
 ## 快速开始
 
-### 环境准备
+推荐使用 Conda 创建独立环境：
 
-推荐环境：
+```powershell
+conda env create -f environments.yml
+conda activate WFBARNet
+```
 
-- Python `3.10`
-- Windows + CUDA GPU 更适合桌面实时分析
-- CPU 也可运行，但实时性会明显下降
-
-安装依赖：
+如果你已经准备好 Python 3.10 环境，也可以直接安装依赖：
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-如果你需要 MMPose、TensorRT 或其他扩展后端，请按本地 CUDA/驱动环境单独安装对应依赖。
-
-### 模型权重
-
-项目默认从以下目录读取权重：
-
-- `assets/weights/track/`
-- `assets/weights/pose/`
-- `assets/weights/bst/`
-- `assets/weights/ShuttleCourtNet/`
-
-当前仓库中的权重组织方式可参考 [assets/weights/README.md](assets/weights/README.md)。
-
-权重文件默认不随仓库发布，也不会在启动时自动下载。新 clone 环境即使没有权重也可以打开 GUI；当点击视频、摄像头或批量分析时，程序会按当前开关懒加载所需模型。如果启用了某个模型但对应路径不存在，本次分析会停止并在日志和状态栏提示具体缺失路径。BST 权重仍是可选项，缺失时只跳过动作分类，不影响基础轨迹、姿态和报告流程。
-
-### 启动图形界面
-
-默认启动桌面应用：
+启动桌面应用：
 
 ```powershell
 python main.py
 ```
 
-`main.py` 在 `source` 为空时会直接进入 PyQt6 图形界面。
+推荐运行环境：
 
-### 命令行推理
+- Python 3.10
+- Windows
+- 支持 CUDA 的 NVIDIA 显卡
 
-`main.py` 也可以读取 `configs/default_infer.json` 执行一次性推理。命令行参数会覆盖配置文件，未知配置字段会被保留在运行配置的 `extra` 中但不影响当前推理。
+CPU 也可以启动和运行部分流程，但视频分析速度会明显下降。
+
+## 模型权重
+
+模型权重默认放在 `assets/weights/` 目录下：
+
+```text
+assets/weights/
+├─ track/
+├─ pose/
+├─ bst/
+└─ ShuttleCourtNet/
+```
+
+权重文件通常体积较大，默认不随仓库一起发布，也不会在启动时自动下载。请根据自己的使用场景，把对应模型文件放到上述目录。
+
+更多说明见 [assets/weights/README.md](assets/weights/README.md)。
+
+## 输出内容
+
+分析后常见输出包括：
+
+- 可视化视频：叠加轨迹、球场线或姿态结果的视频。
+- 结构化数据：JSON、CSV、NPY 等文件，便于进一步整理或统计。
+- 调试日志：用于排查某段视频为什么识别不稳定。
+- HTML 报告：包含关键指标、事件摘要、热力图和训练建议。
+
+默认输出目录通常位于 `outputs/`，报告模板位于 [assets/report_template](assets/report_template)。
+
+## 命令行分析
+
+除了桌面界面，也可以通过命令行执行一次性分析：
 
 ```powershell
 python main.py --config configs/default_infer.json --source .\demo.mp4 --pipeline unified --output-dir outputs/run --device auto
@@ -148,100 +99,56 @@ python main.py --config configs/default_infer.json --source .\demo.mp4 --pipelin
 
 常用参数：
 
-- `--source`：视频、摄像头索引或输入源；为空时进入 GUI。
-- `--pipeline`：`track_only`、`pose_only`、`track_realtime` 或 `unified`。
-- `--pose-weight` / `--track-weight`：覆盖配置中的模型权重路径。
-- `--no-vis`：关闭可视化视频导出。
+- `--source`：输入视频路径或摄像头编号；为空时进入桌面界面。
+- `--output-dir`：输出目录。
+- `--device`：运行设备，可使用 `auto` 让程序自动选择。
+- `--no-vis`：不导出可视化视频，只保留数据结果。
 
-### 运行测试
+多数用户建议优先使用桌面界面；命令行更适合批量处理或自动化流程。
 
-```powershell
-pytest
+## 常见问题
+
+**启动后没有立刻报错，但分析开始失败怎么办？**
+
+通常是缺少某个模型权重。请查看界面日志或状态栏提示，并确认 `assets/weights/` 下的文件路径是否正确。
+
+**一定需要 GPU 吗？**
+
+不一定。CPU 可以运行，但视频分析速度会比较慢。实时分析和较长视频更推荐使用 NVIDIA GPU。
+
+**BST 权重缺失会影响使用吗？**
+
+不会影响基础轨迹、姿态、球场和报告流程。缺少 BST 权重时，只会跳过击球动作类型分类。
+
+**为什么需要手动标定球场？**
+
+不同场馆的机位、光照和遮挡差异很大。手动标定可以帮助系统更准确地把画面位置对应到标准羽毛球场。
+
+## 项目结构
+
+```text
+WFBARNet/
+├─ apps/pyqt6/              # 桌面应用
+├─ assets/                  # 权重、模板和文档资源
+├─ configs/                 # 运行配置
+├─ src/                     # 核心分析代码
+├─ tests/                   # 测试用例
+├─ tools/                   # 演示、导出和辅助脚本
+├─ outputs/                 # 默认输出目录
+└─ main.py                  # 启动入口
 ```
 
-## 典型工作流
+## 鸣谢
 
-### 1. 桌面端视频分析
+本项目的开发过程中使用、修改或参考了以下优秀的开源项目，在此向相关项目的作者及贡献者表示感谢：
 
-```powershell
-python main.py
-```
-
-适合：
-
-- 手动选择视频
-- 预览轨迹、姿态、球场叠加
-- 查看统计、日志和报告
-- 手动标定球场
-
-### 2. 独立 Demo 与排查脚本
-
-常用脚本位于 `tools/demo/`：
-
-- `run_track_only.py`
-- `run_pose_only.py`
-- `run_unified_infer.py`
-- `run_tracknet_realtime.py`
-- `run_court_keypoints_yolo.py`
-
-说明文档见 [tools/demo/README.md](tools/demo/README.md)。
-
-### 3. 导出 TrackNet TensorRT Engine
-
-```powershell
-python tools/export_tracknetv3_int8_engine.py --help
-```
-
-该脚本用于把本地 TrackNet 权重导出为 ONNX / TensorRT 相关产物，适合部署或性能实验。
-
-## 上游参考仓库
-
-WFBARNet 不是以下项目的官方仓库，但当前工程实现明显参考或集成了它们的思路，公开仓库时建议一并说明来源：
-
-### TrackNetV3
-
-- 仓库：`qaz812345/TrackNetV3`
-- 链接：https://github.com/qaz812345/TrackNetV3
-
-当前仓库中的对应位置：
-
-- `src/models/tracknet_v3.py`
-- `src/postprocess/tracknet_v3_filter.py`
-- `tools/export_tracknetv3_int8_engine.py`
-
-说明：
-
-- 本项目实现的是 TrackNetV3 风格轨迹分支与后处理集成版本。
-- 当前工程还加入了自己的轨迹修复、候选筛选、导出和 GUI 分析链路。
-
-### BST
-
-- 仓库：`Va6lue/BST-Badminton-Stroke-type-Transformer`
-- 链接：https://github.com/Va6lue/BST-Badminton-Stroke-type-Transformer
-
-当前仓库中的对应位置：
-
-- `src/models/bst_model.py`
-- `src/models/bst_runtime.py`
-- `src/models/bst_stroke_runtime.py`
-- `src/builders/bst_input_adapter.py`
-
-说明：
-
-- 当前仓库提供 BST 风格动作识别模型封装和推理接入。
-- 系统可在击球事件附近构建时序输入，并把分类结果并入回合统计与报告。
-
-## 输出结果
-
-项目常见输出包括：
-
-- `outputs/run/` 下的 JSON、CSV、NPY 和可视化视频
-- 调试 CSV 与逐帧事件日志
-- `assets/dist/` 或用户报告目录下的 HTML 报告
-- BST 输入导出，如 `bst_input.npy`
-
-报告生成使用 [assets/report_template](assets/report_template) 作为稳定模板来源，运行时生成的 `assets/dist/index.html` 仍是本地输出目录，不需要提交到仓库。
+- [TrackNetV3](https://github.com/qaz812345/TrackNetV3)：羽毛球轨迹识别。
+- [Ultralytics](https://github.com/ultralytics/ultralytics)：YOLO 姿态识别。
+- [TrackNetV3 INT8 Optimization](https://github.com/nickluo/TrackNetV3)：TrackNetV3 INT8 优化。
+- [BST Badminton Stroke Type Transformer](https://github.com/Va6lue/BST-Badminton-Stroke-type-Transformer)：击球动作类型识别。
 
 ## 开源协议
 
 本仓库采用 **Apache License 2.0** 协议开源，完整文本见 [LICENSE](LICENSE)。
+
+本项目所使用、引用或修改的第三方软件、模型及代码仍遵循其各自的原始许可证。使用者在使用本项目时，应同时遵守相关第三方项目的许可证要求。

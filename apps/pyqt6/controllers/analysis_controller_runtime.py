@@ -220,10 +220,12 @@ def project_player_points_to_court(
     return projected
 
 
-def project_ball_to_court(
+def project_ball_visual_intersection(
     track: TrackResult,
     court_prediction: object | None,
 ) -> tuple[float, float] | None:
+    # This is the image ray's apparent intersection with the court plane,
+    # not the shuttlecock's physical ground position while it is airborne.
     if not bool(getattr(track, "visible", 0)):
         return None
     h = extract_image_to_court_h(court_prediction)
@@ -693,18 +695,19 @@ class TrackNetPlaybackWorker(QThread):
                     else:
                         distance_accumulator.reset_tracking_points()
                         player_distances_m = distance_accumulator.totals_m()
-                    ball_projection = project_ball_to_court(track, court_prediction)
+                    ball_visual_intersection = project_ball_visual_intersection(track, court_prediction)
                     rally_stats.update_frame(
                         timestamp_ms=current_ms,
                         player_points=player_points,
                         ball_visible=bool(track.visible),
                         ball_xy=track.ball_xy,
+                        ball_court_xy=ball_visual_intersection,
                         ball_score=float(track.score),
                         court_valid=bool(prediction_value(court_prediction, "valid", False))
                         if court_prediction is not None
                         else False,
                     )
-                    rally_stats.add_trajectory_event(trajectory_event, ball_court_xy=ball_projection)
+                    rally_stats.add_trajectory_event(trajectory_event)
                     for prediction in pending_bst_predictions:
                         rally_stats.add_bst_prediction(prediction)
                     rally_record = rally_stats.export_record()
@@ -729,7 +732,8 @@ class TrackNetPlaybackWorker(QThread):
                             "processed_frames": processed_frames,
                             "infer_fps": ema_infer_fps,
                             "court": court_prediction.to_dict() if court_prediction is not None else None,
-                            "ball_projection": ball_projection,
+                            "ball_projection": ball_visual_intersection,
+                            "ball_visual_intersection": ball_visual_intersection,
                             "player_projections": player_projections,
                             "player_distances_m": player_distances_m,
                             "rally_record": rally_record,
@@ -1009,12 +1013,13 @@ class CameraInferenceWorker(QThread):
                     else:
                         distance_accumulator.reset_tracking_points()
                         player_distances_m = distance_accumulator.totals_m()
-                    ball_projection = project_ball_to_court(track, court_prediction)
+                    ball_visual_intersection = project_ball_visual_intersection(track, court_prediction)
                     rally_stats.update_frame(
                         timestamp_ms=position_ms,
                         player_points=player_points,
                         ball_visible=bool(track.visible),
                         ball_xy=track.ball_xy,
+                        ball_court_xy=ball_visual_intersection,
                         ball_score=float(track.score),
                         court_valid=bool(prediction_value(court_prediction, "valid", False))
                         if court_prediction is not None
@@ -1079,7 +1084,7 @@ class CameraInferenceWorker(QThread):
                             if bst_prediction is not None:
                                 pending_bst_predictions.append(bst_prediction)
 
-                    rally_stats.add_trajectory_event(trajectory_event, ball_court_xy=ball_projection)
+                    rally_stats.add_trajectory_event(trajectory_event)
                     for prediction in pending_bst_predictions:
                         rally_stats.add_bst_prediction(prediction)
                     rally_record = rally_stats.export_record()
@@ -1103,7 +1108,8 @@ class CameraInferenceWorker(QThread):
                             "processed_frames": processed_frames,
                             "infer_fps": ema_infer_fps,
                             "court": court_prediction.to_dict() if court_prediction is not None else None,
-                            "ball_projection": ball_projection,
+                            "ball_projection": ball_visual_intersection,
+                            "ball_visual_intersection": ball_visual_intersection,
                             "player_projections": player_projections,
                             "player_distances_m": player_distances_m,
                             "rally_record": rally_record,
@@ -1399,12 +1405,13 @@ class BatchInferenceWorker(QThread):
                         distance_accumulator.update(player_points)
                     else:
                         distance_accumulator.reset_tracking_points()
-                    ball_projection = project_ball_to_court(track, court_prediction)
+                    ball_visual_intersection = project_ball_visual_intersection(track, court_prediction)
                     rally_stats.update_frame(
                         timestamp_ms=current_ms,
                         player_points=player_points,
                         ball_visible=bool(track.visible),
                         ball_xy=track.ball_xy,
+                        ball_court_xy=ball_visual_intersection,
                         ball_score=float(track.score),
                         court_valid=bool(prediction_value(court_prediction, "valid", False)),
                     )
@@ -1420,7 +1427,7 @@ class BatchInferenceWorker(QThread):
                         if isinstance(trajectory_event, dict) and trajectory_event.get("event_type") == "hit"
                         else None
                     )
-                    rally_stats.add_trajectory_event(trajectory_event, ball_court_xy=ball_projection)
+                    rally_stats.add_trajectory_event(trajectory_event)
 
                     if bst_recognizer is not None:
                         try:
@@ -2651,12 +2658,16 @@ class MainController:
 
         image = payload.get("image")
         if isinstance(image, QImage):
+            ball_visual_intersection = payload.get(
+                "ball_visual_intersection",
+                payload.get("ball_projection"),
+            )
             self.view.show_video_frame(
                 image,
                 int(payload.get("position_ms", 0)),
                 int(payload.get("duration_ms", 0)),
                 payload.get("court"),
-                payload.get("ball_projection"),
+                ball_visual_intersection,
                 payload.get("player_projections"),
             )
             self.view.set_player_distances(payload.get("player_distances_m"))
@@ -2681,7 +2692,6 @@ class MainController:
             court_text = f" | Court {float(court.get('confidence', 0.0)):.2f}"
 
         self.view.lbl_valid_pose.setText(f"{infer_fps:.1f} FPS")
-        self.view.lbl_valid_track.setText(str(self.view.stroke_total_count()))
         self.view.lbl_realtime_fps.setText(f"{self._display_fps_ema:.1f} FPS")
         self.view.status_label.setText(
             f"系统状态：TrackNet + YOLO26s-Pose 运行中 | 人数 {person_count} | Score {current_score:.2f}{court_text}"
@@ -2693,8 +2703,12 @@ class MainController:
 
         image = payload.get("image")
         if isinstance(image, QImage):
+            ball_visual_intersection = payload.get(
+                "ball_visual_intersection",
+                payload.get("ball_projection"),
+            )
             self.view.video_player.display_image(image, court=payload.get("court"))
-            self.view.court_widget.set_ball_projection(payload.get("ball_projection"))
+            self.view.court_widget.set_ball_projection(ball_visual_intersection)
             self.view.court_widget.set_player_projections(payload.get("player_projections"))
             self.view.set_player_distances(payload.get("player_distances_m"))
             self._update_display_fps()
@@ -2715,7 +2729,6 @@ class MainController:
             court_text = f" | Court {float(court.get('confidence', 0.0)):.2f}"
 
         self.view.lbl_valid_pose.setText(f"{infer_fps:.1f} FPS")
-        self.view.lbl_valid_track.setText(str(self.view.stroke_total_count()))
         self.view.lbl_realtime_fps.setText(f"{self._display_fps_ema:.1f} FPS")
         self.view.status_label.setText(
             f"系统状态：摄像头 TrackNet + YOLO26s-Pose 推理中 | 人数 {person_count} | Score {current_score:.2f}{court_text}"

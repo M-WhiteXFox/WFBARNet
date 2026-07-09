@@ -117,6 +117,7 @@ desktop.ini
 
 # Local packaged app outputs and template scratch assets
 assets/temp/
+tools/
+assets/docs/
 
-AGENTS.md
 AgentPlan.md

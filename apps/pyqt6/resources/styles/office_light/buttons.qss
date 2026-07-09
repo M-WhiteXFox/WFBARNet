@@ -29,6 +29,7 @@ QPushButton#btnAnalyze,
 QPushButton#btnReset,
 QPushButton#btnSelectVideo,
 QPushButton#btnForceStop,
+QPushButton#btnFullscreen,
 QPushButton#btnPreviewMode,
 QPushButton#btnCameraMode,
 QPushButton#btnBatchMode,
@@ -105,6 +106,19 @@ QPushButton#btnSelectVideo {
     min-width: 60px;
     background-color: #FFFFFF;
     color: #217346;
+}
+
+QPushButton#btnFullscreen {
+    min-width: 72px;
+    color: #217346;
+    background-color: #FFFFFF;
+    border-color: #525252;
+}
+
+QPushButton#btnFullscreen:checked {
+    color: #FFFFFF;
+    background-color: #217346;
+    border-color: #217346;
 }
 
 /* --- 强制停止（危险色调） --- */

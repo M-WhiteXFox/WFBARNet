@@ -5,7 +5,14 @@ from dataclasses import dataclass
 from math import hypot, isfinite
 from typing import Any, Sequence
 
-from src.postprocess.track_filter import BallTrackFilter, FrameShape, PersonBBoxes
+from src.postprocess.track_filter import (
+    BallTrackFilter,
+    FrameShape,
+    PersonBBoxes,
+    _extract_court_filter,
+    _point_inside_court_plane,
+    _point_inside_projected_court_air,
+)
 from src.utils.structures import TrackResult
 
 
@@ -15,7 +22,7 @@ FrameSize = tuple[float, float]
 
 @dataclass(slots=True)
 class TrackNetV3TrajectoryFilterConfig:
-    fps: float = 25.0
+    fps: float = 30.0
     candidate_min_confidence: float = 0.35
     motion_consistency_enabled: bool = True
     motion_consistency_gate_px: float = 96.0
@@ -26,6 +33,22 @@ class TrackNetV3TrajectoryFilterConfig:
     inpaint_score: float = 0.35
     fixed_lag_frames: int = 0
     buffer_frames: int = 64
+    court_filter_enabled: bool = True
+    court_filter_margin_cm: float = 120.0
+    court_filter_margin_px: float = 72.0
+    court_air_extension_ratio: float = 1.0
+    causal_bridge_enabled: bool = True
+    causal_bridge_frames: int = 4
+    causal_bridge_score: float = 0.30
+    drift_guard_enabled: bool = True
+    drift_guard_min_history_speed_px: float = 8.0
+    drift_guard_min_jump_px: float = 48.0
+    drift_guard_direction_gate_scale: float = 1.0
+    drift_guard_hard_gate_scale: float = 2.5
+    drift_guard_opposite_cosine: float = -0.15
+    drift_guard_upward_impact_px: float = 40.0
+    drift_guard_top_band_ratio: float = 0.08
+    drift_guard_top_band_px: float = 58.0
 
 
 @dataclass(slots=True)
@@ -109,12 +132,15 @@ class TrackNetV3TrajectoryFilter:
         court_prediction: Any | None = None,
         person_bboxes: PersonBBoxes = None,
     ) -> TrackResult:
-        del court_prediction, person_bboxes
+        del person_bboxes
         self._frame_index += 1
         step_dt = self._resolve_dt(dt)
         frame_size = _frame_size(frame_shape)
+        court_filter = _extract_court_filter(court_prediction) if self.config.court_filter_enabled else None
         candidates = self._valid_candidates(tracks, frame_size)
-        selected = self._select_candidate(candidates)
+        candidate_count_before_court = len(candidates)
+        candidates = self._filter_candidates_by_court(candidates, frame_size, court_filter)
+        selected = self._select_candidate(candidates, frame_size)
         raw_track = selected.track if selected is not None else self._invisible(score=_max_score(tracks))
         last_visible_before = self._last_visible_point
         if selected is None:
@@ -130,6 +156,7 @@ class TrackNetV3TrajectoryFilter:
         )
         self._buffer.append(sample)
         self._apply_tracknet_v3_repair(frame_size)
+        self._apply_causal_bridge(sample, frame_size)
         emitted, source_offset, emitted_inpaint_mask = self._emit(sample)
 
         action, reason = self._action_reason(selected, emitted, source_offset, emitted_inpaint_mask)
@@ -142,6 +169,8 @@ class TrackNetV3TrajectoryFilter:
             frame_size=frame_size,
             raw_candidate_count=len(tracks),
             candidate_count=len(candidates),
+            court_filter_active=court_filter is not None,
+            court_filtered_count=max(0, candidate_count_before_court - len(candidates)),
             candidates=candidates,
             selected=selected,
             source_offset=source_offset,
@@ -177,12 +206,51 @@ class TrackNetV3TrajectoryFilter:
             candidates.append(_Candidate(track=track, index=index, point=point, score=score))
         return candidates
 
-    def _select_candidate(self, candidates: Sequence[_Candidate]) -> _Candidate | None:
+    def _filter_candidates_by_court(
+        self,
+        candidates: Sequence[_Candidate],
+        frame_size: FrameSize | None,
+        court_filter: object | None,
+    ) -> list[_Candidate]:
+        if court_filter is None:
+            return list(candidates)
+        return [
+            candidate
+            for candidate in candidates
+            if self._point_inside_court_region(candidate.point, court_filter, frame_size)
+        ]
+
+    def _point_inside_court_region(
+        self,
+        point: Point,
+        court_filter: object,
+        frame_size: FrameSize | None,
+    ) -> bool:
+        corners = getattr(court_filter, "corners", None)
+        if corners is not None:
+            return _point_inside_projected_court_air(
+                point,
+                corners,
+                margin_px=self.config.court_filter_margin_px,
+                air_extension_ratio=self.config.court_air_extension_ratio,
+                frame_size=frame_size,
+            )
+
+        image_to_court_h = getattr(court_filter, "image_to_court_h", None)
+        if image_to_court_h is None:
+            return False
+        return _point_inside_court_plane(point, image_to_court_h, self.config.court_filter_margin_cm)
+
+    def _select_candidate(
+        self,
+        candidates: Sequence[_Candidate],
+        frame_size: FrameSize | None,
+    ) -> _Candidate | None:
         if not candidates:
             return None
 
         primary = max(candidates, key=lambda item: (item.score, -item.index))
-        if len(candidates) <= 1 or not self.config.motion_consistency_enabled:
+        if not self.config.motion_consistency_enabled:
             return primary
 
         prediction = self._predict_next_visible_point()
@@ -190,18 +258,57 @@ class TrackNetV3TrajectoryFilter:
             return primary
 
         gate = self._motion_consistency_gate()
-        stable_candidates = [
-            candidate
-            for candidate in candidates
-            if _distance(candidate.point, prediction) <= gate
-        ]
+        stable_candidates = [candidate for candidate in candidates if _distance(candidate.point, prediction) <= gate]
         if not stable_candidates:
+            if self._candidate_looks_like_drift(primary, prediction, gate, frame_size):
+                return None
             return primary
 
         return max(
             stable_candidates,
             key=lambda item: self._motion_consistency_rank(item, prediction),
         )
+
+    def _candidate_looks_like_drift(
+        self,
+        candidate: _Candidate,
+        prediction: Point,
+        gate: float,
+        frame_size: FrameSize | None,
+    ) -> bool:
+        if not self.config.drift_guard_enabled:
+            return False
+        if self._missing_frames > 0:
+            return False
+
+        motion = self._recent_visible_motion()
+        if motion is None:
+            return False
+        last_point, velocity, recent_speed = motion
+        if recent_speed < max(0.0, float(self.config.drift_guard_min_history_speed_px)):
+            return False
+
+        displacement = (
+            candidate.point[0] - last_point[0],
+            candidate.point[1] - last_point[1],
+        )
+        displacement_length = _length(displacement)
+        min_jump = max(0.0, float(self.config.drift_guard_min_jump_px))
+        if displacement_length < min_jump:
+            return False
+
+        prediction_error = _distance(candidate.point, prediction)
+        direction_gate = max(gate * max(0.0, float(self.config.drift_guard_direction_gate_scale)), min_jump)
+        if prediction_error <= direction_gate:
+            return False
+        if self._drift_guard_near_top(last_point, candidate.point, prediction, frame_size):
+            return False
+        if displacement[1] <= -max(0.0, float(self.config.drift_guard_upward_impact_px)):
+            return False
+
+        cosine = _dot(displacement, velocity) / max(displacement_length * recent_speed, 1e-6)
+        hard_gate = max(gate * max(0.0, float(self.config.drift_guard_hard_gate_scale)), min_jump * 2.0)
+        return prediction_error >= hard_gate or cosine <= float(self.config.drift_guard_opposite_cosine)
 
     def _predict_next_visible_point(self) -> Point | None:
         visible_samples: list[_BufferedTrack] = []
@@ -240,6 +347,10 @@ class TrackNetV3TrajectoryFilter:
         )
 
     def _recent_visible_speed_px_per_frame(self) -> float:
+        motion = self._recent_visible_motion()
+        return motion[2] if motion is not None else 0.0
+
+    def _recent_visible_motion(self) -> tuple[Point, Point, float] | None:
         visible_samples: list[_BufferedTrack] = []
         for sample in reversed(self._buffer):
             if sample.raw.visible and _track_point(sample.raw) is not None:
@@ -247,17 +358,34 @@ class TrackNetV3TrajectoryFilter:
                 if len(visible_samples) >= 2:
                     break
         if len(visible_samples) < 2:
-            return 0.0
+            return None
 
         last = visible_samples[0]
         previous = visible_samples[1]
         last_point = _track_point(last.raw)
         previous_point = _track_point(previous.raw)
         if last_point is None or previous_point is None:
-            return 0.0
+            return None
 
         frame_gap = max(1, last.frame_index - previous.frame_index)
-        return _distance(last_point, previous_point) / float(frame_gap)
+        velocity = (
+            (last_point[0] - previous_point[0]) / float(frame_gap),
+            (last_point[1] - previous_point[1]) / float(frame_gap),
+        )
+        return last_point, velocity, _length(velocity)
+
+    def _drift_guard_near_top(
+        self,
+        last_point: Point,
+        candidate: Point,
+        prediction: Point,
+        frame_size: FrameSize | None,
+    ) -> bool:
+        top_band = max(0.0, float(self.config.drift_guard_top_band_px))
+        if frame_size is not None:
+            _, height = frame_size
+            top_band = max(top_band, height * max(0.0, float(self.config.drift_guard_top_band_ratio)))
+        return min(last_point[1], candidate[1], prediction[1]) <= top_band
 
     def _motion_consistency_rank(self, candidate: _Candidate, prediction: Point) -> tuple[float, float, int]:
         distance = _distance(candidate.point, prediction)
@@ -326,6 +454,57 @@ class TrackNetV3TrajectoryFilter:
                 break
         return max(0.0, min(scores)), heatmap_shape
 
+    def _apply_causal_bridge(self, sample: _BufferedTrack, frame_size: FrameSize | None) -> None:
+        if not self.config.causal_bridge_enabled:
+            return
+        if int(self.config.fixed_lag_frames) > 0:
+            return
+        if sample.raw.visible or sample.repaired.visible:
+            return
+        if self._missing_frames <= 0 or self._missing_frames > max(0, int(self.config.causal_bridge_frames)):
+            return
+
+        prediction = self._predict_next_visible_point()
+        if prediction is None:
+            return
+        if frame_size is not None and not _point_inside_frame(prediction, frame_size):
+            return
+        if self._causal_bridge_top_exit_likely(prediction, frame_size):
+            return
+
+        sample.inpaint_mask = 2
+        sample.repaired = TrackResult(
+            ball_xy=[float(prediction[0]), float(prediction[1])],
+            visible=1,
+            score=max(0.0, min(float(self.config.causal_bridge_score), 1.0)),
+            heatmap_shape=list(sample.raw.heatmap_shape),
+        )
+
+    def _causal_bridge_top_exit_likely(self, prediction: Point, frame_size: FrameSize | None) -> bool:
+        visible_samples: list[_BufferedTrack] = []
+        for sample in reversed(self._buffer):
+            if sample.raw.visible and _track_point(sample.raw) is not None:
+                visible_samples.append(sample)
+                if len(visible_samples) >= 2:
+                    break
+        if not visible_samples:
+            return False
+
+        last_point = _track_point(visible_samples[0].raw)
+        if last_point is None:
+            return False
+        top_threshold = self._inpaint_height_threshold(frame_size)
+        if last_point[1] <= top_threshold:
+            return True
+
+        if len(visible_samples) < 2:
+            return False
+        previous_point = _track_point(visible_samples[1].raw)
+        if previous_point is None:
+            return False
+        moving_up = last_point[1] < previous_point[1]
+        return moving_up and prediction[1] <= top_threshold
+
     def _emit(self, current_sample: _BufferedTrack) -> tuple[TrackResult, int, int]:
         lag = max(0, int(self.config.fixed_lag_frames))
         if lag <= 0 or len(self._buffer) <= lag:
@@ -353,6 +532,8 @@ class TrackNetV3TrajectoryFilter:
         emitted_inpaint_mask: int,
     ) -> tuple[str, str]:
         if emitted.visible and emitted_inpaint_mask:
+            if emitted_inpaint_mask == 2:
+                return "inpaint", "tracknetv2_short_gap_bridge"
             return "inpaint", "tracknet_v3_linear_inpaint"
         if emitted.visible and source_offset > 0:
             return "accept", "tracknet_v3_lag_emit"
@@ -371,6 +552,8 @@ class TrackNetV3TrajectoryFilter:
         frame_size: FrameSize | None,
         raw_candidate_count: int,
         candidate_count: int,
+        court_filter_active: bool,
+        court_filtered_count: int,
         candidates: Sequence[_Candidate],
         selected: _Candidate | None,
         source_offset: int,
@@ -391,6 +574,8 @@ class TrackNetV3TrajectoryFilter:
             "reason": reason,
             "raw_candidate_count": raw_candidate_count,
             "candidate_count": candidate_count,
+            "court_filter_active": int(bool(court_filter_active)),
+            "court_filtered_count": int(court_filtered_count),
             "selected_candidate_index": selected.index if selected is not None else -1,
             "selected_candidate_rank": f"{selected.score:.4f}" if selected is not None else "",
             "input_visible": int(bool(input_track.visible)) if input_track is not None else 0,
@@ -448,7 +633,7 @@ def create_tracknet_v3_ball_track_filter(
     *,
     fps: float | None = None,
     debug_enabled: bool = False,
-    fixed_lag_frames: int | None = 0,
+    fixed_lag_frames: int | None = None,
 ) -> BallTrackFilter:
     resolved_fps = float(fps) if fps is not None and fps > 0 else TrackNetV3TrajectoryFilterConfig.fps
     return BallTrackFilter(
@@ -502,32 +687,37 @@ def linear_interpolate_masked_values(target: Sequence[float], inpaint_mask: Sequ
     values = [float(value) for value in target]
     mask = [int(value) for value in inpaint_mask]
     i = 0
-    j = 0
-    while j < len(mask):
-        while i < len(mask) - 1 and mask[i] == 0:
+    while i < len(mask):
+        if mask[i] == 0:
             i += 1
-        j = i
-        while j < len(mask) - 1 and mask[j] == 1:
-            j += 1
-        if j == i:
-            break
-        x_count = j - i
-        if i == 0:
-            left = values[j]
-            right = values[j]
-        elif j == len(mask) - 1:
-            left = values[i - 1]
-            right = values[i - 1]
-        else:
-            left = values[i - 1]
-            right = values[j]
-        if x_count == 1:
-            values[i] = left
-        else:
-            for offset, index in enumerate(range(i, j)):
-                alpha = offset / float(x_count - 1)
-                values[index] = left * (1.0 - alpha) + right * alpha
-        i = j
+            continue
+
+        start = i
+        while i < len(mask) and mask[i] == 1:
+            i += 1
+        end = i
+
+        left_index = start - 1 if start > 0 else None
+        right_index = end if end < len(mask) else None
+        if left_index is None and right_index is None:
+            continue
+        if left_index is None:
+            fill = values[right_index]
+            for index in range(start, end):
+                values[index] = fill
+            continue
+        if right_index is None:
+            fill = values[left_index]
+            for index in range(start, end):
+                values[index] = fill
+            continue
+
+        left = values[left_index]
+        right = values[right_index]
+        span = end - start
+        for offset, index in enumerate(range(start, end)):
+            alpha = float(offset + 1) / float(span + 1)
+            values[index] = left * (1.0 - alpha) + right * alpha
     return values
 
 
@@ -586,6 +776,14 @@ def _point_inside_frame(point: Point, frame_size: FrameSize) -> bool:
 
 def _distance(a: Point, b: Point) -> float:
     return hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _length(vector: Point) -> float:
+    return hypot(vector[0], vector[1])
+
+
+def _dot(a: Point, b: Point) -> float:
+    return a[0] * b[0] + a[1] * b[1]
 
 
 def _near_edge(point: Point, frame_size: FrameSize) -> bool:
