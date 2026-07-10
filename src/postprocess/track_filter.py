@@ -223,6 +223,8 @@ class BallTrackFilter:
         self._last_debug_record: dict[str, object] | None = None
         self._pending_candidate_debug: dict[str, object] | None = None
         self._raw_candidate_count = 0
+        self._court_filter_active = False
+        self._court_filtered_count = 0
         self._static_filtered_count = 0
         self._static_hotspot_count = 0
         self._decision_action = "unknown"
@@ -256,6 +258,8 @@ class BallTrackFilter:
         self._last_debug_record = None
         self._pending_candidate_debug = None
         self._raw_candidate_count = 0
+        self._court_filter_active = False
+        self._court_filtered_count = 0
         self._static_filtered_count = 0
         self._static_hotspot_count = 0
         self._decision_action = "unknown"
@@ -402,8 +406,18 @@ class BallTrackFilter:
         frame_size = self._resolve_frame_size(frame_shape)
         court_filter = self._court_filter(court_prediction)
         normalized_person_bboxes = self._normalize_person_bboxes(person_bboxes, frame_size)
-        tracks = self._filter_candidates_by_court(tracks, frame_size, court_filter)
-        self._raw_candidate_count = len(tracks)
+        self._raw_candidate_count = sum(
+            self._raw_measurement(track, frame_size) is not None
+            for track in tracks
+        )
+        self._court_filter_active = court_filter is not None
+        filtered_tracks = self._filter_candidates_by_court(tracks, frame_size, court_filter)
+        filtered_candidate_count = sum(
+            self._raw_measurement(track, frame_size) is not None
+            for track in filtered_tracks
+        )
+        self._court_filtered_count = max(0, self._raw_candidate_count - filtered_candidate_count)
+        tracks = filtered_tracks
         candidate_frame_index = self._frame_index + 1
         self._observe_static_hotspots(tracks, frame_size, court_filter, candidate_frame_index)
         tracks = self._filter_static_hotspots(tracks, frame_size, court_filter, step_dt, candidate_frame_index)
@@ -1614,6 +1628,8 @@ class BallTrackFilter:
             "frame_index": self._frame_index,
             "dt": dt,
             "raw_candidate_count": self._raw_candidate_count,
+            "court_filter_active": int(self._court_filter_active),
+            "court_filtered_count": self._court_filtered_count,
             "static_filtered_count": self._static_filtered_count,
             "static_hotspot_count": self._static_hotspot_count,
             "action": self._decision_action,

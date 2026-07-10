@@ -635,7 +635,20 @@ def create_tracknet_v3_ball_track_filter(
     debug_enabled: bool = False,
     fixed_lag_frames: int | None = None,
 ) -> BallTrackFilter:
+    """Create the runtime shuttle tracker.
+
+    The zero-latency runtime path uses the project's robust state machine so
+    candidate relocking, static-hotspot suppression, court filtering, and
+    person-occlusion handling remain active.  Supplying ``fixed_lag_frames``
+    explicitly keeps the TrackNetV3-style buffered interpolation adapter for
+    callers that intentionally accept output latency.
+    """
     resolved_fps = float(fps) if fps is not None and fps > 0 else TrackNetV3TrajectoryFilterConfig.fps
+    if fixed_lag_frames is None:
+        return BallTrackFilter(
+            fps=resolved_fps,
+            debug_enabled=debug_enabled,
+        )
     return BallTrackFilter(
         fps=resolved_fps,
         debug_enabled=debug_enabled,

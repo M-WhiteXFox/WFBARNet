@@ -180,6 +180,14 @@ def write_track_debug_row(writer: csv.DictWriter | None, record: object) -> None
     writer.writerow(record)
 
 
+def frame_step_seconds(current_ms: int, previous_ms: int | None, fps: float) -> float:
+    fallback = 1.0 / fps if fps > 0 else 1.0 / 25.0
+    if previous_ms is None:
+        return fallback
+    elapsed = (int(current_ms) - int(previous_ms)) / 1000.0
+    return elapsed if elapsed > 0.0 else fallback
+
+
 def open_frame_log_jsonl(path: str | None) -> object | None:
     if not path:
         return None
@@ -523,6 +531,7 @@ class TrackNetPlaybackWorker(QThread):
         final_pass = False
         ema_infer_fps = 0.0
         last_pose = []
+        previous_track_ms: int | None = None
         track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=self._debug_csv_path is not None)
         pose_tracker = CourtPoseTargetTracker(
             max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
@@ -607,12 +616,15 @@ class TrackNetPlaybackWorker(QThread):
                         last_pose = []
 
                     if self._track_enabled:
+                        track_dt = frame_step_seconds(current_ms, previous_track_ms, fps)
                         track = track_filter.update_candidates(
                             candidates,
+                            dt=track_dt,
                             frame_shape=current_frame.shape,
                             court_prediction=court_prediction,
                             person_bboxes=pose_person_bboxes(last_pose),
                         )
+                        previous_track_ms = current_ms
                     else:
                         track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
 
@@ -905,6 +917,7 @@ class CameraInferenceWorker(QThread):
         score_sum = 0.0
         ema_infer_fps = 0.0
         last_pose = []
+        previous_track_ms: int | None = None
         track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=self._debug_csv_path is not None)
         pose_tracker = CourtPoseTargetTracker(
             max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
@@ -988,12 +1001,15 @@ class CameraInferenceWorker(QThread):
                         last_pose = []
 
                     if self._track_enabled:
+                        track_dt = frame_step_seconds(position_ms, previous_track_ms, fps)
                         track = track_filter.update_candidates(
                             candidates,
+                            dt=track_dt,
                             frame_shape=current_frame.shape,
                             court_prediction=court_prediction,
                             person_bboxes=pose_person_bboxes(last_pose),
                         )
+                        previous_track_ms = position_ms
                     else:
                         track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
 
@@ -1307,6 +1323,7 @@ class BatchInferenceWorker(QThread):
         score_sum = 0.0
         final_pass = False
         last_pose = []
+        previous_track_ms: int | None = None
         track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=False)
         pose_tracker = CourtPoseTargetTracker(
             max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
@@ -1388,12 +1405,15 @@ class BatchInferenceWorker(QThread):
                         last_pose = []
 
                     if self._track_enabled:
+                        track_dt = frame_step_seconds(current_ms, previous_track_ms, fps)
                         track = track_filter.update_candidates(
                             candidates,
+                            dt=track_dt,
                             frame_shape=current_frame.shape,
                             court_prediction=court_prediction,
                             person_bboxes=pose_person_bboxes(last_pose),
                         )
+                        previous_track_ms = current_ms
                     else:
                         track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
 

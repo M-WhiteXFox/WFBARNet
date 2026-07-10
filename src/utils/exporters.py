@@ -40,6 +40,8 @@ TRACK_DEBUG_FIELDS = [
     "reason",
     "raw_candidate_count",
     "candidate_count",
+    "court_filter_active",
+    "court_filtered_count",
     "selected_candidate_index",
     "selected_candidate_rank",
     "static_filtered_count",
