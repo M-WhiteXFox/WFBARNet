@@ -94,7 +94,7 @@ class BallTrackFilterConfig:
     person_occlusion_coast_frames: int = 7
     person_occlusion_min_speed_px_per_sec: float = 250.0
     person_occlusion_candidate_penalty: float = 140.0
-    person_occlusion_suppress_coast_candidate_score: float = 0.55
+    person_occlusion_suppress_coast_candidate_score: float = 0.35
     frame_measurement_margin_px: float = 6.0
     out_of_frame_prediction_margin_px: float = 12.0
     parabola_enabled: bool = True
@@ -130,6 +130,16 @@ class BallTrackFilterConfig:
     top_exit_reversal_min_delta_px: float = 8.0
     top_edge_hallucination_min_gap_px: float = 120.0
     top_edge_hallucination_min_gap_ratio: float = 0.10
+    ground_bounce_guard_enabled: bool = True
+    ground_bounce_guard_max_score: float = 0.35
+    ground_bounce_guard_min_downward_px: float = 8.0
+    ground_bounce_guard_min_upward_px: float = 4.0
+    ground_bounce_guard_min_upward_points: int = 3
+    ground_bounce_guard_min_low_score_points: int = 2
+    ground_bounce_guard_max_backtrack_px: float = 2.0
+    ground_bounce_guard_max_lateral_px: float = 80.0
+    ground_bounce_guard_min_height_ratio: float = 0.35
+    ground_bounce_guard_suppression_seconds: float = 0.75
     static_hotspot_enabled: bool = True
     static_hotspot_radius_px: float = 18.0
     static_hotspot_min_frames: int = 4
@@ -169,6 +179,7 @@ class _StaticHotspot:
 class _TrajectoryPoint:
     frame_index: int
     point: Point
+    score: float
 
 
 @dataclass(slots=True)
@@ -218,6 +229,7 @@ class BallTrackFilter:
         self._frame_index = -1
         self._last_frame_size: FrameSize | None = None
         self._top_exit_frames_remaining = 0
+        self._ground_bounce_suppression_remaining_s = 0.0
         self.debug_enabled = debug_enabled
         self._debug_records: list[dict[str, object]] = []
         self._last_debug_record: dict[str, object] | None = None
@@ -254,6 +266,7 @@ class BallTrackFilter:
         self._frame_index = -1
         self._last_frame_size = None
         self._top_exit_frames_remaining = 0
+        self._ground_bounce_suppression_remaining_s = 0.0
         self.debug_records.clear()
         self._last_debug_record = None
         self._pending_candidate_debug = None
@@ -291,12 +304,22 @@ class BallTrackFilter:
         debug_before = self._debug_before_state(step_dt, frame_size)
         self._start_decision()
 
+        if self._ground_bounce_suppression_remaining_s > 0.0:
+            self._ground_bounce_suppression_remaining_s = max(
+                0.0,
+                self._ground_bounce_suppression_remaining_s - step_dt,
+            )
+            self._mark_decision("ground_bounce_suppress", "active_ground_bounce_suppression", force=True)
+            result = self._invisible(track)
+            return self._finish_debug(track, result, step_dt, frame_size, debug_before)
+
         if self._top_exit_frames_remaining > 0:
             self._top_exit_frames_remaining -= 1
             self._mark_decision("top_exit_suppress", "active_top_exit_suppression", force=True)
             result = self._invisible(track)
             return self._finish_debug(track, result, step_dt, frame_size, debug_before)
 
+        raw_measurement = self._raw_measurement(track, frame_size)
         measurement = self._measurement(track, frame_size, court_filter=court_filter)
         soft_measurement = False
         if measurement is None and self._can_use_soft_measurement(track, frame_size, court_filter):
@@ -304,12 +327,28 @@ class BallTrackFilter:
             soft_measurement = measurement is not None
 
         person_occlusion_active = self._person_occlusion_likely(step_dt, frame_size, normalized_person_bboxes)
-        if measurement is None:
-            self._mark_decision("reject", "missing_or_low_confidence")
+        if self._ground_bounce_tail_is_likely(
+            measurement,
+            float(track.score),
+            frame_size,
+            court_filter,
+        ):
+            self._enter_ground_bounce_suppression()
+            self._mark_decision("ground_bounce_enter", "low_confidence_ground_bounce_tail", force=True)
+            result = self._invisible(track)
+        elif measurement is None:
+            candidate_conflict = self._low_confidence_candidate_conflicts_with_prediction(
+                raw_measurement,
+                step_dt,
+                frame_size,
+                court_filter,
+            )
+            reason = "low_confidence_candidate_conflict" if candidate_conflict else "missing_or_low_confidence"
+            self._mark_decision("reject", reason)
             result = self._reject(
                 track,
                 step_dt,
-                allow_coast=True,
+                allow_coast=not candidate_conflict,
                 frame_size=frame_size,
                 court_filter=court_filter,
                 occlusion_active=person_occlusion_active,
@@ -357,7 +396,7 @@ class BallTrackFilter:
             result = self._accept(track, measurement, step_dt, frame_size)
         else:
             relock = self._update_candidate(measurement, float(track.score), step_dt)
-            impact_relock = self._should_impact_relock(measurement, step_dt)
+            impact_relock = self._should_impact_relock(measurement, float(track.score), step_dt)
             fast_relock = self._should_fast_relock()
             if (relock and self._should_relock()) or impact_relock or fast_relock:
                 self._drop_lock()
@@ -370,12 +409,11 @@ class BallTrackFilter:
                 self._mark_decision("relock_accept", reason, force=True)
                 result = self._accept(track, measurement, step_dt, frame_size)
             else:
-                allow_parabola_fill = self._should_fill_outlier_with_parabola(measurement)
                 self._mark_decision("reject", "candidate_failed_motion_gate")
                 result = self._reject(
                     track,
                     step_dt,
-                    allow_coast=self.config.coast_on_outlier or allow_parabola_fill or person_occlusion_active,
+                    allow_coast=self.config.coast_on_outlier,
                     frame_size=frame_size,
                     court_filter=court_filter,
                     occlusion_active=person_occlusion_active,
@@ -912,7 +950,7 @@ class BallTrackFilter:
         self._coast_frames = 0
         self._locked = True
         self._candidate = None
-        self._record_history(measurement)
+        self._record_history(measurement, float(track.score))
         if continues_real_detection:
             self._real_detections_since_relock += 1
         else:
@@ -1363,8 +1401,10 @@ class BallTrackFilter:
             return True
         return self._missed_frames >= self.config.relock_after_missed_frames
 
-    def _should_impact_relock(self, measurement: Point, dt: float) -> bool:
+    def _should_impact_relock(self, measurement: Point, score: float, dt: float) -> bool:
         if self._candidate is None or self._last_point is None:
+            return False
+        if score < self.config.impact_relock_confidence:
             return False
         if self._missed_frames < self.config.impact_relock_min_missed_frames:
             return False
@@ -1423,6 +1463,89 @@ class BallTrackFilter:
         suppress_frames = max(0, int(self.config.top_exit_suppression_frames))
         self._drop_lock()
         self._top_exit_frames_remaining = suppress_frames
+
+    def _enter_ground_bounce_suppression(self) -> None:
+        self._drop_lock()
+        self._ground_bounce_suppression_remaining_s = max(
+            0.0,
+            float(self.config.ground_bounce_guard_suppression_seconds),
+        )
+
+    def _ground_bounce_tail_is_likely(
+        self,
+        measurement: Point | None,
+        score: float,
+        frame_size: FrameSize | None,
+        court_filter: _CourtFilter | None,
+    ) -> bool:
+        if not self.config.ground_bounce_guard_enabled or measurement is None:
+            return False
+        if not self._locked or score > float(self.config.ground_bounce_guard_max_score):
+            return False
+        history = list(self._history)
+        if len(history) < 4:
+            return False
+        items = history + [
+            _TrajectoryPoint(
+                frame_index=self._frame_index,
+                point=measurement,
+                score=float(score),
+            )
+        ]
+        peak_index = max(range(len(items)), key=lambda index: items[index].point[1])
+        before = items[:peak_index]
+        after = items[peak_index + 1 :]
+        if not before or len(after) < max(1, int(self.config.ground_bounce_guard_min_upward_points)):
+            return False
+        peak = items[peak_index].point
+        downward_px = peak[1] - min(item.point[1] for item in before)
+        upward_px = peak[1] - measurement[1]
+        if downward_px < float(self.config.ground_bounce_guard_min_downward_px):
+            return False
+        if upward_px < float(self.config.ground_bounce_guard_min_upward_px):
+            return False
+        low_score_points = sum(
+            item.score <= float(self.config.ground_bounce_guard_max_score)
+            for item in after
+        )
+        if low_score_points < max(1, int(self.config.ground_bounce_guard_min_low_score_points)):
+            return False
+        previous_y = peak[1]
+        max_backtrack = float(self.config.ground_bounce_guard_max_backtrack_px)
+        for item in after:
+            if item.point[1] > previous_y + max_backtrack:
+                return False
+            previous_y = item.point[1]
+        if abs(measurement[0] - peak[0]) > float(self.config.ground_bounce_guard_max_lateral_px):
+            return False
+        if not self._point_is_plausible_ground_contact(peak, frame_size, court_filter):
+            return False
+        return True
+
+    def _point_is_plausible_ground_contact(
+        self,
+        point: Point,
+        frame_size: FrameSize | None,
+        court_filter: _CourtFilter | None,
+    ) -> bool:
+        if court_filter is not None and court_filter.image_to_court_h is not None:
+            return _point_inside_court_plane(
+                point,
+                court_filter.image_to_court_h,
+                self.config.court_filter_margin_cm,
+            )
+        if court_filter is not None and court_filter.corners is not None:
+            return _point_inside_projected_court_air(
+                point,
+                court_filter.corners,
+                margin_px=self.config.court_filter_margin_px,
+                air_extension_ratio=0.0,
+                frame_size=frame_size,
+            )
+        if frame_size is None:
+            return False
+        _, height = frame_size
+        return point[1] >= height * float(self.config.ground_bounce_guard_min_height_ratio)
 
     def _top_exit_is_likely(self, dt: float, frame_size: FrameSize | None) -> bool:
         if not self.config.top_exit_enabled or frame_size is None:
@@ -1514,8 +1637,14 @@ class BallTrackFilter:
             self._last_point[1] + self._velocity[1] * dt * frames,
         )
 
-    def _record_history(self, point: Point) -> None:
-        self._history.append(_TrajectoryPoint(frame_index=self._frame_index, point=point))
+    def _record_history(self, point: Point, score: float) -> None:
+        self._history.append(
+            _TrajectoryPoint(
+                frame_index=self._frame_index,
+                point=point,
+                score=float(score),
+            )
+        )
 
     def _parabola_prediction(self, target_frame: int) -> _ParabolaPrediction | None:
         if not self.config.parabola_enabled:
@@ -1574,6 +1703,21 @@ class BallTrackFilter:
             smoothing * self._render_point[0] + (1.0 - smoothing) * measurement[0],
             smoothing * self._render_point[1] + (1.0 - smoothing) * measurement[1],
         )
+
+    def _low_confidence_candidate_conflicts_with_prediction(
+        self,
+        measurement: Point | None,
+        dt: float,
+        frame_size: FrameSize | None,
+        court_filter: _CourtFilter | None,
+    ) -> bool:
+        if measurement is None or not self._locked or self._last_point is None:
+            return False
+        if court_filter is not None and not self._point_inside_court_region(measurement, court_filter, frame_size):
+            return False
+        predicted = self._predict(dt)
+        conflict_distance = max(float(self.config.base_gate_px), float(self.config.close_gate_px))
+        return _distance(measurement, predicted) > conflict_distance
 
     def last_debug_record(self) -> dict[str, object] | None:
         if self._algorithm is not None:

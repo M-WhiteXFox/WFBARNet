@@ -248,7 +248,7 @@ class TrajectoryEventCandidateGeneratorTest(unittest.TestCase):
 
         candidates = generator.generate(
             [100.0, 110.0, 120.0, 130.0, -1.0, -1.0, -1.0, -1.0, -1.0],
-            [400.0, 390.0, 380.0, 370.0, -1.0, -1.0, -1.0, -1.0, -1.0],
+            [300.0, 320.0, 340.0, 370.0, -1.0, -1.0, -1.0, -1.0, -1.0],
             [1, 1, 1, 1, 0, 0, 0, 0, 0],
             img_width=500,
             img_height=500,
@@ -481,13 +481,14 @@ class RealtimeTrajectoryEventDetectorTest(unittest.TestCase):
                 fps=60.0,
                 visibility_drop_missing_frames=3,
                 rally_end_missing_frames=5,
+                tracking_lost_end_seconds=0.0,
             )
         )
         event = None
         samples = [
-            (0, 100.0, 400.0, 1),
-            (1, 110.0, 390.0, 1),
-            (2, 120.0, 380.0, 1),
+            (0, 100.0, 300.0, 1),
+            (1, 110.0, 320.0, 1),
+            (2, 120.0, 340.0, 1),
             (3, 130.0, 370.0, 1),
             (4, -1.0, -1.0, 0),
             (5, -1.0, -1.0, 0),
@@ -510,6 +511,270 @@ class RealtimeTrajectoryEventDetectorTest(unittest.TestCase):
         assert event is not None
         self.assertEqual(event["frame_id"], 3)
         self.assertEqual(event["rule"], "tracking_lost_rally_end")
+
+    def test_dense_tracking_loss_waits_for_real_elapsed_time(self) -> None:
+        detector = RealtimeTrajectoryEventDetector(
+            TrajectoryEventDetectorConfig(
+                fps=60.0,
+                visibility_drop_missing_frames=3,
+                rally_end_missing_frames=5,
+                tracking_lost_end_seconds=0.75,
+            )
+        )
+        samples = [
+            (0, 100.0, 300.0, 1),
+            (1, 110.0, 320.0, 1),
+            (2, 120.0, 340.0, 1),
+            (3, 130.0, 370.0, 1),
+            *[(frame_id, -1.0, -1.0, 0) for frame_id in range(4, 14)],
+        ]
+
+        events = []
+        for frame_id, x, y, visible in samples:
+            event = detector.update(
+                _frame(frame_id, x, y, visible=visible),
+                timestamp_ms=frame_id * 20,
+                frame_shape=(500, 500, 3),
+            )
+            if event is not None:
+                events.append(event)
+
+        self.assertFalse(any(event["event_type"] == "landing" for event in events))
+
+    def test_tracking_loss_ends_rally_after_real_time_confirmation(self) -> None:
+        detector = RealtimeTrajectoryEventDetector(
+            TrajectoryEventDetectorConfig(
+                fps=60.0,
+                visibility_drop_missing_frames=3,
+                rally_end_missing_frames=5,
+                tracking_lost_end_seconds=0.75,
+            )
+        )
+        samples = [
+            (0, 100.0, 300.0, 1),
+            (1, 110.0, 320.0, 1),
+            (2, 120.0, 340.0, 1),
+            (3, 130.0, 370.0, 1),
+            *[(frame_id, -1.0, -1.0, 0) for frame_id in range(4, 24)],
+        ]
+
+        events = []
+        for frame_id, x, y, visible in samples:
+            event = detector.update(
+                _frame(frame_id, x, y, visible=visible),
+                timestamp_ms=frame_id * 50,
+                frame_shape=(500, 500, 3),
+            )
+            if event is not None:
+                events.append(event)
+
+        self.assertTrue(
+            any(
+                event["event_type"] == "landing" and event["rule"] == "tracking_lost_rally_end"
+                for event in events
+            )
+        )
+
+    def test_upward_tracking_loss_does_not_end_rally(self) -> None:
+        detector = RealtimeTrajectoryEventDetector(
+            TrajectoryEventDetectorConfig(
+                fps=60.0,
+                visibility_drop_missing_frames=3,
+                rally_end_missing_frames=5,
+                tracking_lost_end_seconds=0.20,
+            )
+        )
+        samples = [
+            (0, 100.0, 400.0, 1),
+            (1, 110.0, 380.0, 1),
+            (2, 120.0, 360.0, 1),
+            (3, 130.0, 340.0, 1),
+            *[(frame_id, -1.0, -1.0, 0) for frame_id in range(4, 24)],
+        ]
+
+        events = []
+        for frame_id, x, y, visible in samples:
+            event = detector.update(
+                _frame(frame_id, x, y, visible=visible),
+                timestamp_ms=frame_id * 40,
+                frame_shape=(500, 500, 3),
+            )
+            if event is not None:
+                events.append(event)
+
+        self.assertFalse(any(event["event_type"] == "landing" for event in events))
+
+    def test_ground_bounce_then_tracking_loss_ends_rally(self) -> None:
+        detector = RealtimeTrajectoryEventDetector(
+            TrajectoryEventDetectorConfig(
+                fps=20.0,
+                visibility_drop_missing_frames=3,
+                rally_end_missing_frames=5,
+                tracking_lost_end_seconds=0.20,
+            )
+        )
+        samples = [
+            (0, 100.0, 300.0, 1, 0.8),
+            (1, 102.0, 350.0, 1, 0.8),
+            (2, 104.0, 410.0, 1, 0.8),
+            (3, 106.0, 450.0, 1, 0.7),
+            (4, 108.0, 440.0, 1, 0.20),
+            (5, 110.0, 420.0, 1, 0.10),
+            (6, 112.0, 400.0, 1, 0.05),
+            *[(frame_id, -1.0, -1.0, 0, 0.0) for frame_id in range(7, 19)],
+        ]
+
+        events = []
+        for frame_id, x, y, visible, score in samples:
+            event = detector.update(
+                _frame(frame_id, x, y, visible=visible, score=score),
+                timestamp_ms=frame_id * 50,
+                frame_shape=(500, 500, 3),
+            )
+            if event is not None:
+                events.append(event)
+
+        landing = next(
+            event
+            for event in events
+            if event["event_type"] == "landing" and event["rule"] == "tracking_lost_bounce_end"
+        )
+        self.assertEqual(landing["frame_id"], 3)
+        self.assertEqual(landing["timestamp_ms"], 150)
+        self.assertEqual(landing["ball_xy"], [106.0, 450.0])
+
+    def test_high_confidence_upward_flight_after_reversal_is_not_bounce_end(self) -> None:
+        detector = RealtimeTrajectoryEventDetector(
+            TrajectoryEventDetectorConfig(
+                fps=20.0,
+                visibility_drop_missing_frames=3,
+                rally_end_missing_frames=5,
+                tracking_lost_end_seconds=0.20,
+            )
+        )
+        samples = [
+            (0, 100.0, 300.0, 1),
+            (1, 102.0, 360.0, 1),
+            (2, 104.0, 430.0, 1),
+            (3, 108.0, 400.0, 1),
+            (4, 116.0, 350.0, 1),
+            (5, 128.0, 300.0, 1),
+            *[(frame_id, -1.0, -1.0, 0) for frame_id in range(6, 18)],
+        ]
+
+        events = []
+        for frame_id, x, y, visible in samples:
+            event = detector.update(
+                _frame(frame_id, x, y, visible=visible, score=0.75),
+                timestamp_ms=frame_id * 50,
+                frame_shape=(500, 500, 3),
+            )
+            if event is not None:
+                events.append(event)
+
+        self.assertFalse(any(event.get("rule") == "tracking_lost_bounce_end" for event in events))
+
+    def test_low_speed_landing_is_cancelled_when_motion_resumes(self) -> None:
+        detector = RealtimeTrajectoryEventDetector(
+            TrajectoryEventDetectorConfig(
+                fps=20.0,
+                landing_confirmation_seconds=0.35,
+            )
+        )
+        points = [
+            (0.0, 120.0),
+            (10.0, 120.0),
+            (20.0, 120.0),
+            (30.0, 120.0),
+            (31.0, 120.0),
+            (31.5, 120.0),
+            (32.0, 120.0),
+            (32.5, 120.0),
+            (70.0, 120.0),
+            (90.0, 120.0),
+            (110.0, 120.0),
+        ]
+
+        events = []
+        for frame_id, (x, y) in enumerate(points):
+            event = detector.update(
+                _frame(frame_id, x, y),
+                timestamp_ms=frame_id * 50,
+                frame_shape=(300, 500, 3),
+            )
+            if event is not None:
+                events.append(event)
+
+        self.assertFalse(any(event["event_type"] == "landing" for event in events))
+
+    def test_confirmed_low_speed_landing_is_emitted(self) -> None:
+        detector = RealtimeTrajectoryEventDetector(
+            TrajectoryEventDetectorConfig(
+                fps=20.0,
+                landing_confirmation_seconds=0.35,
+            )
+        )
+        points = [
+            (0.0, 120.0),
+            (10.0, 120.0),
+            (20.0, 120.0),
+            (30.0, 120.0),
+            (31.0, 120.0),
+            (31.5, 120.0),
+            (32.0, 120.0),
+            (32.2, 120.0),
+            (32.3, 120.0),
+            (32.4, 120.0),
+            (32.5, 120.0),
+            (32.6, 120.0),
+        ]
+
+        events = []
+        for frame_id, (x, y) in enumerate(points):
+            event = detector.update(
+                _frame(frame_id, x, y),
+                timestamp_ms=frame_id * 50,
+                frame_shape=(300, 500, 3),
+            )
+            if event is not None:
+                events.append(event)
+
+        self.assertTrue(any(event["event_type"] == "landing" for event in events))
+
+    def test_landing_outside_calibrated_court_is_rejected(self) -> None:
+        detector = RealtimeTrajectoryEventDetector(
+            TrajectoryEventDetectorConfig(
+                fps=20.0,
+                landing_confirmation_seconds=0.20,
+            )
+        )
+        court_prediction = {
+            "corners": [[400.0, 100.0], [100.0, 100.0], [80.0, 280.0], [420.0, 280.0]],
+        }
+        points = [
+            (0.0, 200.0),
+            (10.0, 200.0),
+            (20.0, 200.0),
+            (30.0, 200.0),
+            (31.0, 200.0),
+            (31.5, 200.0),
+            (32.0, 200.0),
+            (32.2, 200.0),
+            (32.3, 200.0),
+        ]
+
+        events = []
+        for frame_id, (x, y) in enumerate(points):
+            event = detector.update(
+                _frame(frame_id, x, y),
+                timestamp_ms=frame_id * 50,
+                frame_shape=(300, 500, 3),
+                court_prediction=court_prediction,
+            )
+            if event is not None:
+                events.append(event)
+
+        self.assertFalse(any(event["event_type"] == "landing" for event in events))
 
 
 if __name__ == "__main__":

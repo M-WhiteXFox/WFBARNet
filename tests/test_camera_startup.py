@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from apps.pyqt6.controllers.analysis_controller_runtime import MainController, frame_step_seconds
+from apps.pyqt6.controllers.analysis_controller_runtime import (
+    MainController,
+    frame_step_seconds,
+    track_state_gap_exceeded,
+)
 
 
 class _FakeTimeline:
@@ -70,6 +74,10 @@ class CameraStartupTest(unittest.TestCase):
         self.assertAlmostEqual(frame_step_seconds(166, 100, 60.0), 0.066)
         self.assertAlmostEqual(frame_step_seconds(100, None, 50.0), 0.02)
         self.assertAlmostEqual(frame_step_seconds(100, 100, 25.0), 0.04)
+
+    def test_track_state_resets_only_after_long_gap(self) -> None:
+        self.assertFalse(track_state_gap_exceeded(0.75))
+        self.assertTrue(track_state_gap_exceeded(0.751))
 
     def test_controller_init_does_not_probe_cameras(self) -> None:
         view = _FakeView()

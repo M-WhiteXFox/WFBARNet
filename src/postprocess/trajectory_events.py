@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from math import isfinite
-from typing import Any, Sequence
+from math import hypot, isfinite
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -50,7 +50,22 @@ class TrajectoryEventDetectorConfig:
     visibility_drop_missing_frames: int = 12
     rally_end_missing_frames: int = 18
     tracking_lost_end_max_speed: float = 120.0
+    tracking_lost_end_seconds: float = 0.75
+    tracking_lost_min_downward_speed: float = 1.0
+    tracking_lost_bounce_lookback_frames: int = 18
+    tracking_lost_bounce_max_age_frames: int = 12
+    tracking_lost_bounce_min_downward_px: float = 8.0
+    tracking_lost_bounce_min_upward_px: float = 4.0
+    tracking_lost_bounce_min_height_ratio: float = 0.35
+    tracking_lost_bounce_max_last_score: float = 0.35
+    landing_confirmation_seconds: float = 0.35
+    min_landing_track_score: float = 0.35
+    landing_resume_distance_ratio: float = 0.02
+    landing_resume_distance_min_px: float = 20.0
+    landing_min_height_ratio: float = 0.30
+    landing_court_margin_ratio: float = 0.12
     event_cooldown_seconds: float = 0.18
+    landing_event_cooldown_seconds: float = 0.75
     max_event_lag_frames: int = 12
 
 
@@ -552,6 +567,7 @@ class TrajectoryEventCandidateGenerator:
         if (
             missing_after >= max(1, int(self.config.rally_end_missing_frames))
             and recent_speed <= float(self.config.tracking_lost_end_max_speed)
+            and previous_v_y >= float(self.config.tracking_lost_min_downward_speed)
         ):
             return {
                 "event_type": "landing",
@@ -792,15 +808,25 @@ class TrajectoryEventCandidateGenerator:
             while j < len(candidates) and int(candidates[j]["frame"]) - base_frame <= self.config.merge_window:
                 group.append(candidates[j])
                 j += 1
-            merged.append(
-                max(
-                    group,
-                    key=lambda item: (
-                        rule_priority.get(str(item["rule"]), 0),
-                        float(item["confidence"]),
-                    ),
-                )
+            selected = max(
+                group,
+                key=lambda item: (
+                    rule_priority.get(str(item["rule"]), 0),
+                    float(item["confidence"]),
+                ),
             )
+            merged.append(selected)
+            if str(selected.get("event_type")) == "hit":
+                trailing_tracking_loss = next(
+                    (
+                        item
+                        for item in reversed(group)
+                        if str(item.get("rule")) == "visibility_drop_tracking_lost"
+                    ),
+                    None,
+                )
+                if trailing_tracking_loss is not None:
+                    merged.append(trailing_tracking_loss)
             i = j
         return merged
 
@@ -828,6 +854,7 @@ class RealtimeTrajectoryEventDetector:
         *,
         timestamp_ms: int | None = None,
         frame_shape: Sequence[int] | None = None,
+        court_prediction: object | None = None,
     ) -> dict[str, object] | None:
         timestamp = int(timestamp_ms) if timestamp_ms is not None else self._timestamp_ms(result.frame_id)
         self._history.append(self._point_from_result(result, timestamp))
@@ -858,16 +885,53 @@ class RealtimeTrajectoryEventDetector:
                 continue
             max_lag = int(self.config.max_event_lag_frames)
             rule = str(candidate.get("rule", ""))
-            if rule == "tracking_lost_rally_end":
-                max_lag = max(max_lag, int(self.config.rally_end_missing_frames) + self.config.confirmation_frames)
+            bounce_features = (
+                self._tracking_loss_bounce_features(samples, local_index, img_height)
+                if rule == "visibility_drop_tracking_lost"
+                else None
+            )
+            if rule == "tracking_lost_rally_end" or bounce_features is not None:
+                confirmation_frames = int(
+                    round(max(0.0, float(self.config.tracking_lost_end_seconds)) * self.config.fps)
+                )
+                max_lag = max(
+                    max_lag,
+                    int(self.config.rally_end_missing_frames) + confirmation_frames + self.config.confirmation_frames,
+                )
+            elif str(candidate.get("event_type", "")) == "landing":
+                confirmation_frames = int(
+                    round(max(0.0, float(self.config.landing_confirmation_seconds)) * self.config.fps)
+                )
+                max_lag = max(max_lag, confirmation_frames + self.config.confirmation_frames + self.config.post_window)
             if max_lag >= 0 and lag_frames > max_lag:
                 continue
             event = self._event_from_candidate(candidate, samples[local_index])
+            if bounce_features is not None:
+                promoted = self._promote_tracking_loss_bounce(
+                    event,
+                    samples,
+                    local_index,
+                    img_height,
+                    court_prediction,
+                    bounce_features,
+                )
+                if promoted is None:
+                    continue
+                event = promoted
             if str(event["event_type"]) == "hit" and not self._is_hit_event_valid(
                 event,
                 samples,
                 local_index,
                 img_height,
+            ):
+                continue
+            if str(event["event_type"]) == "landing" and not self._is_landing_event_valid(
+                event,
+                samples,
+                local_index,
+                img_width,
+                img_height,
+                court_prediction,
             ):
                 continue
             event_key = (str(event["event_type"]), int(event["frame_id"]))
@@ -987,13 +1051,182 @@ class RealtimeTrajectoryEventDetector:
                 return idx
         return None
 
+    def _is_landing_event_valid(
+        self,
+        event: Mapping[str, object],
+        samples: Sequence[_TrajectoryPoint],
+        local_index: int,
+        img_width: int,
+        img_height: int,
+        court_prediction: object | None,
+    ) -> bool:
+        sample = samples[local_index]
+        rule = str(event.get("rule", ""))
+        features = event.get("features")
+        landing_x = sample.x
+        landing_y = sample.y
+        if rule == "tracking_lost_bounce_end" and isinstance(features, Mapping):
+            try:
+                landing_x = float(features.get("bounce_x", sample.x))
+                landing_y = float(features.get("bounce_y", sample.y))
+            except (TypeError, ValueError):
+                return False
+        if not self._landing_position_plausible(landing_x, landing_y, img_height, court_prediction):
+            return False
+
+        elapsed_ms = max(0, int(samples[-1].timestamp_ms) - int(sample.timestamp_ms))
+        if rule in {"tracking_lost_rally_end", "tracking_lost_bounce_end"}:
+            required_ms = int(round(max(0.0, float(self.config.tracking_lost_end_seconds)) * 1000.0))
+            if elapsed_ms < required_ms:
+                return False
+            if rule == "tracking_lost_rally_end":
+                vertical_speed = 0.0
+                if isinstance(features, Mapping):
+                    try:
+                        vertical_speed = float(features.get("v_y", 0.0))
+                    except (TypeError, ValueError):
+                        return False
+                if vertical_speed < float(self.config.tracking_lost_min_downward_speed):
+                    return False
+            elif sample.score > float(self.config.tracking_lost_bounce_max_last_score):
+                return False
+            return not any(current.visible for current in samples[local_index + 1 :])
+
+        if sample.score < float(self.config.min_landing_track_score):
+            return False
+        required_ms = int(round(max(0.0, float(self.config.landing_confirmation_seconds)) * 1000.0))
+        if elapsed_ms < required_ms:
+            return False
+        resume_distance = max(
+            float(self.config.landing_resume_distance_min_px),
+            hypot(float(img_width), float(img_height)) * float(self.config.landing_resume_distance_ratio),
+        )
+        confirmation_end_ms = int(sample.timestamp_ms) + required_ms
+        for current in samples[local_index + 1 :]:
+            if current.timestamp_ms > confirmation_end_ms:
+                break
+            if current.visible and hypot(current.x - sample.x, current.y - sample.y) > resume_distance:
+                return False
+        return True
+
+    def _tracking_loss_bounce_features(
+        self,
+        samples: Sequence[_TrajectoryPoint],
+        local_index: int,
+        img_height: int,
+    ) -> dict[str, float | int] | None:
+        sample = samples[local_index]
+        if sample.score > float(self.config.tracking_lost_bounce_max_last_score):
+            return None
+        lookback = max(3, int(self.config.tracking_lost_bounce_lookback_frames))
+        start = max(0, local_index - lookback)
+        visible_indices = [index for index in range(start, local_index + 1) if samples[index].visible]
+        if len(visible_indices) < 4:
+            return None
+        peak_index = max(visible_indices, key=lambda index: samples[index].y)
+        before_indices = [index for index in visible_indices if index < peak_index]
+        after_indices = [index for index in visible_indices if index > peak_index]
+        if not before_indices or len(after_indices) < 2:
+            return None
+        if local_index - peak_index > max(1, int(self.config.tracking_lost_bounce_max_age_frames)):
+            return None
+        peak = samples[peak_index]
+        downward_px = peak.y - min(samples[index].y for index in before_indices)
+        upward_px = peak.y - sample.y
+        if downward_px < float(self.config.tracking_lost_bounce_min_downward_px):
+            return None
+        if upward_px < float(self.config.tracking_lost_bounce_min_upward_px):
+            return None
+        if peak.y < float(img_height) * float(self.config.tracking_lost_bounce_min_height_ratio):
+            return None
+        return {
+            "bounce_frame_id": int(peak.frame_id),
+            "bounce_timestamp_ms": int(peak.timestamp_ms),
+            "bounce_x": float(peak.x),
+            "bounce_y": float(peak.y),
+            "bounce_downward_px": float(downward_px),
+            "bounce_upward_px": float(upward_px),
+        }
+
+    def _promote_tracking_loss_bounce(
+        self,
+        event: dict[str, object],
+        samples: Sequence[_TrajectoryPoint],
+        local_index: int,
+        img_height: int,
+        court_prediction: object | None,
+        bounce_features: Mapping[str, float | int],
+    ) -> dict[str, object] | None:
+        features = event.get("features")
+        missing_after = 0
+        if isinstance(features, Mapping):
+            try:
+                missing_after = int(features.get("missing_after", 0))
+            except (TypeError, ValueError):
+                missing_after = 0
+        if missing_after < max(1, int(self.config.rally_end_missing_frames)):
+            return None
+        sample = samples[local_index]
+        elapsed_ms = max(0, int(samples[-1].timestamp_ms) - int(sample.timestamp_ms))
+        required_ms = int(round(max(0.0, float(self.config.tracking_lost_end_seconds)) * 1000.0))
+        if elapsed_ms < required_ms:
+            return None
+        if any(current.visible for current in samples[local_index + 1 :]):
+            return event
+        bounce_x = float(bounce_features["bounce_x"])
+        bounce_y = float(bounce_features["bounce_y"])
+        if not self._landing_position_plausible(bounce_x, bounce_y, img_height, court_prediction):
+            return event
+        promoted = dict(event)
+        promoted.update(
+            {
+                "event_type": "landing",
+                "rule": "tracking_lost_bounce_end",
+                "confidence": max(0.68, float(event.get("confidence", 0.0))),
+                "frame_id": int(bounce_features["bounce_frame_id"]),
+                "timestamp_ms": int(bounce_features["bounce_timestamp_ms"]),
+                "ball_xy": [bounce_x, bounce_y],
+                "all_rules": ["tracking_lost_bounce_end"],
+                "auxiliary_rules": ["ground_bounce"],
+                "features": {
+                    **(dict(features) if isinstance(features, Mapping) else {}),
+                    **dict(bounce_features),
+                },
+            }
+        )
+        return promoted
+
+    def _landing_position_plausible(
+        self,
+        x: float,
+        y: float,
+        img_height: int,
+        court_prediction: object | None,
+    ) -> bool:
+        corners = _court_corners(court_prediction)
+        if corners is None:
+            return float(y) >= float(img_height) * float(self.config.landing_min_height_ratio)
+        center_x = sum(point[0] for point in corners) / len(corners)
+        center_y = sum(point[1] for point in corners) / len(corners)
+        scale = 1.0 + max(0.0, float(self.config.landing_court_margin_ratio))
+        expanded = [
+            (center_x + (point[0] - center_x) * scale, center_y + (point[1] - center_y) * scale)
+            for point in corners
+        ]
+        return _point_in_polygon(float(x), float(y), expanded)
+
     def _in_cooldown(self, event: dict[str, object]) -> bool:
         event_type = str(event["event_type"])
         timestamp_ms = int(event["timestamp_ms"])
         last_time = self._last_event_time_ms.get(event_type)
         if last_time is None:
             return False
-        cooldown_ms = int(round(max(0.0, float(self.config.event_cooldown_seconds)) * 1000.0))
+        cooldown_seconds = (
+            self.config.landing_event_cooldown_seconds
+            if event_type == "landing"
+            else self.config.event_cooldown_seconds
+        )
+        cooldown_ms = int(round(max(0.0, float(cooldown_seconds)) * 1000.0))
         return timestamp_ms - last_time < cooldown_ms
 
 
@@ -1005,6 +1238,48 @@ def _frame_size(frame_shape: Sequence[int] | None) -> tuple[int, int]:
     if width <= 0 or height <= 0:
         return 512, 288
     return width, height
+
+
+def _court_corners(court_prediction: object | None) -> list[tuple[float, float]] | None:
+    if court_prediction is None:
+        return None
+    prediction_valid = (
+        court_prediction.get("valid", True)
+        if isinstance(court_prediction, Mapping)
+        else getattr(court_prediction, "valid", True)
+    )
+    if not bool(prediction_valid):
+        return None
+    raw_corners = (
+        court_prediction.get("corners")
+        if isinstance(court_prediction, Mapping)
+        else getattr(court_prediction, "corners", None)
+    )
+    if raw_corners is None:
+        return None
+    try:
+        corners = [(float(point[0]), float(point[1])) for point in raw_corners]
+    except (TypeError, ValueError, IndexError):
+        return None
+    if len(corners) != 4:
+        return None
+    for x, y in corners:
+        if not isfinite(x) or not isfinite(y):
+            return None
+    return corners
+
+
+def _point_in_polygon(x: float, y: float, polygon: Sequence[tuple[float, float]]) -> bool:
+    inside = False
+    previous_x, previous_y = polygon[-1]
+    for current_x, current_y in polygon:
+        crosses = (current_y > y) != (previous_y > y)
+        if crosses:
+            boundary_x = (previous_x - current_x) * (y - current_y) / (previous_y - current_y) + current_x
+            if x < boundary_x:
+                inside = not inside
+        previous_x, previous_y = current_x, current_y
+    return inside
 
 
 def _as_sequence(value: object) -> Sequence[object]:

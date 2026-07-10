@@ -42,6 +42,7 @@ from src.utils.visualize import TrackTrailRenderer
 DISPLAY_FPS_LIMIT = 60.0
 METRICS_UPDATE_INTERVAL_S = 0.25
 PLAYBACK_LAG_TOLERANCE_FRAMES = 1.5
+TRACK_STATE_RESET_GAP_S = 0.75
 POSE_CANDIDATE_LIMIT = 12
 POSE_COURT_MARGIN_CM = 30.0
 POSE_MAX_MISSING_SECONDS = 0.35
@@ -186,6 +187,10 @@ def frame_step_seconds(current_ms: int, previous_ms: int | None, fps: float) -> 
         return fallback
     elapsed = (int(current_ms) - int(previous_ms)) / 1000.0
     return elapsed if elapsed > 0.0 else fallback
+
+
+def track_state_gap_exceeded(step_seconds: float) -> bool:
+    return float(step_seconds) > TRACK_STATE_RESET_GAP_S
 
 
 def open_frame_log_jsonl(path: str | None) -> object | None:
@@ -617,6 +622,9 @@ class TrackNetPlaybackWorker(QThread):
 
                     if self._track_enabled:
                         track_dt = frame_step_seconds(current_ms, previous_track_ms, fps)
+                        if track_state_gap_exceeded(track_dt):
+                            track_filter.reset()
+                            track_dt = frame_step_seconds(current_ms, None, fps)
                         track = track_filter.update_candidates(
                             candidates,
                             dt=track_dt,
@@ -637,6 +645,7 @@ class TrackNetPlaybackWorker(QThread):
                         frame_result,
                         timestamp_ms=current_ms,
                         frame_shape=current_frame.shape,
+                        court_prediction=court_prediction,
                     )
                     hit_event = (
                         trajectory_event
@@ -1002,6 +1011,9 @@ class CameraInferenceWorker(QThread):
 
                     if self._track_enabled:
                         track_dt = frame_step_seconds(position_ms, previous_track_ms, fps)
+                        if track_state_gap_exceeded(track_dt):
+                            track_filter.reset()
+                            track_dt = frame_step_seconds(position_ms, None, fps)
                         track = track_filter.update_candidates(
                             candidates,
                             dt=track_dt,
@@ -1048,6 +1060,7 @@ class CameraInferenceWorker(QThread):
                         frame_result,
                         timestamp_ms=position_ms,
                         frame_shape=current_frame.shape,
+                        court_prediction=court_prediction,
                     )
                     hit_event = (
                         trajectory_event
@@ -1406,6 +1419,9 @@ class BatchInferenceWorker(QThread):
 
                     if self._track_enabled:
                         track_dt = frame_step_seconds(current_ms, previous_track_ms, fps)
+                        if track_state_gap_exceeded(track_dt):
+                            track_filter.reset()
+                            track_dt = frame_step_seconds(current_ms, None, fps)
                         track = track_filter.update_candidates(
                             candidates,
                             dt=track_dt,
@@ -1441,6 +1457,7 @@ class BatchInferenceWorker(QThread):
                         frame_result,
                         timestamp_ms=current_ms,
                         frame_shape=current_frame.shape,
+                        court_prediction=court_prediction,
                     )
                     hit_event = (
                         trajectory_event

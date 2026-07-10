@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from src.postprocess.track_filter import BallTrackFilter
+from src.postprocess.trajectory_events import RealtimeTrajectoryEventDetector, TrajectoryEventDetectorConfig
 from src.postprocess.tracknet_v3_filter import (
     TrackNetV3TrajectoryFilter,
     TrackNetV3TrajectoryFilterConfig,
@@ -10,7 +11,7 @@ from src.postprocess.tracknet_v3_filter import (
     generate_tracknet_v3_inpaint_mask,
     linear_interpolate_masked_values,
 )
-from src.utils.structures import TrackResult
+from src.utils.structures import FrameResult, TrackResult
 
 
 def _track(x: float, y: float, score: float = 0.72, visible: int = 1) -> TrackResult:
@@ -273,6 +274,208 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
 
         self.assertFalse(guarded.visible)
         self.assertEqual(track_filter.last_debug_record()["reason"], "candidate_failed_motion_gate")
+
+    def test_runtime_filter_does_not_coast_when_new_relock_candidate_is_pending(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=60.0, debug_enabled=True)
+        frame_shape = (1080, 1920, 3)
+        sequence = [
+            ([_track(1105.0, 380.0, 0.8)], 0.017),
+            ([_track(1105.0, 400.0, 0.7)], 0.017),
+            ([_track(1105.0, 420.0, 0.7)], 0.017),
+            ([_track(1105.0, 443.0, 0.63)], 0.016),
+            ([_missing(0.068)], 0.034),
+            ([_track(1038.0, 442.0, 0.402)], 0.016),
+        ]
+        for candidates, dt in sequence:
+            track_filter.update_candidates(candidates, dt=dt, frame_shape=frame_shape)
+
+        pending = track_filter.update_candidates(
+            [_track(926.0, 391.0, 0.236)],
+            dt=0.05,
+            frame_shape=frame_shape,
+        )
+
+        self.assertFalse(pending.visible)
+        self.assertEqual(track_filter.last_debug_record()["reason"], "low_confidence_candidate_conflict")
+
+    def test_runtime_filter_stops_occlusion_coast_when_candidate_reappears(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=60.0, debug_enabled=True)
+        frame_shape = (1080, 1920, 3)
+        full_frame_person = [(0.0, 0.0, 1920.0, 1080.0)]
+        track_filter.update_candidates([_track(718.0, 300.0, 0.8)], dt=0.017, frame_shape=frame_shape)
+        track_filter.update_candidates([_track(740.0, 330.0, 0.8)], dt=0.017, frame_shape=frame_shape)
+        track_filter.update_candidates([_track(769.0, 368.0, 0.8)], dt=0.017, frame_shape=frame_shape)
+        track_filter.update_candidates(
+            [_missing()],
+            dt=0.05,
+            frame_shape=frame_shape,
+            person_bboxes=full_frame_person,
+        )
+
+        reappeared = track_filter.update_candidates(
+            [_track(711.0, 343.0, 0.36)],
+            dt=0.017,
+            frame_shape=frame_shape,
+            person_bboxes=full_frame_person,
+        )
+
+        self.assertFalse(reappeared.visible)
+        self.assertEqual(track_filter.last_debug_record()["reason"], "person_occlusion_candidate_high_score")
+
+    def test_runtime_filter_requires_current_impact_score_for_relock(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=60.0, debug_enabled=True)
+        frame_shape = (1080, 1920, 3)
+        sequence = [
+            ([_track(630.0, 550.0, 0.8)], 0.034),
+            ([_track(632.0, 600.0, 0.8)], 0.034),
+            ([_track(633.0, 644.0, 0.8)], 0.034),
+            ([_missing(0.06)], 0.017),
+            ([_missing(0.06)], 0.017),
+            ([_track(677.0, 582.0, 0.657)], 0.033),
+            ([_missing(0.16)], 0.034),
+            ([_missing(0.11)], 0.016),
+        ]
+        for candidates, dt in sequence:
+            track_filter.update_candidates(candidates, dt=dt, frame_shape=frame_shape)
+
+        low_score_impact = track_filter.update_candidates(
+            [_track(733.0, 554.0, 0.307)],
+            dt=0.034,
+            frame_shape=frame_shape,
+        )
+
+        self.assertFalse(low_score_impact.visible)
+        self.assertEqual(track_filter.last_debug_record()["reason"], "candidate_failed_motion_gate")
+
+    def test_runtime_filter_stops_low_confidence_ground_bounce_tail(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=20.0, debug_enabled=True)
+        frame_shape = (500, 500, 3)
+        samples = [
+            (100.0, 300.0, 0.80),
+            (102.0, 350.0, 0.80),
+            (104.0, 410.0, 0.80),
+            (106.0, 450.0, 0.70),
+            (108.0, 440.0, 0.55),
+            (110.0, 420.0, 0.30),
+        ]
+        for x, y, score in samples:
+            result = track_filter.update_candidates(
+                [_track(x, y, score)],
+                dt=0.05,
+                frame_shape=frame_shape,
+            )
+            self.assertTrue(result.visible)
+
+        stopped = track_filter.update_candidates(
+            [_track(112.0, 400.0, 0.32)],
+            dt=0.05,
+            frame_shape=frame_shape,
+        )
+        suppressed = track_filter.update_candidates(
+            [_track(114.0, 380.0, 0.80)],
+            dt=0.05,
+            frame_shape=frame_shape,
+        )
+
+        self.assertFalse(stopped.visible)
+        self.assertEqual(track_filter.debug_records[-2]["reason"], "low_confidence_ground_bounce_tail")
+        self.assertFalse(suppressed.visible)
+        self.assertEqual(track_filter.last_debug_record()["reason"], "active_ground_bounce_suppression")
+
+    def test_runtime_filter_keeps_high_confidence_upward_hit_near_ground(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=20.0, debug_enabled=True)
+        frame_shape = (500, 500, 3)
+        samples = [
+            (100.0, 300.0, 0.80),
+            (102.0, 350.0, 0.80),
+            (104.0, 410.0, 0.80),
+            (106.0, 450.0, 0.75),
+            (112.0, 430.0, 0.75),
+            (120.0, 400.0, 0.75),
+        ]
+        for x, y, score in samples:
+            track_filter.update_candidates(
+                [_track(x, y, score)],
+                dt=0.05,
+                frame_shape=frame_shape,
+            )
+
+        continued = track_filter.update_candidates(
+            [_track(130.0, 360.0, 0.75)],
+            dt=0.05,
+            frame_shape=frame_shape,
+        )
+
+        self.assertTrue(continued.visible)
+        self.assertNotEqual(track_filter.last_debug_record()["reason"], "low_confidence_ground_bounce_tail")
+
+    def test_runtime_filter_keeps_upward_track_with_only_one_low_score(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=20.0, debug_enabled=True)
+        frame_shape = (500, 500, 3)
+        samples = [
+            (100.0, 300.0, 0.80),
+            (102.0, 350.0, 0.80),
+            (104.0, 410.0, 0.80),
+            (106.0, 450.0, 0.75),
+            (112.0, 430.0, 0.75),
+            (120.0, 400.0, 0.75),
+        ]
+        for x, y, score in samples:
+            track_filter.update_candidates(
+                [_track(x, y, score)],
+                dt=0.05,
+                frame_shape=frame_shape,
+            )
+
+        continued = track_filter.update_candidates(
+            [_track(130.0, 360.0, 0.32)],
+            dt=0.05,
+            frame_shape=frame_shape,
+        )
+
+        self.assertTrue(continued.visible)
+        self.assertNotEqual(track_filter.last_debug_record()["reason"], "low_confidence_ground_bounce_tail")
+
+    def test_ground_bounce_guard_still_allows_bounce_end_event(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=20.0, debug_enabled=True)
+        event_detector = RealtimeTrajectoryEventDetector(
+            TrajectoryEventDetectorConfig(
+                fps=20.0,
+                visibility_drop_missing_frames=3,
+                rally_end_missing_frames=5,
+                tracking_lost_end_seconds=0.20,
+            )
+        )
+        frame_shape = (500, 500, 3)
+        raw_tracks = [
+            _track(100.0, 300.0, 0.80),
+            _track(102.0, 350.0, 0.80),
+            _track(104.0, 410.0, 0.80),
+            _track(106.0, 450.0, 0.70),
+            _track(108.0, 440.0, 0.55),
+            _track(110.0, 420.0, 0.30),
+            _track(112.0, 400.0, 0.32),
+            *[_missing() for _ in range(12)],
+        ]
+
+        events = []
+        for frame_id, raw_track in enumerate(raw_tracks):
+            filtered = track_filter.update_candidates(
+                [raw_track],
+                dt=0.05,
+                frame_shape=frame_shape,
+            )
+            event = event_detector.update(
+                FrameResult(frame_id=frame_id, pose=[], track=filtered),
+                timestamp_ms=frame_id * 50,
+                frame_shape=frame_shape,
+            )
+            if event is not None:
+                events.append(event)
+
+        self.assertTrue(
+            any(event.get("rule") == "tracking_lost_bounce_end" for event in events)
+        )
 
     def test_runtime_filter_debug_records_court_filtering(self) -> None:
         track_filter = create_tracknet_v3_ball_track_filter(fps=30.0, debug_enabled=True)
