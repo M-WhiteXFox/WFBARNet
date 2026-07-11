@@ -18,7 +18,7 @@ def default_batch_court_backends() -> tuple[CourtLineBackend, ...]:
     """Return the batch court fallback order available in the current workspace."""
     backends: list[CourtLineBackend] = []
     try:
-        resolve_court_pose_weights("assets/weights/court_pose/best.pt")
+        resolve_court_pose_weights("assets/weights/court_pose/CourtPose.pt")
     except FileNotFoundError:
         pass
     else:

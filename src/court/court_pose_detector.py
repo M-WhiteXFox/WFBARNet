@@ -20,12 +20,12 @@ from src.court.shuttlecourt_seg_detector import (
 )
 
 
-DEFAULT_COURT_POSE_WEIGHTS = PROJECT_ROOT / "assets" / "weights" / "court_pose" / "best.pt"
+DEFAULT_COURT_POSE_WEIGHTS = PROJECT_ROOT / "assets" / "weights" / "court_pose" / "CourtPose.pt"
 
 
 @dataclass(slots=True)
 class CourtPoseConfig(ShuttleCourtSegConfig):
-    weights: str = "assets/weights/court_pose/best.pt"
+    weights: str = "assets/weights/court_pose/CourtPose.pt"
     imgsz: int = 512
     max_det: int = 3
     seg_roi_dilate_px: int = 28

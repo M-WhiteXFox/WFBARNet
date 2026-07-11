@@ -18,7 +18,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-DEFAULT_WEIGHTS = REPO_ROOT / "assets" / "weights" / "court_pose" / "best.pt"
+DEFAULT_WEIGHTS = REPO_ROOT / "assets" / "weights" / "court_pose" / "CourtPose.pt"
 DEFAULT_VIDEO = REPO_ROOT / "videos" / "MVI_0211.MP4"
 DEFAULT_LOG_GLOB = "MVI_0211_*_frame_log.jsonl"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "court_pose_accuracy"
