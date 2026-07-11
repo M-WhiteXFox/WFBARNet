@@ -75,6 +75,7 @@ class BallTrackFilterConfig:
     court_filter_margin_cm: float = 140.0
     court_filter_margin_px: float = 96.0
     court_air_extension_ratio: float = 1.0
+    court_air_lateral_expansion_ratio: float = 1.25
     base_gate_px: float = 80.0
     max_gate_px: float = 360.0
     missed_gate_growth_px: float = 55.0
@@ -95,6 +96,7 @@ class BallTrackFilterConfig:
     person_occlusion_min_speed_px_per_sec: float = 250.0
     person_occlusion_candidate_penalty: float = 140.0
     person_occlusion_suppress_coast_candidate_score: float = 0.35
+    person_occlusion_accept_confidence: float = 0.50
     frame_measurement_margin_px: float = 6.0
     out_of_frame_prediction_margin_px: float = 12.0
     parabola_enabled: bool = True
@@ -178,6 +180,7 @@ class _StaticHotspot:
 @dataclass(slots=True)
 class _TrajectoryPoint:
     frame_index: int
+    time_seconds: float
     point: Point
     score: float
 
@@ -227,6 +230,7 @@ class BallTrackFilter:
         self._history: deque[_TrajectoryPoint] = deque(maxlen=max(1, self.config.parabola_history_frames))
         self._static_hotspots: list[_StaticHotspot] = []
         self._frame_index = -1
+        self._time_seconds = 0.0
         self._last_frame_size: FrameSize | None = None
         self._top_exit_frames_remaining = 0
         self._ground_bounce_suppression_remaining_s = 0.0
@@ -264,6 +268,7 @@ class BallTrackFilter:
         self._history.clear()
         self._static_hotspots.clear()
         self._frame_index = -1
+        self._time_seconds = 0.0
         self._last_frame_size = None
         self._top_exit_frames_remaining = 0
         self._ground_bounce_suppression_remaining_s = 0.0
@@ -296,8 +301,9 @@ class BallTrackFilter:
                 person_bboxes=person_bboxes,
             )
 
-        self._frame_index += 1
         step_dt = self._resolve_dt(dt)
+        self._frame_index += 1
+        self._time_seconds += step_dt
         frame_size = self._resolve_frame_size(frame_shape)
         court_filter = self._court_filter(court_prediction)
         normalized_person_bboxes = self._normalize_person_bboxes(person_bboxes, frame_size)
@@ -370,23 +376,37 @@ class BallTrackFilter:
             person_occlusion_active
             and self._point_inside_person_bbox(measurement, normalized_person_bboxes)
         ):
-            suppress_coast = (
-                float(track.score) > self.config.person_occlusion_suppress_coast_candidate_score
-            )
-            if suppress_coast:
-                self._mark_decision("reject", "person_occlusion_candidate_high_score", force=True)
+            score = float(track.score)
+            if (
+                score >= self.config.person_occlusion_accept_confidence
+                and self._passes_gate(measurement, score, step_dt, frame_size)
+            ):
+                predicted = self._predict(step_dt)
+                if self._can_relax_inertia(score, _distance(measurement, predicted)):
+                    self._invalidate_parabola_on_y_direction_conflict(measurement, step_dt)
+                self._mark_decision("accept", "person_occlusion_motion_gate", force=True)
+                result = self._accept(track, measurement, step_dt, frame_size)
             else:
-                self._mark_decision("reject", "person_occlusion_candidate")
-            result = self._reject(
-                track,
-                step_dt,
-                allow_coast=not suppress_coast,
-                frame_size=frame_size,
-                court_filter=court_filter,
-                occlusion_active=True,
-                coast_reason="person_occlusion_prediction",
-            )
+                suppress_coast = (
+                    score > self.config.person_occlusion_suppress_coast_candidate_score
+                )
+                if suppress_coast:
+                    self._mark_decision("reject", "person_occlusion_candidate_high_score", force=True)
+                else:
+                    self._mark_decision("reject", "person_occlusion_candidate")
+                result = self._reject(
+                    track,
+                    step_dt,
+                    allow_coast=not suppress_coast,
+                    frame_size=frame_size,
+                    court_filter=court_filter,
+                    occlusion_active=True,
+                    coast_reason="person_occlusion_prediction",
+                )
         elif self._passes_gate(measurement, float(track.score), step_dt, frame_size):
+            predicted = self._predict(step_dt)
+            if self._can_relax_inertia(float(track.score), _distance(measurement, predicted)):
+                self._invalidate_parabola_on_y_direction_conflict(measurement, step_dt)
             if soft_measurement:
                 self._mark_decision("accept", "soft_confidence_motion_gate")
             result = self._accept(track, measurement, step_dt, frame_size)
@@ -397,7 +417,7 @@ class BallTrackFilter:
         else:
             relock = self._update_candidate(measurement, float(track.score), step_dt)
             impact_relock = self._should_impact_relock(measurement, float(track.score), step_dt)
-            fast_relock = self._should_fast_relock()
+            fast_relock = self._should_fast_relock(float(track.score))
             if (relock and self._should_relock()) or impact_relock or fast_relock:
                 self._drop_lock()
                 if impact_relock:
@@ -441,6 +461,7 @@ class BallTrackFilter:
             )
 
         step_dt = self._resolve_dt(dt)
+        target_time_seconds = self._time_seconds + step_dt
         frame_size = self._resolve_frame_size(frame_shape)
         court_filter = self._court_filter(court_prediction)
         normalized_person_bboxes = self._normalize_person_bboxes(person_bboxes, frame_size)
@@ -458,8 +479,22 @@ class BallTrackFilter:
         tracks = filtered_tracks
         candidate_frame_index = self._frame_index + 1
         self._observe_static_hotspots(tracks, frame_size, court_filter, candidate_frame_index)
-        tracks = self._filter_static_hotspots(tracks, frame_size, court_filter, step_dt, candidate_frame_index)
-        track = self._select_candidate(tracks, step_dt, frame_size, court_filter, normalized_person_bboxes)
+        tracks = self._filter_static_hotspots(
+            tracks,
+            frame_size,
+            court_filter,
+            step_dt,
+            candidate_frame_index,
+            target_time_seconds,
+        )
+        track = self._select_candidate(
+            tracks,
+            step_dt,
+            frame_size,
+            court_filter,
+            normalized_person_bboxes,
+            target_time_seconds,
+        )
         return self.update(
             track,
             dt=step_dt,
@@ -475,6 +510,7 @@ class BallTrackFilter:
         frame_size: FrameSize | None,
         court_filter: _CourtFilter | None,
         person_bboxes: Sequence[PersonBBox],
+        target_time_seconds: float,
     ) -> TrackResult:
         if not tracks:
             self._pending_candidate_debug = {
@@ -496,14 +532,20 @@ class BallTrackFilter:
                 person_bboxes,
                 selected_index=selected_index,
                 selected_rank="primary",
+                target_time_seconds=target_time_seconds,
             )
             return primary
 
-        predicted = self._predict(dt)
+        predicted = self._predict(dt, target_time_seconds=target_time_seconds)
         best_track = primary
         best_rank = float("-inf")
         best_index = -1
-        person_occlusion_active = self._person_occlusion_likely(dt, frame_size, person_bboxes)
+        person_occlusion_active = self._person_occlusion_likely(
+            dt,
+            frame_size,
+            person_bboxes,
+            target_time_seconds=target_time_seconds,
+        )
         for index, candidate in enumerate(tracks):
             rank = self._candidate_rank(
                 candidate,
@@ -514,6 +556,7 @@ class BallTrackFilter:
                 person_bboxes,
                 person_occlusion_active,
                 index,
+                target_time_seconds,
             )
             if rank > best_rank:
                 best_rank = rank
@@ -528,6 +571,7 @@ class BallTrackFilter:
             person_bboxes,
             selected_index=best_index,
             selected_rank=f"{best_rank:.4f}",
+            target_time_seconds=target_time_seconds,
         )
         return best_track
 
@@ -541,14 +585,33 @@ class BallTrackFilter:
         person_bboxes: Sequence[PersonBBox],
         person_occlusion_active: bool,
         index: int,
+        target_time_seconds: float,
     ) -> float:
         measurement = self._measurement(track, frame_size, court_filter=court_filter)
+        soft_measurement = False
+        if measurement is None and self._can_use_soft_measurement(track, frame_size, court_filter):
+            measurement = self._raw_measurement(track, frame_size)
+            soft_measurement = measurement is not None
         if measurement is None:
             return -1000.0 + float(track.score) - index * 0.05
 
         score = float(track.score)
         distance_to_prediction = _distance(measurement, predicted)
-        gate_bonus = 100.0 if self._passes_gate(measurement, score, dt, frame_size) else 0.0
+        passes_gate = self._passes_gate(
+            measurement,
+            score,
+            dt,
+            frame_size,
+            target_time_seconds=target_time_seconds,
+        )
+        if soft_measurement and not passes_gate:
+            return -500.0 + score - distance_to_prediction / 56.0 - index * 0.05
+        pending_relock_continuity = self._continues_pending_relock_candidate(
+            measurement,
+            score,
+            dt,
+        )
+        gate_bonus = 100.0 if passes_gate or pending_relock_continuity else 0.0
         distance_penalty = distance_to_prediction / 56.0
         heatmap_rank_penalty = index * 0.08
         occlusion_penalty = (
@@ -669,6 +732,8 @@ class BallTrackFilter:
         dt: float,
         frame_size: FrameSize | None,
         person_bboxes: Sequence[PersonBBox],
+        *,
+        target_time_seconds: float | None = None,
     ) -> bool:
         if not self.config.person_occlusion_enabled or not person_bboxes:
             return False
@@ -677,7 +742,7 @@ class BallTrackFilter:
         if _length(self._velocity) < max(0.0, float(self.config.person_occlusion_min_speed_px_per_sec)):
             return False
 
-        predicted = self._predict(dt)
+        predicted = self._predict(dt, target_time_seconds=target_time_seconds)
         if self._point_is_out_of_frame_prediction(predicted, frame_size):
             return False
 
@@ -736,10 +801,12 @@ class BallTrackFilter:
         score: float,
         dt: float,
         frame_size: FrameSize | None,
+        *,
+        target_time_seconds: float | None = None,
     ) -> bool:
         assert self._last_point is not None
 
-        predicted = self._predict(dt)
+        predicted = self._predict(dt, target_time_seconds=target_time_seconds)
         if self._point_is_out_of_frame_prediction(predicted, frame_size):
             return False
 
@@ -762,11 +829,14 @@ class BallTrackFilter:
         if distance_to_prediction > allowed_distance:
             return False
 
-        if not self._passes_parabola_gate(measurement, score):
+        if not self._passes_parabola_gate(
+            measurement,
+            score,
+            target_time_seconds=target_time_seconds,
+        ):
             return False
 
         if self._can_relax_inertia(score, distance_to_prediction):
-            self._invalidate_parabola_on_y_direction_conflict(measurement, dt)
             return True
 
         return self._passes_inertia(measurement, score, dt)
@@ -798,7 +868,7 @@ class BallTrackFilter:
         if self._last_point is None:
             return
 
-        parabola_prediction = self._parabola_prediction(self._frame_index)
+        parabola_prediction = self._parabola_prediction()
         if parabola_prediction is None:
             return
 
@@ -828,8 +898,14 @@ class BallTrackFilter:
             and parabola_delta_y * actual_delta_y < 0.0
         )
 
-    def _passes_parabola_gate(self, measurement: Point, score: float) -> bool:
-        prediction = self._parabola_prediction(self._frame_index)
+    def _passes_parabola_gate(
+        self,
+        measurement: Point,
+        score: float,
+        *,
+        target_time_seconds: float | None = None,
+    ) -> bool:
+        prediction = self._parabola_prediction(target_time_seconds)
         if prediction is None:
             return True
 
@@ -846,7 +922,7 @@ class BallTrackFilter:
     def _should_fill_outlier_with_parabola(self, measurement: Point) -> bool:
         if not self.config.parabola_fill_on_outlier:
             return False
-        prediction = self._parabola_prediction(self._frame_index)
+        prediction = self._parabola_prediction()
         if prediction is None:
             return False
         if self._parabola_y_direction_conflicts(measurement, prediction):
@@ -897,9 +973,9 @@ class BallTrackFilter:
         max_distance = self.config.base_gate_px * max(0.0, float(self.config.inertia_relax_prediction_gate_ratio))
         return distance_to_prediction <= max_distance
 
-    def _predict(self, dt: float) -> Point:
+    def _predict(self, dt: float, *, target_time_seconds: float | None = None) -> Point:
         assert self._last_point is not None
-        parabola_prediction = self._parabola_prediction(self._frame_index)
+        parabola_prediction = self._parabola_prediction(target_time_seconds)
         if parabola_prediction is not None:
             return parabola_prediction.point
 
@@ -996,7 +1072,7 @@ class BallTrackFilter:
         if not self._locked or self._last_point is None:
             return False
 
-        parabola_prediction = self._parabola_prediction(self._frame_index)
+        parabola_prediction = self._parabola_prediction()
         if (
             self._coast_frames < self.config.parabola_max_gap_frames
             and parabola_prediction is not None
@@ -1044,6 +1120,7 @@ class BallTrackFilter:
                 court_filter.corners,
                 margin_px=self.config.court_filter_margin_px,
                 air_extension_ratio=self.config.court_air_extension_ratio,
+                lateral_expansion_ratio=self.config.court_air_lateral_expansion_ratio,
                 frame_size=frame_size,
             )
 
@@ -1154,6 +1231,7 @@ class BallTrackFilter:
         court_filter: _CourtFilter | None,
         dt: float,
         frame_index: int,
+        target_time_seconds: float,
     ) -> list[TrackResult]:
         self._static_filtered_count = 0
         if not self.config.static_hotspot_enabled:
@@ -1168,7 +1246,13 @@ class BallTrackFilter:
                 heatmap_shape = list(track.heatmap_shape)
 
             measurement = self._measurement(track, frame_size, court_filter=court_filter)
-            if measurement is not None and self._point_matches_static_hotspot(measurement, dt, frame_index, frame_size):
+            if measurement is not None and self._point_matches_static_hotspot(
+                measurement,
+                dt,
+                frame_index,
+                frame_size,
+                target_time_seconds,
+            ):
                 self._static_filtered_count += 1
                 continue
             selected.append(track)
@@ -1220,6 +1304,7 @@ class BallTrackFilter:
         dt: float,
         frame_index: int,
         frame_size: FrameSize | None,
+        target_time_seconds: float,
     ) -> bool:
         radius = max(1.0, float(self.config.static_hotspot_radius_px))
         for hotspot in self._static_hotspots:
@@ -1231,7 +1316,7 @@ class BallTrackFilter:
                 continue
             if _distance(point, hotspot.point) > radius:
                 continue
-            if self._moving_track_can_claim_static_point(point, dt):
+            if self._moving_track_can_claim_static_point(point, dt, target_time_seconds):
                 return False
             return True
         return False
@@ -1259,13 +1344,18 @@ class BallTrackFilter:
             or point[1] >= height - y_margin
         )
 
-    def _moving_track_can_claim_static_point(self, point: Point, dt: float) -> bool:
+    def _moving_track_can_claim_static_point(
+        self,
+        point: Point,
+        dt: float,
+        target_time_seconds: float,
+    ) -> bool:
         if not self._locked or self._last_point is None:
             return False
         speed = _length(self._velocity)
         if speed < max(0.0, float(self.config.static_hotspot_tracking_speed_px_per_sec)):
             return False
-        predicted = self._predict(dt)
+        predicted = self._predict(dt, target_time_seconds=target_time_seconds)
         return _distance(point, predicted) <= max(float(self.config.close_gate_px), float(self.config.base_gate_px))
 
     def _coast(
@@ -1279,7 +1369,7 @@ class BallTrackFilter:
     ) -> TrackResult:
         assert self._last_point is not None
 
-        parabola_prediction = self._parabola_prediction(self._frame_index)
+        parabola_prediction = self._parabola_prediction()
         if parabola_prediction is not None:
             predicted = parabola_prediction.point
             self._velocity = (
@@ -1366,6 +1456,38 @@ class BallTrackFilter:
             and self._candidate.score >= self.config.relock_confidence
         )
 
+    def _continues_pending_relock_candidate(
+        self,
+        measurement: Point,
+        score: float,
+        dt: float,
+    ) -> bool:
+        if self._candidate is None or self._candidate.last_measurement is None or self._last_point is None:
+            return False
+        if self._missed_frames < self.config.impact_relock_min_missed_frames:
+            return False
+        if score < self.config.impact_relock_confidence:
+            return False
+        if self._candidate.score < self.config.impact_relock_confidence:
+            return False
+
+        relock_distance = max(
+            self.config.relock_distance_px,
+            self.config.relock_max_speed_px_per_sec * max(dt, 1e-6),
+        )
+        if _distance(measurement, self._candidate.last_measurement) > relock_distance:
+            return False
+
+        previous_direction = (
+            self._candidate.last_measurement[0] - self._last_point[0],
+            self._candidate.last_measurement[1] - self._last_point[1],
+        )
+        current_direction = (
+            measurement[0] - self._last_point[0],
+            measurement[1] - self._last_point[1],
+        )
+        return _dot(previous_direction, current_direction) > 0.0
+
     def _candidate_is_static_bootstrap_cluster(self) -> bool:
         if self._candidate is None:
             return False
@@ -1385,11 +1507,12 @@ class BallTrackFilter:
             and y_std < max(0.0, float(self.config.bootstrap_static_max_y_std_px))
         )
 
-    def _should_fast_relock(self) -> bool:
+    def _should_fast_relock(self, current_score: float) -> bool:
         if self._candidate is None:
             return False
         return (
             self._candidate.count >= 2
+            and current_score > self.config.high_score_fast_relock_confidence
             and self._candidate.score > self.config.high_score_fast_relock_confidence
             and self._candidate.direction_consistent
         )
@@ -1488,6 +1611,7 @@ class BallTrackFilter:
         items = history + [
             _TrajectoryPoint(
                 frame_index=self._frame_index,
+                time_seconds=self._time_seconds,
                 point=measurement,
                 score=float(score),
             )
@@ -1571,8 +1695,11 @@ class BallTrackFilter:
         first = history[0]
         last = history[-1]
         frame_span = max(last.frame_index - first.frame_index, 1)
+        elapsed_seconds = last.time_seconds - first.time_seconds
+        if elapsed_seconds <= 0.0:
+            elapsed_seconds = dt * frame_span
         upward_motion = first.point[1] - last.point[1]
-        upward_speed = upward_motion / max(dt * frame_span, 1e-6)
+        upward_speed = upward_motion / max(elapsed_seconds, 1e-6)
         return (
             upward_motion >= self.config.top_exit_min_up_motion_px
             and upward_speed >= abs(self.config.top_exit_min_up_speed_px_per_sec) * 0.45
@@ -1641,12 +1768,13 @@ class BallTrackFilter:
         self._history.append(
             _TrajectoryPoint(
                 frame_index=self._frame_index,
+                time_seconds=self._time_seconds,
                 point=point,
                 score=float(score),
             )
         )
 
-    def _parabola_prediction(self, target_frame: int) -> _ParabolaPrediction | None:
+    def _parabola_prediction(self, target_time_seconds: float | None = None) -> _ParabolaPrediction | None:
         if not self.config.parabola_enabled:
             return None
 
@@ -1657,13 +1785,16 @@ class BallTrackFilter:
             return None
 
         usable_history = list(self._history)[-usable_history_count:]
-        last_frame = usable_history[-1].frame_index
-        gap_frames = target_frame - last_frame
-        if gap_frames < 0 or gap_frames > self.config.parabola_max_gap_frames:
+        last_time_seconds = usable_history[-1].time_seconds
+        target_time = self._time_seconds if target_time_seconds is None else float(target_time_seconds)
+        gap_seconds = target_time - last_time_seconds
+        fps = self.config.fps if self.config.fps > 0 else 25.0
+        gap_frames_float = gap_seconds * fps
+        if gap_frames_float < -1e-6 or gap_frames_float > float(self.config.parabola_max_gap_frames):
             return None
 
         history = usable_history[-max(min_points, int(self.config.parabola_history_frames)) :]
-        if history[-1].frame_index - history[0].frame_index < min_points - 1:
+        if history[-1].time_seconds - history[0].time_seconds <= 1e-9:
             return None
 
         first_point = history[0].point
@@ -1671,7 +1802,7 @@ class BallTrackFilter:
         if motion_span < self.config.parabola_min_motion_px:
             return None
 
-        times = [float(item.frame_index - last_frame) for item in history]
+        times = [float(item.time_seconds - last_time_seconds) for item in history]
         xs = [float(item.point[0]) for item in history]
         ys = [float(item.point[1]) for item in history]
         coeff_x = _fit_quadratic(times, xs)
@@ -1688,12 +1819,16 @@ class BallTrackFilter:
         if not isfinite(fit_rmse) or fit_rmse > self.config.parabola_max_fit_rmse_px:
             return None
 
-        target_t = float(target_frame - last_frame)
+        target_t = float(target_time - last_time_seconds)
         predicted = (_eval_quadratic(coeff_x, target_t), _eval_quadratic(coeff_y, target_t))
         if not isfinite(predicted[0]) or not isfinite(predicted[1]):
             return None
 
-        return _ParabolaPrediction(point=predicted, fit_rmse=fit_rmse, gap_frames=max(0, gap_frames))
+        return _ParabolaPrediction(
+            point=predicted,
+            fit_rmse=fit_rmse,
+            gap_frames=max(0, int(round(gap_frames_float))),
+        )
 
     def _smooth_render_point(self, measurement: Point) -> Point:
         smoothing = min(max(self.config.render_smoothing, 0.0), 0.85)
@@ -1807,14 +1942,35 @@ class BallTrackFilter:
         *,
         selected_index: int,
         selected_rank: str,
+        target_time_seconds: float,
     ) -> dict[str, object]:
         items = []
-        predicted: Point | None = self._predict(dt) if self._last_point is not None else None
+        predicted: Point | None = (
+            self._predict(dt, target_time_seconds=target_time_seconds)
+            if self._last_point is not None
+            else None
+        )
+        person_occlusion_active = self._person_occlusion_likely(
+            dt,
+            frame_size,
+            person_bboxes,
+            target_time_seconds=target_time_seconds,
+        )
         for index, track in enumerate(tracks):
             measurement = self._measurement(track, frame_size, court_filter=court_filter)
+            if measurement is None and self._can_use_soft_measurement(track, frame_size, court_filter):
+                measurement = self._raw_measurement(track, frame_size)
             distance = _distance(measurement, predicted) if measurement is not None and predicted is not None else -1.0
             gate = (
-                int(self._passes_gate(measurement, float(track.score), dt, frame_size))
+                int(
+                    self._passes_gate(
+                        measurement,
+                        float(track.score),
+                        dt,
+                        frame_size,
+                        target_time_seconds=target_time_seconds,
+                    )
+                )
                 if measurement is not None and self._locked and self._last_point is not None
                 else -1
             )
@@ -1826,15 +1982,16 @@ class BallTrackFilter:
                     frame_size,
                     court_filter,
                     person_bboxes,
-                    self._person_occlusion_likely(dt, frame_size, person_bboxes),
+                    person_occlusion_active,
                     index,
+                    target_time_seconds,
                 )
                 if predicted is not None and self._locked and self._last_point is not None
                 else float("nan")
             )
             person_occ = int(
                 measurement is not None
-                and self._person_occlusion_likely(dt, frame_size, person_bboxes)
+                and person_occlusion_active
                 and self._point_inside_person_bbox(measurement, person_bboxes)
             )
             x = track.ball_xy[0] if len(track.ball_xy) > 0 else -1.0
@@ -2035,6 +2192,7 @@ def _point_inside_projected_court_air(
     *,
     margin_px: float,
     air_extension_ratio: float,
+    lateral_expansion_ratio: float = 0.0,
     frame_size: FrameSize | None,
 ) -> bool:
     tl, tr, br, bl = corners
@@ -2058,8 +2216,10 @@ def _point_inside_projected_court_air(
         left_x = min(xs)
         right_x = max(xs)
 
-    min_x = min(left_x, right_x) - margin
-    max_x = max(left_x, right_x) + margin
+    above_court = min(max(0.0, top_y - y), extension)
+    lateral_margin = margin + above_court * max(0.0, float(lateral_expansion_ratio))
+    min_x = min(left_x, right_x) - lateral_margin
+    max_x = max(left_x, right_x) + lateral_margin
     return min_x <= x <= max_x
 
 

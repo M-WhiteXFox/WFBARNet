@@ -79,7 +79,11 @@ class UnifiedRunner:
         for frame_id, frame, window in tqdm(list(iter_frame_windows(frames)), desc="Unified inference"):
             pose = self.pose_branch.infer(frame)
             candidates = self.track_branch.infer_candidate_results(window)
-            track = track_filter.update_candidates(candidates, frame_shape=frame.shape)
+            track = track_filter.update_candidates(
+                candidates,
+                frame_shape=frame.shape,
+                person_bboxes=_pose_bboxes(pose),
+            )
             outputs.append(FrameResult(frame_id=frame_id, pose=pose, track=track))
         self.track_debug_records = list(track_filter.debug_records)
         return outputs
@@ -107,7 +111,11 @@ class UnifiedRunner:
             ):
                 pose = self.pose_branch.infer(frame)
                 candidates = self.track_branch.infer_candidate_results(window)
-                track = track_filter.update_candidates(candidates, frame_shape=frame.shape)
+                track = track_filter.update_candidates(
+                    candidates,
+                    frame_shape=frame.shape,
+                    person_bboxes=_pose_bboxes(pose),
+                )
                 result = FrameResult(frame_id=frame_id, pose=pose, track=track)
                 outputs.append(result)
                 if writer is not None:
@@ -132,7 +140,30 @@ class UnifiedRunner:
             with torch.cuda.stream(track_stream):
                 candidates = self.track_branch.infer_candidate_results(window)
             torch.cuda.synchronize()
-            track = track_filter.update_candidates(candidates, frame_shape=frame.shape)
+            track = track_filter.update_candidates(
+                candidates,
+                frame_shape=frame.shape,
+                person_bboxes=_pose_bboxes(pose),
+            )
             outputs.append(FrameResult(frame_id=frame_id, pose=pose, track=track))
         self.track_debug_records = list(track_filter.debug_records)
         return outputs
+
+
+def _pose_bboxes(poses: object) -> list[tuple[float, float, float, float]]:
+    if not isinstance(poses, list):
+        return []
+
+    bboxes: list[tuple[float, float, float, float]] = []
+    for pose in poses:
+        bbox = getattr(pose, "bbox", None)
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
+        except (TypeError, ValueError):
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+        bboxes.append((x1, y1, x2, y2))
+    return bboxes

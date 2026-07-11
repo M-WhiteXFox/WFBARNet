@@ -2184,6 +2184,8 @@ def snap_corners_by_outer_edge_fits(
     mask: np.ndarray,
     points: np.ndarray,
     args: argparse.Namespace,
+    *,
+    prefer_outer_cluster: bool = False,
 ) -> tuple[np.ndarray, list[bool]]:
     ordered = order_quad_points(points)
     if ordered is None:
@@ -2192,7 +2194,14 @@ def snap_corners_by_outer_edge_fits(
     edge_pairs = [(0, 1), (1, 2), (2, 3), (3, 0)]
     court_center = np.mean(ordered, axis=0).astype(np.float32)
     fitted_edges = [
-        fit_outer_edge_line(mask, ordered[start], ordered[end], args, court_center, prefer_outer_cluster=False)
+        fit_outer_edge_line(
+            mask,
+            ordered[start],
+            ordered[end],
+            args,
+            court_center,
+            prefer_outer_cluster=prefer_outer_cluster,
+        )
         for index, (start, end) in enumerate(edge_pairs)
     ]
     snapped = ordered.copy()

@@ -75,10 +75,10 @@ assets/weights/
 ├─ track/
 ├─ pose/
 ├─ bst/
-└─ ShuttleCourtNet/
+└─ court_pose/
 ```
 
-权重文件通常体积较大，默认不随仓库一起发布，也不会在启动时自动下载。请根据自己的使用场景，把对应模型文件放到上述目录。
+权重文件不随仓库一起发布，也不会在启动时自动下载。请根据自己的使用场景，把对应模型文件放到上述目录。模型文件请到Releases下载。
 
 更多说明见 [assets/weights/README.md](assets/weights/README.md)。
 

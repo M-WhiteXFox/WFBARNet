@@ -17,10 +17,11 @@ from src.court.shuttlecourt_seg_detector import (
     ShuttleCourtSegConfig,
     ShuttleCourtSegLineDetector,
 )
+from src.court.court_pose_detector import CourtPoseConfig, CourtPoseLineDetector
 
 
-CourtLineBackend = Literal["shuttlecourt_seg", "monotrack", "opencv"]
-CourtLineConfig = ShuttleCourtSegConfig | MonoTrackCourtLineConfig | OpenCVCourtLineConfig
+CourtLineBackend = Literal["court_pose", "shuttlecourt_seg", "monotrack", "opencv"]
+CourtLineConfig = CourtPoseConfig | ShuttleCourtSegConfig | MonoTrackCourtLineConfig | OpenCVCourtLineConfig
 
 
 @runtime_checkable
@@ -47,6 +48,10 @@ def create_court_line_detector(
     *,
     config: CourtLineConfig | None = None,
 ) -> CourtLineDetector:
+    if backend == "court_pose":
+        if config is not None and not isinstance(config, CourtPoseConfig):
+            raise TypeError("Court pose detector requires CourtPoseConfig.")
+        return CourtPoseLineDetector(config)
     if backend == "shuttlecourt_seg":
         if config is not None and not isinstance(config, ShuttleCourtSegConfig):
             raise TypeError("ShuttleCourt segmentation detector requires ShuttleCourtSegConfig.")

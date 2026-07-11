@@ -3,6 +3,8 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+import numpy as np
+
 from apps.pyqt6.controllers.analysis_controller_runtime import (
     MainController,
     frame_step_seconds,
@@ -33,6 +35,8 @@ class _FakeView:
         self.logs: list[str] = []
         self.input_mode = ""
         self.video_state = ""
+        self.court_overlay = None
+        self.shown_frame = None
 
     def set_model_settings(self, pose_path: str, track_path: str) -> None:
         self.model_settings = (pose_path, track_path)
@@ -57,6 +61,24 @@ class _FakeView:
 
     def set_video_state(self, state: str) -> None:
         self.video_state = state
+
+    def show_video_frame(self, *args, **kwargs) -> None:
+        self.shown_frame = (args, kwargs)
+
+    def update_progress(self, value: int) -> None:
+        self.progress = value
+
+    def set_court_overlay(self, payload: object) -> None:
+        self.court_overlay = payload
+
+
+class _FakeCourtService:
+    def __init__(self) -> None:
+        self.submissions: list[tuple[np.ndarray, int, int]] = []
+
+    def submit_frame(self, frame: np.ndarray, frame_id: int, timestamp_ms: int) -> bool:
+        self.submissions.append((frame, frame_id, timestamp_ms))
+        return True
 
 
 def _controller_init_patches():
@@ -103,6 +125,63 @@ class CameraStartupTest(unittest.TestCase):
             controller.handle_input_mode("camera")
 
         refresh.assert_called_once_with(log=True)
+
+    def test_video_probe_submits_preview_frame_for_automatic_court_calibration(self) -> None:
+        view = _FakeView()
+        court_service = _FakeCourtService()
+        controller = object.__new__(MainController)
+        controller.view = view
+        controller._court_service = court_service
+        controller._selected_video_path = "sample.mp4"
+        controller._probe_worker = None
+        controller._video_meta = {}
+        controller._latest_court_prediction_dict = lambda: None
+        controller._reset_court_detection = lambda *, request_initial_prediction: setattr(
+            controller,
+            "court_prediction_requested",
+            request_initial_prediction,
+        )
+        controller._set_idle_state = lambda: None
+        controller._release_probe_worker = lambda worker: None
+        frame = np.zeros((48, 64, 3), dtype=np.uint8)
+        payload = {
+            "fps": 25.0,
+            "width": 64,
+            "height": 48,
+            "duration_ms": 1000,
+            "position_ms": 40,
+            "frame_id": 1,
+            "image": object(),
+            "court_frame": frame,
+        }
+
+        controller._on_probe_finished("sample.mp4", payload)
+
+        self.assertTrue(controller.court_prediction_requested)
+        self.assertEqual(len(court_service.submissions), 1)
+        self.assertIs(court_service.submissions[0][0], frame)
+        self.assertEqual(court_service.submissions[0][1:], (1, 40))
+        self.assertNotIn("court_frame", controller._video_meta)
+
+    def test_automatic_court_result_updates_preview_overlay(self) -> None:
+        view = _FakeView()
+        controller = object.__new__(MainController)
+        controller.view = view
+        controller._last_court_log_frame = -1
+        payload = {
+            "frame_id": 3,
+            "valid": True,
+            "updated": True,
+            "confidence": 0.94,
+            "detect_ms": 800.0,
+            "scheme": "court_pose_white_line",
+            "corners": [[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0]],
+        }
+
+        controller._on_court_prediction_ready(payload)
+
+        self.assertIs(view.court_overlay, payload)
+        self.assertTrue(any("自动标定完成" in message for message in view.logs))
 
 
 if __name__ == "__main__":

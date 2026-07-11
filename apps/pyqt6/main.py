@@ -160,10 +160,10 @@ def main() -> int:
     if not icon.isNull():
         window.setWindowIcon(icon)
 
-    update_startup(56, "正在初始化手动标定服务...")
-    from apps.pyqt6.services.manual_court_calibration_service import create_manual_court_calibration_service
+    update_startup(56, "正在初始化自动球场标定服务...")
+    from apps.pyqt6.services.automatic_court_calibration_service import create_automatic_court_calibration_service
 
-    court_service = create_manual_court_calibration_service()
+    court_service = create_automatic_court_calibration_service()
 
     update_startup(78, "正在连接控制器...")
     from apps.pyqt6.controllers.analysis_controller_runtime import MainController

@@ -9,6 +9,8 @@ import cv2
 import numpy as np
 
 from src.court import (
+    CourtPoseConfig,
+    CourtPoseLineDetector,
     CourtLineDetector,
     MonoTrackCourtLineConfig,
     MonoTrackCourtLineDetector,
@@ -85,6 +87,32 @@ class _FakeSegModel:
         return [self.result]
 
 
+class _FakePoseKeypoints:
+    def __init__(self, points: np.ndarray, confidences: np.ndarray | None = None) -> None:
+        self.xy = np.asarray([points], dtype=np.float32)
+        self.conf = (
+            np.asarray([confidences], dtype=np.float32)
+            if confidences is not None
+            else np.ones((1, len(points)), dtype=np.float32)
+        )
+
+
+class _FakePoseResult:
+    def __init__(self, points: np.ndarray, confidence: float = 0.95) -> None:
+        self.keypoints = _FakePoseKeypoints(points)
+        self.boxes = _FakeBoxes([confidence], [0])
+
+
+class _FakePoseModel:
+    def __init__(self, points: np.ndarray) -> None:
+        self.result = _FakePoseResult(points)
+        self.last_kwargs: dict | None = None
+
+    def predict(self, frame: np.ndarray, **kwargs: object) -> list[_FakePoseResult]:
+        self.last_kwargs = kwargs
+        return [self.result]
+
+
 class OpenCVCourtLineDetectorTest(unittest.TestCase):
     def test_detector_factory_returns_interface_compatible_detector(self) -> None:
         detector = create_court_line_detector()
@@ -97,6 +125,15 @@ class OpenCVCourtLineDetectorTest(unittest.TestCase):
 
         self.assertIsInstance(detector, CourtLineDetector)
         self.assertIsInstance(detector, OpenCVCourtLineDetector)
+
+    def test_court_pose_backend_returns_pose_detector(self) -> None:
+        detector = create_court_line_detector(
+            backend="court_pose",
+            config=CourtPoseConfig(device="cpu"),
+        )
+
+        self.assertIsInstance(detector, CourtLineDetector)
+        self.assertIsInstance(detector, CourtPoseLineDetector)
 
     def test_predict_court_lines_module_api(self) -> None:
         result = predict_court_lines(
@@ -309,6 +346,53 @@ class OpenCVCourtLineDetectorTest(unittest.TestCase):
         self.assertTrue(result.valid, result.to_dict())
         self.assertEqual(components.get("seg_line_fit"), 1.0)
         self.assertLess(detected_error, seg_error * 0.65)
+
+    def test_court_pose_detector_refines_coarse_surface_boundary_to_white_lines(self) -> None:
+        frame = np.full((360, 520, 3), (45, 120, 45), dtype=np.uint8)
+        true_corners = np.asarray(
+            [
+                [130.0, 42.0],
+                [390.0, 48.0],
+                [448.0, 314.0],
+                [80.0, 304.0],
+            ],
+            dtype=np.float32,
+        )
+        court_to_image_h, _ = court_core.compute_homographies(true_corners)
+        if court_to_image_h is None:
+            raise AssertionError("synthetic court should produce a valid homography")
+        for name, points in court_core.project_template_lines(court_to_image_h).items():
+            line_points = np.asarray(points, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(frame, [line_points], name == "doubles_outer", (245, 245, 245), 5, lineType=cv2.LINE_AA)
+
+        coarse_corners = true_corners + np.asarray(
+            [[-28.0, -20.0], [28.0, -20.0], [28.0, 20.0], [-28.0, 20.0]],
+            dtype=np.float32,
+        )
+        model = _FakePoseModel(coarse_corners)
+        detector = CourtPoseLineDetector(
+            CourtPoseConfig(
+                device="cpu",
+                min_mask_area_ratio=0.001,
+                hough_threshold=20,
+                seg_line_min_area_ratio=0.30,
+                reliable_conf=0.10,
+                medium_conf=0.05,
+                snap_response_threshold=0.08,
+            ),
+            model=model,
+        )
+
+        result = detector.predict(frame, frame_id=9, timestamp_ms=360, force=True)
+        self.assertTrue(result.valid, result.to_dict())
+        detected = np.asarray(result.corners, dtype=np.float32)
+        coarse_error = float(np.mean(np.linalg.norm(coarse_corners - true_corners, axis=1)))
+        detected_error = float(np.mean(np.linalg.norm(detected - true_corners, axis=1)))
+
+        self.assertEqual(result.scheme, "court_pose_white_line", result.to_dict())
+        self.assertEqual(result.metrics.get("components", {}).get("pose_white_line_refined"), 1.0)
+        self.assertLess(detected_error, coarse_error * 0.65, result.to_dict())
+        self.assertEqual(model.last_kwargs["imgsz"], 512)
 
     def test_blank_frame_returns_stable_payload(self) -> None:
         detector = OpenCVCourtLineDetector()

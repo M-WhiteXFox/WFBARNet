@@ -9,6 +9,7 @@ from src.court.opencv_court_detector import (
 )
 from src.court.monotrack_court_detector import MonoTrackCourtLineConfig, MonoTrackCourtLineDetector
 from src.court.shuttlecourt_seg_detector import ShuttleCourtSegConfig, ShuttleCourtSegLineDetector
+from src.court.court_pose_detector import CourtPoseConfig, CourtPoseLineDetector
 from src.court.court_line_detector import (
     CourtLineBackend,
     CourtLineConfig,
@@ -23,6 +24,8 @@ __all__ = [
     "CourtLineDetector",
     "CourtLineOverlayRenderer",
     "CourtLinePrediction",
+    "CourtPoseConfig",
+    "CourtPoseLineDetector",
     "MonoTrackCourtLineConfig",
     "MonoTrackCourtLineDetector",
     "OpenCVCourtLineConfig",

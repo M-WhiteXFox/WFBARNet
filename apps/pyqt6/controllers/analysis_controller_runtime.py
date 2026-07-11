@@ -15,6 +15,7 @@ from typing import Any
 import importlib.util
 
 import cv2
+import numpy as np
 import torch
 from PyQt6.QtCore import QElapsedTimer, QSettings, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage
@@ -399,7 +400,9 @@ class VideoProbeWorker(QThread):
             "frame_count": frame_count,
             "duration_ms": duration_ms,
             "position_ms": max(0, int(round(position_ms))),
+            "frame_id": max(0, int(round((position_ms / 1000.0) * fps))),
             "image": frame_to_qimage(frame),
+            "court_frame": frame,
         }
         cap.release()
         self.finished.emit(self._file_path, payload)
@@ -1712,25 +1715,26 @@ class MainController:
                 self._court_service.request_prediction()
 
     def _request_court_prediction(self) -> None:
-        self.handle_manual_court_calibration()
+        if self._court_service is not None:
+            self._court_service.request_prediction()
 
     def handle_manual_court_calibration(self) -> None:
         if self._manual_court_active:
             self._finish_manual_court_calibration(cancelled=True)
             return
         if self._is_inference_running():
-            self.view.append_log("[Court] 请先停止当前推理任务，再进行手动标定。")
+            self.view.append_log("[Court] 请先停止当前推理任务，再重新标注球场。")
             return
         if self._input_mode == "batch":
-            self.view.append_log("[Court] 批量模式暂不支持逐视频手动标定。")
+            self.view.append_log("[Court] 批量模式暂不支持逐视频重新标注。")
             return
         if self.view.video_player.source_size() is None:
-            self.view.append_log("[Court] 请先选择视频或打开摄像头预览，再进行手动标定。")
+            self.view.append_log("[Court] 请先选择视频或打开摄像头预览，再重新标注球场。")
             return
         self._manual_court_points = []
         self._manual_court_active = True
         self.view.set_manual_court_capture_enabled(True)
-        self.view.append_log("[Court] 手动标定开始：请依次点击外框四角 TL, TR, BR, BL。")
+        self.view.append_log("[Court] 重新标注开始：请依次点击外框四角 TL, TR, BR, BL。")
 
     def handle_manual_court_point_selected(self, x: float, y: float) -> None:
         if not self._manual_court_active:
@@ -1749,7 +1753,7 @@ class MainController:
         try:
             set_calibration = getattr(self._court_service, "set_calibration", None)
             if not callable(set_calibration):
-                raise RuntimeError("manual calibration service is not available")
+                raise RuntimeError("court calibration correction service is not available")
             prediction = set_calibration(
                 self._manual_court_points,
                 source_size=source_size,
@@ -1758,13 +1762,13 @@ class MainController:
             )
         except Exception as exc:
             self._finish_manual_court_calibration(cancelled=True)
-            self.view.append_log(f"[Court] 手动标定失败: {exc}")
+            self.view.append_log(f"[Court] 重新标注失败: {exc}")
             return
 
         payload = prediction.to_dict() if hasattr(prediction, "to_dict") else prediction
         self.view.set_court_overlay(payload)
         self._finish_manual_court_calibration(cancelled=False)
-        self.view.append_log("[Court] 手动标定完成，后续分析将使用该球场映射。")
+        self.view.append_log("[Court] 重新标注完成，已覆盖自动标定结果；后续分析将使用修正后的球场映射。")
 
     def handle_manual_court_corner_dragged(self, corner_index: int, x: float, y: float) -> None:
         if self._manual_court_active:
@@ -1800,7 +1804,7 @@ class MainController:
         self._manual_court_points = []
         self.view.set_manual_court_capture_enabled(False)
         if cancelled:
-            self.view.append_log("[Court] 已取消手动标定。")
+            self.view.append_log("[Court] 已取消重新标注。")
 
     def _clear_manual_court_calibration(self) -> None:
         self._finish_manual_court_calibration(cancelled=False)
@@ -1825,6 +1829,8 @@ class MainController:
     def _on_court_prediction_ready(self, payload: object) -> None:
         if not isinstance(payload, dict):
             return
+        if bool(payload.get("valid")):
+            self.view.set_court_overlay(payload)
         frame_id = int(payload.get("frame_id", -1))
         if frame_id == self._last_court_log_frame:
             return
@@ -1837,15 +1843,18 @@ class MainController:
             detect_ms = float(payload.get("detect_ms", 0.0))
             scheme = str(payload.get("scheme", "manual"))
             if scheme == "manual":
-                self.view.append_log(f"[Court] manual calibration updated | frame {frame_id} | conf {confidence:.2f}")
+                self.view.append_log(f"[Court] 人工修正已更新 | frame {frame_id} | conf {confidence:.2f}")
             else:
-                self.view.append_log(f"[Court] court updated | frame {frame_id} | conf {confidence:.2f} | {detect_ms:.0f} ms")
+                self.view.append_log(
+                    f"[Court] 自动标定完成 | {scheme} | frame {frame_id} | "
+                    f"conf {confidence:.2f} | {detect_ms:.0f} ms；可点击重新标注或拖动角点修正。"
+                )
         elif not valid and self._last_court_log_frame < 0:
             self._last_court_log_frame = frame_id
-            self.view.append_log("[Court] waiting for manual court calibration.")
+            self.view.append_log("[Court] 自动标定未找到可靠球场，可点击“重新标注球场”手动修正。")
 
     def _on_court_detection_failed(self, message: str) -> None:
-        self.view.append_log(f"[Court] manual court calibration failed: {message}")
+        self.view.append_log(f"[Court] 自动标定失败: {message}；可点击“重新标注球场”手动修正。")
 
     def _load_model_path(self, key: str, default_path: str) -> str:
         raw_value = self._settings.value(key, default_path)
@@ -2485,7 +2494,8 @@ class MainController:
             if file_path != self._selected_video_path or not isinstance(payload, dict):
                 return
 
-            self._video_meta = payload
+            court_frame = payload.get("court_frame")
+            self._video_meta = {key: value for key, value in payload.items() if key != "court_frame"}
             self.view.show_video_frame(
                 payload["image"],
                 int(payload.get("position_ms", 0)),
@@ -2499,6 +2509,15 @@ class MainController:
                 f"{payload.get('width', 0)} x {payload.get('height', 0)} | "
                 f"FPS {float(payload.get('fps', 0.0)):.2f}"
             )
+            if isinstance(court_frame, np.ndarray) and self._court_service is not None:
+                self._reset_court_detection(request_initial_prediction=True)
+                submitted = self._court_service.submit_frame(
+                    court_frame,
+                    int(payload.get("frame_id", 0)),
+                    int(payload.get("position_ms", 0)),
+                )
+                if submitted:
+                    self.view.append_log("[Court] 正在使用球场模型进行自动标定...")
             self._set_idle_state()
         finally:
             self._release_probe_worker(worker)

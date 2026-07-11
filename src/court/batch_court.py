@@ -6,6 +6,7 @@ from typing import Callable
 import numpy as np
 
 from src.court.court_line_detector import CourtLineBackend, CourtLineDetector, create_court_line_detector
+from src.court.court_pose_detector import resolve_court_pose_weights
 from src.court.opencv_court_detector import CourtLinePrediction
 from src.court.shuttlecourt_seg_detector import resolve_shuttlecourt_weights
 
@@ -16,6 +17,12 @@ DetectorFactory = Callable[[CourtLineBackend], CourtLineDetector]
 def default_batch_court_backends() -> tuple[CourtLineBackend, ...]:
     """Return the batch court fallback order available in the current workspace."""
     backends: list[CourtLineBackend] = []
+    try:
+        resolve_court_pose_weights("assets/weights/court_pose/best.pt")
+    except FileNotFoundError:
+        pass
+    else:
+        backends.append("court_pose")
     try:
         resolve_shuttlecourt_weights("weights/shttlecourtnet")
     except FileNotFoundError:

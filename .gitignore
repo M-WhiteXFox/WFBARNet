@@ -75,6 +75,7 @@ ENV/
 
 # Datasets and large local assets
 datasets/
+Dataset/
 data/
 *.npy
 *.npz
@@ -123,5 +124,9 @@ assets/docs/
 # README media should be committed.
 !assets/readme/
 !assets/readme/**
+
+# Bundled court calibration model required by the automatic court workflow.
+!assets/weights/court_pose/
+!assets/weights/court_pose/best.pt
 
 AgentPlan.md

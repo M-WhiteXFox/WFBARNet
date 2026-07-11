@@ -1051,8 +1051,9 @@ class MainWindow(QMainWindow):
         court_controls_layout.setSpacing(8)
         court_controls_layout.addStretch(1)
 
-        self.btn_redetect_court = QPushButton("手动标定球场")
+        self.btn_redetect_court = QPushButton("重新标注球场")
         self.btn_redetect_court.setObjectName("btnRedetectCourt")
+        self.btn_redetect_court.setToolTip("自动标定完成后，可重新点击四角或直接拖动角点进行修正")
         self.btn_redetect_court.setEnabled(False)
         self.btn_redetect_court.clicked.connect(self.manualCourtCalibrationRequested.emit)
         court_controls_layout.addWidget(self.btn_redetect_court)
@@ -1773,7 +1774,7 @@ class MainWindow(QMainWindow):
 
     def set_manual_court_capture_enabled(self, enabled: bool) -> None:
         self.video_player.set_point_capture_enabled(enabled)
-        self.btn_redetect_court.setText("取消标定" if enabled else "手动标定球场")
+        self.btn_redetect_court.setText("取消重新标注" if enabled else "重新标注球场")
 
     def set_court_overlay(self, court: object | None) -> None:
         self.video_player.set_court_overlay(court)

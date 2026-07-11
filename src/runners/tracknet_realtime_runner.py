@@ -3,16 +3,21 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Optional
 
 import cv2
 import numpy as np
 
 from src.models.track_branch import TrackBranch
+from src.postprocess.track_filter import TrackFilterAlgorithm
 from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
 from src.utils.exporters import export_csv, export_json, export_npy, export_track_debug_csv
 from src.utils.structures import FrameResult, TrackResult
 from src.utils.visualize import TrackTrailRenderer
+
+
+TRACK_STATE_RESET_GAP_SECONDS = 0.75
 
 
 def _parse_capture_source(source: str) -> str | int:
@@ -39,7 +44,9 @@ class TrackNetRealtimeRunner:
     ) -> list[FrameResult]:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        cap = cv2.VideoCapture(_parse_capture_source(source))
+        capture_source = _parse_capture_source(source)
+        live_source = isinstance(capture_source, int)
+        cap = cv2.VideoCapture(capture_source)
         if not cap.isOpened():
             raise FileNotFoundError(f"Unable to open realtime source: {source}")
 
@@ -61,6 +68,7 @@ class TrackNetRealtimeRunner:
         results: list[FrameResult] = []
 
         ok, first_frame = cap.read()
+        first_capture_time = perf_counter() if live_source else 0.0
         if not ok:
             cap.release()
             if writer is not None:
@@ -68,12 +76,17 @@ class TrackNetRealtimeRunner:
             raise RuntimeError("The realtime source opened but returned no frames.")
 
         ok, second_frame = cap.read()
+        second_capture_time = perf_counter() if live_source else 1.0 / fps
         if not ok:
             second_frame = first_frame.copy()
+            second_capture_time = first_capture_time + 1.0 / fps
 
         prev_frame = first_frame.copy()
         curr_frame = first_frame
         next_frame = second_frame
+        curr_capture_time = first_capture_time
+        next_capture_time = second_capture_time
+        previous_track_time: float | None = None
         frame_id = 0
         ema_fps = 0.0
         tick_frequency = cv2.getTickFrequency()
@@ -84,7 +97,12 @@ class TrackNetRealtimeRunner:
             start_tick = cv2.getTickCount()
 
             candidates = self.track_branch.infer_candidate_results([prev_frame, curr_frame, next_frame])
-            track = track_filter.update_candidates(candidates, frame_shape=curr_frame.shape)
+            track_dt = _frame_step_seconds(curr_capture_time, previous_track_time, fps)
+            if track_dt > TRACK_STATE_RESET_GAP_SECONDS:
+                _reset_filter_state_preserving_debug(track_filter)
+                track_dt = 1.0 / fps
+            track = track_filter.update_candidates(candidates, dt=track_dt, frame_shape=curr_frame.shape)
+            previous_track_time = curr_capture_time
             result = FrameResult(frame_id=frame_id, pose=[], track=track)
             results.append(result)
 
@@ -107,14 +125,24 @@ class TrackNetRealtimeRunner:
 
             prev_frame = curr_frame
             curr_frame = next_frame
+            curr_capture_time = next_capture_time
             ok, incoming = cap.read()
+            incoming_capture_time = perf_counter() if live_source else (frame_id + 2) / fps
             if not ok:
                 if frame_id == 0:
                     break
                 next_frame = curr_frame.copy()
                 frame_id += 1
                 final_candidates = self.track_branch.infer_candidate_results([prev_frame, curr_frame, next_frame])
-                final_track = track_filter.update_candidates(final_candidates, frame_shape=curr_frame.shape)
+                final_dt = _frame_step_seconds(curr_capture_time, previous_track_time, fps)
+                if final_dt > TRACK_STATE_RESET_GAP_SECONDS:
+                    _reset_filter_state_preserving_debug(track_filter)
+                    final_dt = 1.0 / fps
+                final_track = track_filter.update_candidates(
+                    final_candidates,
+                    dt=final_dt,
+                    frame_shape=curr_frame.shape,
+                )
                 final_result = FrameResult(frame_id=frame_id, pose=[], track=final_track)
                 results.append(final_result)
                 final_vis = self._draw_overlay(curr_frame.copy(), final_result, ema_fps, trail_renderer)
@@ -125,6 +153,7 @@ class TrackNetRealtimeRunner:
                     cv2.waitKey(1)
                 break
             next_frame = incoming
+            next_capture_time = incoming_capture_time
             frame_id += 1
 
         cap.release()
@@ -195,3 +224,17 @@ class TrackNetRealtimeRunner:
                 (0, 120, 255),
                 2,
             )
+
+
+def _frame_step_seconds(current_time: float, previous_time: float | None, fps: float) -> float:
+    fallback = 1.0 / fps if fps > 0 else 1.0 / 25.0
+    if previous_time is None:
+        return fallback
+    elapsed = float(current_time) - float(previous_time)
+    return elapsed if elapsed > 0.0 else fallback
+
+
+def _reset_filter_state_preserving_debug(track_filter: TrackFilterAlgorithm) -> None:
+    debug_records = list(track_filter.debug_records)
+    track_filter.reset()
+    track_filter.debug_records.extend(debug_records)
