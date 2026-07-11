@@ -537,6 +537,72 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
         self.assertFalse(suppressed.visible)
         self.assertEqual(track_filter.last_debug_record()["reason"], "active_ground_bounce_suppression")
 
+    def test_runtime_filter_stops_compact_high_confidence_ground_bounce(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=20.0, debug_enabled=True)
+        frame_shape = (500, 500, 3)
+        far_person = [(350.0, 100.0, 450.0, 400.0)]
+        samples = [
+            (100.0, 300.0, 0.90),
+            (102.0, 350.0, 0.90),
+            (104.0, 410.0, 0.90),
+            (106.0, 450.0, 0.85),
+            (105.0, 444.0, 0.88),
+        ]
+        for x, y, score in samples:
+            result = track_filter.update_candidates(
+                [_track(x, y, score)],
+                dt=0.05,
+                frame_shape=frame_shape,
+                person_bboxes=far_person,
+            )
+            self.assertTrue(result.visible)
+
+        stopped = track_filter.update_candidates(
+            [_track(104.0, 439.0, 0.92)],
+            dt=0.05,
+            frame_shape=frame_shape,
+            person_bboxes=far_person,
+        )
+        suppressed = track_filter.update_candidates(
+            [_missing(0.90)],
+            dt=0.05,
+            frame_shape=frame_shape,
+        )
+
+        self.assertFalse(stopped.visible)
+        self.assertEqual(track_filter.debug_records[-2]["reason"], "compact_ground_bounce")
+        self.assertFalse(suppressed.visible)
+        self.assertEqual(track_filter.last_debug_record()["reason"], "active_ground_bounce_suppression")
+
+    def test_runtime_filter_keeps_compact_high_confidence_reversal_near_player(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=20.0, debug_enabled=True)
+        frame_shape = (500, 500, 3)
+        nearby_person = [(80.0, 250.0, 150.0, 490.0)]
+        samples = [
+            (100.0, 300.0, 0.90),
+            (102.0, 350.0, 0.90),
+            (104.0, 410.0, 0.90),
+            (106.0, 450.0, 0.85),
+            (105.0, 444.0, 0.88),
+        ]
+        for x, y, score in samples:
+            track_filter.update_candidates(
+                [_track(x, y, score)],
+                dt=0.05,
+                frame_shape=frame_shape,
+                person_bboxes=nearby_person,
+            )
+
+        continued = track_filter.update_candidates(
+            [_track(104.0, 439.0, 0.92)],
+            dt=0.05,
+            frame_shape=frame_shape,
+            person_bboxes=nearby_person,
+        )
+
+        self.assertTrue(continued.visible)
+        self.assertNotEqual(track_filter.last_debug_record()["reason"], "compact_ground_bounce")
+
     def test_runtime_filter_keeps_high_confidence_upward_hit_near_ground(self) -> None:
         track_filter = create_tracknet_v3_ball_track_filter(fps=20.0, debug_enabled=True)
         frame_shape = (500, 500, 3)

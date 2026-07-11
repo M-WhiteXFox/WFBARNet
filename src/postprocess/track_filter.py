@@ -140,6 +140,10 @@ class BallTrackFilterConfig:
     ground_bounce_guard_min_low_score_points: int = 2
     ground_bounce_guard_max_backtrack_px: float = 2.0
     ground_bounce_guard_max_lateral_px: float = 80.0
+    ground_bounce_guard_compact_max_upward_px: float = 24.0
+    ground_bounce_guard_compact_max_lateral_px: float = 16.0
+    ground_bounce_guard_compact_max_speed_ratio: float = 0.45
+    ground_bounce_guard_person_clearance_px: float = 96.0
     ground_bounce_guard_min_height_ratio: float = 0.35
     ground_bounce_guard_suppression_seconds: float = 0.75
     static_hotspot_enabled: bool = True
@@ -333,14 +337,16 @@ class BallTrackFilter:
             soft_measurement = measurement is not None
 
         person_occlusion_active = self._person_occlusion_likely(step_dt, frame_size, normalized_person_bboxes)
-        if self._ground_bounce_tail_is_likely(
+        ground_bounce_reason = self._ground_bounce_reason(
             measurement,
             float(track.score),
             frame_size,
             court_filter,
-        ):
+            normalized_person_bboxes,
+        )
+        if ground_bounce_reason is not None:
             self._enter_ground_bounce_suppression()
-            self._mark_decision("ground_bounce_enter", "low_confidence_ground_bounce_tail", force=True)
+            self._mark_decision("ground_bounce_enter", ground_bounce_reason, force=True)
             result = self._invisible(track)
         elif measurement is None:
             candidate_conflict = self._low_confidence_candidate_conflicts_with_prediction(
@@ -1594,20 +1600,21 @@ class BallTrackFilter:
             float(self.config.ground_bounce_guard_suppression_seconds),
         )
 
-    def _ground_bounce_tail_is_likely(
+    def _ground_bounce_reason(
         self,
         measurement: Point | None,
         score: float,
         frame_size: FrameSize | None,
         court_filter: _CourtFilter | None,
-    ) -> bool:
+        person_bboxes: Sequence[PersonBBox],
+    ) -> str | None:
         if not self.config.ground_bounce_guard_enabled or measurement is None:
-            return False
-        if not self._locked or score > float(self.config.ground_bounce_guard_max_score):
-            return False
+            return None
+        if not self._locked:
+            return None
         history = list(self._history)
         if len(history) < 4:
-            return False
+            return None
         items = history + [
             _TrajectoryPoint(
                 frame_index=self._frame_index,
@@ -1619,32 +1626,63 @@ class BallTrackFilter:
         peak_index = max(range(len(items)), key=lambda index: items[index].point[1])
         before = items[:peak_index]
         after = items[peak_index + 1 :]
-        if not before or len(after) < max(1, int(self.config.ground_bounce_guard_min_upward_points)):
-            return False
+        if not before or not after:
+            return None
         peak = items[peak_index].point
         downward_px = peak[1] - min(item.point[1] for item in before)
         upward_px = peak[1] - measurement[1]
         if downward_px < float(self.config.ground_bounce_guard_min_downward_px):
-            return False
+            return None
         if upward_px < float(self.config.ground_bounce_guard_min_upward_px):
-            return False
+            return None
+        previous_y = peak[1]
+        max_backtrack = float(self.config.ground_bounce_guard_max_backtrack_px)
+        for item in after:
+            if item.point[1] > previous_y + max_backtrack:
+                return None
+            previous_y = item.point[1]
+        if not self._point_is_plausible_ground_contact(peak, frame_size, court_filter):
+            return None
+
+        contact_clear_of_players = bool(person_bboxes) and not any(
+            _point_inside_rect(
+                peak,
+                bbox,
+                padding=float(self.config.ground_bounce_guard_person_clearance_px),
+            )
+            for bbox in person_bboxes
+        )
+        if contact_clear_of_players and len(after) >= 2:
+            approach_reference = items[max(0, peak_index - len(after))]
+            approach_duration = items[peak_index].time_seconds - approach_reference.time_seconds
+            rebound_duration = items[-1].time_seconds - items[peak_index].time_seconds
+            approach_speed = (
+                peak[1] - approach_reference.point[1]
+            ) / max(approach_duration, 1e-6)
+            rebound_speed = upward_px / max(rebound_duration, 1e-6)
+            compact_lateral_px = abs(measurement[0] - peak[0])
+            if (
+                approach_speed > 0.0
+                and upward_px <= float(self.config.ground_bounce_guard_compact_max_upward_px)
+                and compact_lateral_px <= float(self.config.ground_bounce_guard_compact_max_lateral_px)
+                and rebound_speed / approach_speed
+                <= float(self.config.ground_bounce_guard_compact_max_speed_ratio)
+            ):
+                return "compact_ground_bounce"
+
+        if score > float(self.config.ground_bounce_guard_max_score):
+            return None
+        if len(after) < max(1, int(self.config.ground_bounce_guard_min_upward_points)):
+            return None
         low_score_points = sum(
             item.score <= float(self.config.ground_bounce_guard_max_score)
             for item in after
         )
         if low_score_points < max(1, int(self.config.ground_bounce_guard_min_low_score_points)):
-            return False
-        previous_y = peak[1]
-        max_backtrack = float(self.config.ground_bounce_guard_max_backtrack_px)
-        for item in after:
-            if item.point[1] > previous_y + max_backtrack:
-                return False
-            previous_y = item.point[1]
+            return None
         if abs(measurement[0] - peak[0]) > float(self.config.ground_bounce_guard_max_lateral_px):
-            return False
-        if not self._point_is_plausible_ground_contact(peak, frame_size, court_filter):
-            return False
-        return True
+            return None
+        return "low_confidence_ground_bounce_tail"
 
     def _point_is_plausible_ground_contact(
         self,
