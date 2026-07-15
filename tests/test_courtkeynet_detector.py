@@ -19,8 +19,10 @@ class CourtKeyNetArchitectureTest(unittest.TestCase):
             set(outputs),
             {"heatmaps", "kpts_init", "kpts_refined", "offsets"},
         )
-        self.assertEqual(tuple(outputs["heatmaps"].shape[:2]), (1, 4))
+        self.assertEqual(tuple(outputs["heatmaps"].shape), (1, 4, 32, 32))
+        self.assertEqual(tuple(outputs["kpts_init"].shape), (1, 4, 2))
         self.assertEqual(tuple(outputs["kpts_refined"].shape), (1, 4, 2))
+        self.assertEqual(tuple(outputs["offsets"].shape), (1, 4, 2))
         for tensor in outputs.values():
             self.assertTrue(torch.isfinite(tensor).all().item())
 
