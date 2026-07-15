@@ -271,15 +271,18 @@ class VideoPlayerWidget(QFrame):
 
         self.btn_select_video = QPushButton("选择视频")
         self.btn_select_video.setObjectName("btnSelectVideo")
+        self.btn_select_video.setAccessibleName("选择视频文件")
 
         self.path_edit = QLineEdit()
         self.path_edit.setObjectName("videoPathEdit")
         self.path_edit.setReadOnly(True)
         self.path_edit.setPlaceholderText("视频路径")
         self.path_edit.setClearButtonEnabled(False)
+        self.path_edit.setAccessibleName("当前视频文件路径")
 
         self.btn_force_stop = QPushButton("停止")
         self.btn_force_stop.setObjectName("btnForceStop")
+        self.btn_force_stop.setAccessibleName("停止当前分析")
 
         self.btn_fullscreen = QPushButton("全屏")
         self.btn_fullscreen.setObjectName("btnFullscreen")
@@ -304,11 +307,11 @@ class VideoPlayerWidget(QFrame):
         placeholder_frame_layout.setContentsMargins(24, 24, 24, 24)
         placeholder_frame_layout.setSpacing(10)
 
-        placeholder_title = QLabel("预览")
+        placeholder_title = QLabel("视频预览")
         placeholder_title.setObjectName("videoPlaceholderTitle")
         placeholder_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        placeholder_hint = QLabel("在此处选择视频以预览 TrackNetV3 帧。")
+        placeholder_hint = QLabel("尚未选择视频")
         placeholder_hint.setObjectName("videoPlaceholderHint")
         placeholder_hint.setWordWrap(True)
         placeholder_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -327,6 +330,7 @@ class VideoPlayerWidget(QFrame):
             QSizePolicy.Policy.Expanding,
         )
         self.video_label.setMinimumSize(320, 240)
+        self.video_label.setAccessibleName("视频分析画面")
         self.video_label.setMouseTracking(True)
         self.video_label.installEventFilter(self)
         self.court_overlay = CourtLineOverlayWidget(self.video_label)
@@ -616,6 +620,7 @@ class VideoTimelineWidget(QFrame):
 
         self.seek_slider = QSlider(Qt.Orientation.Horizontal)
         self.seek_slider.setObjectName("videoTimeline")
+        self.seek_slider.setAccessibleName("视频时间轴")
         self.seek_slider.setRange(0, 0)
         self.seek_slider.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -626,6 +631,7 @@ class VideoTimelineWidget(QFrame):
         self.time_label.setObjectName("timeLabel")
         self.time_label.setFixedWidth(110)
         self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.time_label.setAccessibleName("视频播放时间")
 
         layout.addWidget(self.seek_slider)
         layout.addWidget(self.time_label)

@@ -2,8 +2,37 @@
  *  FORM  —  QLineEdit / QComboBox / QProgressBar / QTextEdit
  * ============================================================ */
 
-/* --- 进度条 --- */
-QProgressBar#topProgress,
+/* --- 分析进度状态条 --- */
+QFrame#analysisProgressNotice {
+    background-color: #F3F8F5;
+    border: 1px solid #B7D6C4;
+    border-radius: 4px;
+}
+
+QLabel#analysisProgressDot {
+    background-color: #217346;
+    border: none;
+    border-radius: 4px;
+}
+
+QLabel#analysisProgressLabel {
+    color: #1F1F1F;
+    font-weight: 500;
+}
+
+QProgressBar#topProgress {
+    background-color: #D5E8DC;
+    border: none;
+    border-radius: 2px;
+    min-height: 4px;
+    max-height: 4px;
+}
+
+QProgressBar#topProgress::chunk {
+    background-color: #217346;
+    border-radius: 2px;
+}
+
 QProgressBar {
     background-color: #E6E6E6;
     border: 1px solid #BDBDBD;
@@ -20,31 +49,37 @@ QProgressBar::chunk {
 
 /* --- 文本输入框 --- */
 QLineEdit#videoPathEdit,
-QLineEdit#modelPathEdit {
+QLineEdit#modelPathEdit,
+QLineEdit#logSearchEdit {
     background-color: #FFFFFF;
-    border: 1px solid #525252;
+    border: 1px solid #A19F9D;
     border-radius: 2px;
     color: #1F1F1F;
     padding: 6px 10px;
 }
 
 QLineEdit#videoPathEdit:focus,
-QLineEdit#modelPathEdit:focus { border-color: #217346; }
+QLineEdit#modelPathEdit:focus,
+QLineEdit#logSearchEdit:focus { border-color: #217346; }
 
-QComboBox#cameraDeviceCombo {
+QComboBox#cameraDeviceCombo,
+QComboBox#modelPathEdit,
+QComboBox#logFilterCombo {
     background-color: #FFFFFF;
-    border: 1px solid #525252;
+    border: 1px solid #A19F9D;
     border-radius: 2px;
     color: #1F1F1F;
     padding: 6px 10px;
 }
 
-QComboBox#cameraDeviceCombo:focus { border-color: #217346; }
+QComboBox#cameraDeviceCombo:focus,
+QComboBox#modelPathEdit:focus,
+QComboBox#logFilterCombo:focus { border-color: #217346; }
 
 /* --- 主题切换按钮 --- */
 QToolButton#styleBtn {
     background-color: #F7F7F7;
-    border: 1px solid #525252;
+    border: 1px solid #A19F9D;
     border-radius: 2px;
     color: #1F1F1F;
     padding: 0px 12px;
@@ -55,13 +90,13 @@ QToolButton#styleBtn {
 
 QToolButton#styleBtn:hover {
     background-color: #F3F3F3;
-    border-color: #525252;
+    border-color: #A19F9D;
 }
 
 QToolButton#styleBtn:pressed,
 QToolButton#styleBtn[popupMode="1"]:pressed {
     background-color: #E8E8E8;
-    border-color: #525252;
+    border-color: #A19F9D;
 }
 
 QToolButton#styleBtn::menu-indicator {
@@ -71,7 +106,7 @@ QToolButton#styleBtn::menu-indicator {
 
 QMenu#styleMenu {
     background-color: #FFFFFF;
-    border: 1px solid #525252;
+    border: 1px solid #A19F9D;
     border-radius: 2px;
     padding: 2px;
 }

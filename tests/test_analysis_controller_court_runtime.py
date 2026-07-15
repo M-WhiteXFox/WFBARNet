@@ -25,6 +25,7 @@ class _CourtService:
     def __init__(self, latest: dict | None = None) -> None:
         self.latest = latest
         self.clear_count = 0
+        self.request_count = 0
         self.resultReady = _Signal()
         self.failed = _Signal()
 
@@ -37,6 +38,9 @@ class _CourtService:
     def clear_calibration(self) -> None:
         self.clear_count += 1
         self.latest = None
+
+    def request_prediction(self) -> None:
+        self.request_count += 1
 
 
 class _VideoPlayer:
@@ -61,6 +65,9 @@ class _View:
         self.video_player = _VideoPlayer()
         self.shown_court = None
         self.logs: list[str] = []
+        self.progress_busy: tuple[bool, str] = (False, "")
+        self.system_status: tuple[str, str] = ("", "")
+        self.status_notices: list[tuple[str, str]] = []
 
     def show_video_frame(self, image, position_ms, duration_ms, court, *args) -> None:
         self.shown_court = court
@@ -86,8 +93,17 @@ class _View:
     def set_status_state(self, state: str) -> None:
         return
 
+    def set_system_status(self, text: str, state: str) -> None:
+        self.system_status = (state, text)
+
+    def show_status_notice(self, message: str, state: str) -> None:
+        self.status_notices.append((state, message))
+
     def update_progress(self, value: int) -> None:
         return
+
+    def set_progress_busy(self, busy: bool, text: str = "") -> None:
+        self.progress_busy = (busy, text)
 
 
 def _bare_controller(service: _CourtService, view: _View | None = None) -> MainController:
@@ -98,6 +114,8 @@ def _bare_controller(service: _CourtService, view: _View | None = None) -> MainC
     controller._manual_court_points = []
     controller._display_fps_ema = 0.0
     controller._last_court_log_frame = -1
+    controller._pending_video_start_ms = None
+    controller._court_bootstrap_exhausted = False
     controller._log_track_debug_event = lambda payload: None
     controller._append_trajectory_event = lambda payload: None
     controller._append_bst_predictions = lambda payload: None
@@ -108,6 +126,124 @@ def _bare_controller(service: _CourtService, view: _View | None = None) -> MainC
 
 
 class AnalysisControllerCourtRuntimeTest(unittest.TestCase):
+    def test_status_helper_updates_text_and_semantic_state(self) -> None:
+        controller = _bare_controller(_CourtService(None))
+
+        controller._set_view_status("success", "系统状态：视频分析完成")
+
+        self.assertEqual(
+            controller.view.system_status,
+            ("success", "系统状态：视频分析完成"),
+        )
+
+    def test_court_waiting_state_shows_busy_indicator(self) -> None:
+        controller = _bare_controller(_CourtService(None))
+        running_states: list[bool] = []
+        controller._set_running_state = lambda: running_states.append(True)
+
+        controller._set_court_waiting_state()
+
+        self.assertEqual(running_states, [True])
+        self.assertEqual(
+            controller.view.progress_busy,
+            (True, "正在识别可信球场线..."),
+        )
+
+    def test_video_analysis_waits_for_trusted_court_before_starting_playback(self) -> None:
+        service = _CourtService({"valid": False, "provisional": True})
+        controller = _bare_controller(service)
+        controller._input_mode = "video"
+        controller._selected_video_path = "match.mp4"
+        controller._video_meta = {"position_ms": 1250}
+        controller._pending_seek_ms = None
+        controller._ensure_models_ready = lambda: True
+        waiting_states: list[bool] = []
+        controller._set_court_waiting_state = lambda: waiting_states.append(True)
+        starts: list[dict] = []
+        controller._start_playback = lambda **kwargs: starts.append(kwargs)
+
+        controller.handle_analyze()
+
+        self.assertEqual(starts, [])
+        self.assertEqual(controller._pending_video_start_ms, 1250)
+        self.assertEqual(waiting_states, [True])
+        self.assertEqual(service.request_count, 1)
+
+    def test_trusted_court_result_starts_waiting_video_once_without_reset(self) -> None:
+        controller = _bare_controller(_CourtService(None))
+        controller._pending_video_start_ms = 1250
+        starts: list[dict] = []
+        controller._start_playback = lambda **kwargs: starts.append(kwargs)
+        payload = {
+            "valid": True,
+            "updated": True,
+            "frame_id": 3,
+            "confidence": 0.91,
+            "detect_ms": 25.0,
+            "scheme": "courtkeynet",
+        }
+
+        controller._on_court_prediction_ready(payload)
+        controller._on_court_prediction_ready(payload)
+
+        self.assertEqual(
+            starts,
+            [{"start_ms": 1250, "request_court_prediction": False}],
+        )
+        self.assertIsNone(controller._pending_video_start_ms)
+        self.assertEqual(controller.view.progress_busy, (False, ""))
+
+    def test_exhausted_untrusted_court_does_not_start_waiting_video(self) -> None:
+        controller = _bare_controller(_CourtService(None))
+        controller._pending_video_start_ms = 0
+        idle_states: list[bool] = []
+        controller._set_idle_state = lambda: idle_states.append(True)
+        starts: list[dict] = []
+        controller._start_playback = lambda **kwargs: starts.append(kwargs)
+        payload = {
+            "valid": False,
+            "provisional": True,
+            "frame_id": 6,
+            "scheme": "courtkeynet",
+            "candidate_confidence": 0.47,
+            "metrics": {"bootstrap_exhausted": 1},
+        }
+
+        controller._on_court_prediction_ready(payload)
+
+        self.assertEqual(starts, [])
+        self.assertIsNone(controller._pending_video_start_ms)
+        self.assertEqual(idle_states, [True])
+        self.assertEqual(controller.view.progress_busy, (False, ""))
+        self.assertTrue(any("未开始播放" in message for message in controller.view.logs))
+
+    def test_start_after_empty_exhausted_scan_requires_manual_calibration(self) -> None:
+        controller = _bare_controller(_CourtService(None))
+        controller._on_court_prediction_ready(
+            {
+                "valid": False,
+                "provisional": False,
+                "frame_id": 6,
+                "metrics": {"bootstrap_exhausted": 1},
+            }
+        )
+        controller._input_mode = "video"
+        controller._selected_video_path = "match.mp4"
+        controller._video_meta = {"position_ms": 0}
+        controller._pending_seek_ms = None
+        controller._ensure_models_ready = lambda: True
+        waiting_states: list[bool] = []
+        controller._set_court_waiting_state = lambda: waiting_states.append(True)
+        starts: list[dict] = []
+        controller._start_playback = lambda **kwargs: starts.append(kwargs)
+
+        controller.handle_analyze()
+
+        self.assertEqual(starts, [])
+        self.assertEqual(waiting_states, [])
+        self.assertIsNone(controller._pending_video_start_ms)
+        self.assertTrue(any("视频不会播放" in message for message in controller.view.logs))
+
     def test_frame_without_court_payload_reuses_latest_service_prediction(self) -> None:
         latest = {"valid": True, "scheme": "court_pose_white_line", "frame_id": 8}
         service = _CourtService(latest)

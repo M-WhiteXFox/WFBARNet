@@ -9,9 +9,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from PyQt6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QSize, Qt, QUrl, pyqtProperty, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QLinearGradient, QPainter, QPen
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QLinearGradient, QPainter, QPalette, QPen, QTextCursor
 from PyQt6.QtWidgets import (
+    QApplication,
     QFrame,
+    QFileDialog,
     QGridLayout,
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -25,6 +27,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QPushButton,
     QProgressBar,
+    QSplitter,
     QTextBrowser,
     QTabWidget,
     QTableWidget,
@@ -60,6 +63,8 @@ class ToggleSwitch(QCheckBox):
         self.setFixedSize(46, 24)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(tooltip)
+        self.setAccessibleName(tooltip)
+        self.setAccessibleDescription(tooltip)
         self.setText("")
         self._animation = QPropertyAnimation(self, b"offset", self)
         self._animation.setDuration(140)
@@ -98,15 +103,16 @@ class ToggleSwitch(QCheckBox):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         track_rect = QRectF(1, 2, 44, 20)
-        off_color = QColor("#9CA3AF")
-        on_color = QColor("#22C55E")
+        palette = self.palette()
+        off_color = palette.color(QPalette.ColorRole.Mid)
+        on_color = palette.color(QPalette.ColorRole.Highlight)
         track_color = QColor(
             int(off_color.red() + (on_color.red() - off_color.red()) * self._offset),
             int(off_color.green() + (on_color.green() - off_color.green()) * self._offset),
             int(off_color.blue() + (on_color.blue() - off_color.blue()) * self._offset),
         )
         if not self.isEnabled():
-            track_color = QColor("#D1D5DB")
+            track_color = palette.color(QPalette.ColorRole.Midlight)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(track_color)
         painter.drawRoundedRect(track_rect, 10, 10)
@@ -114,11 +120,11 @@ class ToggleSwitch(QCheckBox):
         knob_size = 18
         knob_x = 3 + (22 * self._offset)
         knob_rect = QRectF(knob_x, 3, knob_size, knob_size)
-        painter.setBrush(QColor("#FFFFFF"))
+        painter.setBrush(palette.color(QPalette.ColorRole.HighlightedText))
         painter.drawEllipse(knob_rect)
 
 
-class StrokePieChartWidget(QWidget):
+class StrokeBarChartWidget(QWidget):
     COLORS = (
         "#2563EB",
         "#DC2626",
@@ -138,7 +144,8 @@ class StrokePieChartWidget(QWidget):
         super().__init__(parent)
         self._counts: dict[str, int] = {}
         self._colors_by_label: dict[str, QColor] = {}
-        self.setObjectName("strokePieChart")
+        self.setObjectName("strokeBarChart")
+        self.setAccessibleName("击球类型统计图")
         self.setMinimumSize(320, 260)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -151,6 +158,7 @@ class StrokePieChartWidget(QWidget):
                 cleaned[name] = cleaned.get(name, 0) + value
                 self._ensure_color(name)
         self._counts = cleaned
+        self._update_accessible_summary()
         self.update()
 
     def increment(self, label: str, amount: int = 1) -> None:
@@ -160,10 +168,12 @@ class StrokePieChartWidget(QWidget):
             return
         self._ensure_color(name)
         self._counts[name] = self._counts.get(name, 0) + value
+        self._update_accessible_summary()
         self.update()
 
     def clear_counts(self) -> None:
         self._counts.clear()
+        self._update_accessible_summary()
         self.update()
 
     def total_count(self) -> int:
@@ -184,131 +194,76 @@ class StrokePieChartWidget(QWidget):
             return
 
         items = sorted(self._counts.items(), key=lambda item: (-item[1], item[0]))
-        chart_rect, legend_rect = self._layout_rects(bounds)
-        self._draw_pie(painter, chart_rect, items, total)
-        self._draw_legend(painter, legend_rect, items, total)
-
-    def _layout_rects(self, bounds: QRectF) -> tuple[QRectF, QRectF]:
-        if bounds.width() >= 430:
-            side = min(bounds.height(), bounds.width() * 0.42)
-            chart = QRectF(
-                bounds.left(),
-                bounds.top() + (bounds.height() - side) / 2.0,
-                side,
-                side,
-            )
-            legend = QRectF(
-                chart.right() + 24,
-                bounds.top(),
-                max(1.0, bounds.right() - chart.right() - 24),
-                bounds.height(),
-            )
-            return chart, legend
-
-        side = min(bounds.width() * 0.78, bounds.height() * 0.56)
-        chart = QRectF(
-            bounds.left() + (bounds.width() - side) / 2.0,
-            bounds.top(),
-            side,
-            side,
-        )
-        legend = QRectF(
-            bounds.left(),
-            chart.bottom() + 16,
-            bounds.width(),
-            max(1.0, bounds.bottom() - chart.bottom() - 16),
-        )
-        return chart, legend
+        self._draw_bars(painter, bounds, items, total)
 
     def _draw_empty_state(self, painter: QPainter, bounds: QRectF) -> None:
-        side = min(bounds.width(), bounds.height()) * 0.54
-        circle = QRectF(
-            bounds.center().x() - side / 2.0,
-            bounds.center().y() - side / 2.0,
-            side,
-            side,
-        )
-        painter.setPen(QPen(QColor("#CBD5E1"), 2))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(circle)
-        painter.setPen(QColor("#64748B"))
+        palette = self.palette()
+        painter.setPen(palette.color(QPalette.ColorRole.PlaceholderText))
         painter.drawText(bounds, Qt.AlignmentFlag.AlignCenter, "暂无击球统计")
 
-    def _draw_pie(
+    def _draw_bars(
         self,
         painter: QPainter,
-        chart: QRectF,
+        bounds: QRectF,
         items: list[tuple[str, int]],
         total: int,
     ) -> None:
-        painter.setPen(QPen(QColor("#FFFFFF"), 1))
-        start_angle = 90 * 16
-        used_angle = 0
-        full_angle = 360 * 16
-        for index, (label, count) in enumerate(items):
-            remaining_angle = max(0, full_angle - used_angle)
-            if index == len(items) - 1:
-                span_angle = remaining_angle
-            else:
-                span_angle = min(remaining_angle, max(1, int(round(full_angle * count / total))))
-            used_angle += span_angle
-            if span_angle <= 0:
-                continue
-            painter.setBrush(self._ensure_color(label))
-            painter.drawPie(chart, start_angle, -span_angle)
-            start_angle -= span_angle
-
-        painter.setPen(QPen(QColor("#0F172A"), 1))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(chart)
-
-    def _draw_legend(
-        self,
-        painter: QPainter,
-        legend: QRectF,
-        items: list[tuple[str, int]],
-        total: int,
-    ) -> None:
-        row_height = 22
-        rows_per_column = max(1, int(legend.height() // row_height))
-        column_count = max(1, min(3, (len(items) + rows_per_column - 1) // rows_per_column))
-        column_width = legend.width() / column_count
+        palette = self.palette()
         metrics = painter.fontMetrics()
-        text_color = self.palette().color(self.foregroundRole())
-        muted_color = QColor("#64748B")
-
+        text_color = palette.color(QPalette.ColorRole.Text)
+        muted_color = palette.color(QPalette.ColorRole.PlaceholderText)
+        track_color = palette.color(QPalette.ColorRole.Midlight)
+        label_width = min(124.0, max(84.0, bounds.width() * 0.24))
+        value_width = min(132.0, max(96.0, bounds.width() * 0.24))
+        bar_left = bounds.left() + label_width + 12.0
+        bar_width = max(48.0, bounds.width() - label_width - value_width - 24.0)
+        max_count = max(count for _, count in items)
+        row_height = min(42.0, max(28.0, bounds.height() / max(1, len(items))))
+        content_height = row_height * len(items)
+        y_start = bounds.top() + max(0.0, (bounds.height() - content_height) / 2.0)
         for index, (label, count) in enumerate(items):
-            column = index // rows_per_column
-            row = index % rows_per_column
-            x = legend.left() + column * column_width
-            y = legend.top() + row * row_height
-            if y + row_height > legend.bottom() + 1:
+            y = y_start + index * row_height
+            if y + row_height > bounds.bottom() + 1:
                 break
-
-            color = self._ensure_color(label)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(color)
-            painter.drawRoundedRect(QRectF(x, y + 5, 11, 11), 3, 3)
-
-            percent = count / max(1, total) * 100.0
-            text = f"{label}  {count}次  {percent:.1f}%"
-            text = metrics.elidedText(
-                text,
-                Qt.TextElideMode.ElideRight,
-                max(40, int(column_width - 18)),
-            )
-            painter.setPen(text_color if count > 0 else muted_color)
+            label_text = metrics.elidedText(label, Qt.TextElideMode.ElideRight, int(label_width))
+            painter.setPen(text_color)
             painter.drawText(
-                QRectF(x + 18, y, column_width - 18, row_height),
+                QRectF(bounds.left(), y, label_width, row_height),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                text,
+                label_text,
             )
+            track = QRectF(bar_left, y + row_height * 0.31, bar_width, max(8.0, row_height * 0.38))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(track_color)
+            painter.drawRoundedRect(track, 4, 4)
+            fill = QRectF(track)
+            fill.setWidth(max(4.0, track.width() * count / max_count))
+            painter.setBrush(self._ensure_color(label))
+            painter.drawRoundedRect(fill, 4, 4)
+            percent = count / max(1, total) * 100.0
+            painter.setPen(text_color if count else muted_color)
+            painter.drawText(
+                QRectF(bar_left + bar_width + 12.0, y, value_width - 12.0, row_height),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                f"{count} 次  {percent:.1f}%",
+            )
+
+    def _update_accessible_summary(self) -> None:
+        if not self._counts:
+            self.setAccessibleDescription("暂无击球统计")
+            return
+        items = sorted(self._counts.items(), key=lambda item: (-item[1], item[0]))
+        summary = "，".join(f"{label} {count} 次" for label, count in items)
+        self.setAccessibleDescription(f"总击球 {self.total_count()} 次：{summary}")
 
     def _ensure_color(self, label: str) -> QColor:
         if label not in self._colors_by_label:
             color = QColor(self.COLORS[len(self._colors_by_label) % len(self.COLORS)])
             self._colors_by_label[label] = color
         return self._colors_by_label[label]
+
+
+StrokePieChartWidget = StrokeBarChartWidget
 
 
 class CourtHeatmapWidget(QWidget):
@@ -584,8 +539,13 @@ class CourtHeatmapWidget(QWidget):
         legend = QRectF(x, y, legend_width, legend_height)
 
         painter.save()
-        painter.setPen(QPen(QColor(15, 23, 42, 85), 1))
-        painter.setBrush(QColor(248, 250, 252, 218))
+        palette = self.palette()
+        border_color = QColor(palette.color(QPalette.ColorRole.Mid))
+        border_color.setAlpha(150)
+        surface_color = QColor(palette.color(QPalette.ColorRole.Base))
+        surface_color.setAlpha(228)
+        painter.setPen(QPen(border_color, 1))
+        painter.setBrush(surface_color)
         painter.drawRoundedRect(legend, 7, 7)
 
         bar = QRectF(legend.left() + 12.0, legend.top() + 12.0, legend.width() - 24.0, 8.0)
@@ -598,7 +558,7 @@ class CourtHeatmapWidget(QWidget):
         painter.setBrush(gradient)
         painter.drawRoundedRect(bar, 4, 4)
 
-        painter.setPen(QPen(QColor("#334155"), 1))
+        painter.setPen(QPen(palette.color(QPalette.ColorRole.Text), 1))
         font = painter.font()
         font.setPointSize(max(7, font.pointSize() - 1))
         painter.setFont(font)
@@ -710,6 +670,7 @@ class ReportPreviewWidget(QWidget):
         self._report_output_path = project_root / "assets" / "dist" / "index.html"
         self._template_path = project_root / "assets" / "report_template" / "report-template.html"
         self._current_report_path: Path | None = None
+        self._theme_name = "office_light"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -725,9 +686,9 @@ class ReportPreviewWidget(QWidget):
         self.backend_label = QLabel("")
         self.backend_label.setObjectName("sectionNote")
 
-        self.btn_refresh_report = QPushButton("刷新")
+        self.btn_refresh_report = QPushButton("重新载入")
         self.btn_refresh_report.setObjectName("btnRefreshReport")
-        self.btn_open_report = QPushButton("浏览器打开")
+        self.btn_open_report = QPushButton("在浏览器中打开")
         self.btn_open_report.setObjectName("btnOpenReport")
         self.btn_refresh_report.clicked.connect(self.reload)
         self.btn_open_report.clicked.connect(self.open_external)
@@ -743,6 +704,7 @@ class ReportPreviewWidget(QWidget):
             self.viewer = QWebEngineView(self)
             self.viewer.setObjectName("reportWebView")
             self._configure_web_engine()
+            self.viewer.loadFinished.connect(self._on_load_finished)
             self._uses_web_engine = True
         else:
             self.viewer = QTextBrowser(self)
@@ -757,9 +719,49 @@ class ReportPreviewWidget(QWidget):
         if self._uses_web_engine:
             self.backend_label.setText("WebEngine")
             self.backend_label.setToolTip("当前使用 QWebEngineView 渲染 Tabler 报告。")
+        self.backend_label.setVisible(False)
 
         layout.addWidget(self.viewer, stretch=1)
         self.load_template()
+
+    def set_theme(self, theme_name: str) -> None:
+        self._theme_name = str(theme_name or "office_light")
+        is_dark = self._theme_name.endswith("_dark")
+        if self._uses_web_engine:
+            force_dark = getattr(QWebEngineSettings.WebAttribute, "ForceDarkModeEnabled", None)
+            if force_dark is not None:
+                self.viewer.settings().setAttribute(force_dark, is_dark)
+            self.viewer.setStyleSheet(
+                "background:#1D2129;" if is_dark else "background:#FFFFFF;"
+            )
+            self._apply_fallback_web_theme()
+        else:
+            self.viewer.setStyleSheet(
+                "background:#1D2129;color:#E8EDF5;" if is_dark else ""
+            )
+
+    def _on_load_finished(self, _ok: bool) -> None:
+        self._apply_fallback_web_theme()
+
+    def _apply_fallback_web_theme(self) -> None:
+        if not self._uses_web_engine:
+            return
+        is_dark = self._theme_name.endswith("_dark")
+        if not is_dark:
+            script = "(function(){const s=document.getElementById('wfbar-theme-override');if(s)s.remove();})();"
+        else:
+            css = (
+                "html{color-scheme:dark}body,.page-wrapper{background:#1D2129!important;"
+                "color:#E8EDF5!important}.card,.navbar,.page-header{background:#242933!important;"
+                "border-color:#3A4050!important}.text-secondary,.text-muted{color:#A9B3C3!important}"
+            )
+            script = (
+                "(function(){let s=document.getElementById('wfbar-theme-override');"
+                "if(!s){s=document.createElement('style');s.id='wfbar-theme-override';"
+                "document.head.appendChild(s);}s.textContent=" + repr(css) + ";"
+                "})();"
+            )
+        self.viewer.page().runJavaScript(script)
 
     def load_template(self) -> None:
         path = self._report_output_path if self._report_output_path.exists() else self._template_path
@@ -820,11 +822,12 @@ class ReportPreviewWidget(QWidget):
 
     def _update_path_label(self, path: Path) -> None:
         if path == self._report_output_path:
-            self.report_path_label.setText("当前报告：assets/dist/index.html")
+            self.report_path_label.setText("最新训练报告")
         elif path == self._template_path:
-            self.report_path_label.setText("当前报告：assets/report_template/report-template.html")
+            self.report_path_label.setText("报告模板预览")
         else:
             self.report_path_label.setText(f"当前报告：{path.name}")
+        self.report_path_label.setToolTip(str(path))
 
     def _set_fallback_html(self, message: str) -> None:
         escaped = (
@@ -873,10 +876,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("羽毛球动作识别分析平台")
         self.resize(1360, 860)
-        self.setMinimumSize(1200, 760)
+        self.setMinimumSize(1024, 680)
         self._video_fullscreen = False
         self._video_fullscreen_previous_state = Qt.WindowState.WindowNoState
-        self._normal_root_margins = (20, 20, 20, 20)
+        self._normal_root_margins = (16, 16, 16, 16)
         self._analytics_opacity_effect: QGraphicsOpacityEffect | None = None
         self._analytics_panel_overlay = False
 
@@ -885,47 +888,36 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.central_widget)
 
         self.root_layout = QVBoxLayout(self.central_widget)
-        self.root_layout.setContentsMargins(20, 20, 20, 20)
-        self.root_layout.setSpacing(16)
+        self.root_layout.setContentsMargins(*self._normal_root_margins)
+        self.root_layout.setSpacing(12)
 
         self._build_header()
+        self._build_status_banner()
         self._build_body()
 
     def _build_header(self) -> None:
         self.header_card = QFrame()
         self.header_card.setObjectName("headerCard")
         header_layout = QHBoxLayout(self.header_card)
-        header_layout.setContentsMargins(20, 18, 20, 18)
-        header_layout.setSpacing(18)
+        header_layout.setContentsMargins(18, 12, 18, 12)
+        header_layout.setSpacing(16)
 
         brand_col = QVBoxLayout()
-        brand_col.setSpacing(6)
+        brand_col.setSpacing(4)
 
-        self.title_label = QLabel("羽毛球动作分析平台")
+        self.title_label = QLabel("WFBARNet 羽毛球分析")
         self.title_label.setObjectName("titleLabel")
 
-        self.subtitle_label = QLabel(
-            "YOLOv11 负责视觉理解，BST 负责动作时序识别。左侧预览，右侧看结果与日志。"
-        )
-        self.subtitle_label.setObjectName("subtitleLabel")
-        self.subtitle_label.setWordWrap(True)
-
-        chip_row = QHBoxLayout()
-        chip_row.setSpacing(8)
-        self.mode_chip = QLabel("实时分析界面")
-        self.mode_chip.setObjectName("modeChip")
-        self.pipeline_chip = QLabel("YOLOv11 · BST")
-        self.pipeline_chip.setObjectName("pipelineChip")
-        chip_row.addWidget(self.mode_chip)
-        chip_row.addWidget(self.pipeline_chip)
-        chip_row.addStretch(1)
-
         brand_col.addWidget(self.title_label)
-        brand_col.addWidget(self.subtitle_label)
-        brand_col.addLayout(chip_row)
+
+        self.status_label = QLabel("系统状态：待机中")
+        self.status_label.setObjectName("statusLabel")
+        self.status_label.setProperty("state", "idle")
+        self.status_label.setAccessibleName("系统状态")
+        brand_col.addWidget(self.status_label)
 
         actions_col = QVBoxLayout()
-        actions_col.setSpacing(10)
+        actions_col.setSpacing(8)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(8)
@@ -957,14 +949,34 @@ class MainWindow(QMainWindow):
 
         actions_col.addLayout(button_row)
 
-        self.status_label = QLabel("系统状态：待机中")
-        self.status_label.setObjectName("statusLabel")
-        self.status_label.setProperty("state", "idle")
-        brand_col.addWidget(self.status_label)
-
         header_layout.addLayout(brand_col, stretch=1)
         header_layout.addLayout(actions_col, stretch=0)
         self.root_layout.addWidget(self.header_card)
+
+    def _build_status_banner(self) -> None:
+        self.status_banner = QFrame()
+        self.status_banner.setObjectName("statusBanner")
+        self.status_banner.setProperty("state", "info")
+        self.status_banner.setVisible(False)
+        banner_layout = QHBoxLayout(self.status_banner)
+        banner_layout.setContentsMargins(14, 8, 10, 8)
+        banner_layout.setSpacing(10)
+
+        self.status_banner_label = QLabel("")
+        self.status_banner_label.setObjectName("statusBannerLabel")
+        self.status_banner_label.setWordWrap(True)
+        self.status_banner_label.setAccessibleName("操作提示")
+        self.btn_notice_details = QPushButton("查看日志")
+        self.btn_notice_details.setObjectName("btnNoticeDetails")
+        self.btn_notice_details.clicked.connect(self.show_log_tab)
+        self.btn_notice_dismiss = QPushButton("关闭")
+        self.btn_notice_dismiss.setObjectName("btnNoticeDismiss")
+        self.btn_notice_dismiss.clicked.connect(self.clear_status_notice)
+
+        banner_layout.addWidget(self.status_banner_label, stretch=1)
+        banner_layout.addWidget(self.btn_notice_details)
+        banner_layout.addWidget(self.btn_notice_dismiss)
+        self.root_layout.addWidget(self.status_banner)
 
     def populate_stylesheets(self, theme_dirs: list[Path], active_name: str = "office_light") -> None:
         self._style_menu.clear()
@@ -981,14 +993,23 @@ class MainWindow(QMainWindow):
     def _build_body(self) -> None:
         self.body_layout = QHBoxLayout()
         body_layout = self.body_layout
-        body_layout.setSpacing(16)
+        body_layout.setSpacing(0)
 
-        self._build_preview_panel(body_layout)
-        self._build_analytics_panel(body_layout)
+        self.body_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.body_splitter.setObjectName("bodySplitter")
+        self.body_splitter.setChildrenCollapsible(False)
+        self.body_splitter.setHandleWidth(6)
 
+        self._build_preview_panel(self.body_splitter)
+        self._build_analytics_panel(self.body_splitter)
+        self.body_splitter.setStretchFactor(0, 6)
+        self.body_splitter.setStretchFactor(1, 5)
+        self.body_splitter.setSizes([690, 570])
+
+        body_layout.addWidget(self.body_splitter)
         self.root_layout.addLayout(body_layout, stretch=1)
 
-    def _build_preview_panel(self, body_layout: QHBoxLayout) -> None:
+    def _build_preview_panel(self, body_splitter: QSplitter) -> None:
         self.preview_shell = QWidget()
         preview_shell = self.preview_shell
         preview_shell.setSizePolicy(
@@ -1033,12 +1054,36 @@ class MainWindow(QMainWindow):
         preview_header.addWidget(self.btn_batch_mode)
         preview_header.addStretch(1)
 
-        self.progress_bar = QProgressBar(preview_panel)
+        self.progress_notice = QFrame(preview_panel)
+        self.progress_notice.setObjectName("analysisProgressNotice")
+        self.progress_notice.setVisible(False)
+        progress_notice_layout = QHBoxLayout(self.progress_notice)
+        progress_notice_layout.setContentsMargins(14, 8, 14, 8)
+        progress_notice_layout.setSpacing(10)
+
+        self.progress_status_dot = QLabel(self.progress_notice)
+        self.progress_status_dot.setObjectName("analysisProgressDot")
+        self.progress_status_dot.setFixedSize(8, 8)
+        self.progress_status_dot.setAccessibleName("分析任务正在进行")
+
+        self.progress_label = QLabel("正在准备分析任务", self.progress_notice)
+        self.progress_label.setObjectName("analysisProgressLabel")
+        self.progress_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+
+        self.progress_bar = QProgressBar(self.progress_notice)
         self.progress_bar.setObjectName("topProgress")
         self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFixedHeight(16)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedSize(132, 4)
         self.progress_bar.setVisible(False)
+        self.progress_bar.setAccessibleName("分析任务进度")
+
+        progress_notice_layout.addWidget(self.progress_status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        progress_notice_layout.addWidget(self.progress_label, 1)
+        progress_notice_layout.addWidget(self.progress_bar, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.video_player = VideoPlayerWidget()
         self.video_player.setMinimumHeight(360)
@@ -1120,6 +1165,7 @@ class MainWindow(QMainWindow):
         timeline_bar_layout.setSpacing(0)
         timeline_bar_layout.addWidget(self.video_timeline)
 
+        preview_layout.addWidget(self.progress_notice, 0)
         preview_layout.addWidget(court_controls, 0)
         preview_layout.addWidget(video_controls, 0)
         preview_layout.addWidget(self.video_player, 1)
@@ -1128,9 +1174,9 @@ class MainWindow(QMainWindow):
         preview_shell_layout.addWidget(self.preview_mode_bar, 0)
         preview_shell_layout.addWidget(preview_panel, stretch=1)
 
-        body_layout.addWidget(preview_shell, stretch=6)
+        body_splitter.addWidget(preview_shell)
 
-    def _build_analytics_panel(self, body_layout: QHBoxLayout) -> None:
+    def _build_analytics_panel(self, body_splitter: QSplitter) -> None:
         self.analytics_panel = QFrame()
         analytics_panel = self.analytics_panel
         analytics_panel.setObjectName("analyticsCard")
@@ -1152,7 +1198,7 @@ class MainWindow(QMainWindow):
         self._build_log_tab()
 
         analytics_layout.addWidget(self.tabs, stretch=1)
-        body_layout.addWidget(analytics_panel, stretch=5)
+        body_splitter.addWidget(analytics_panel)
 
     def _build_overview_tab(self) -> None:
         tab_overview = QWidget()
@@ -1216,7 +1262,7 @@ class MainWindow(QMainWindow):
         section_header.addWidget(section_note)
 
         self.data_subtabs = QTabWidget()
-        self.data_subtabs.setObjectName("mainTabs")
+        self.data_subtabs.setObjectName("secondaryTabs")
 
         summary_page = QWidget()
         summary_layout = QVBoxLayout(summary_page)
@@ -1256,7 +1302,7 @@ class MainWindow(QMainWindow):
         details_layout.addWidget(self.table_data_details)
 
         self.data_subtabs.addTab(summary_page, "汇总")
-        self.data_subtabs.addTab(details_page, "详情")
+        self.data_subtabs.addTab(details_page, "事件明细")
         data_layout.addLayout(section_header)
         data_layout.addWidget(self.data_subtabs, stretch=1)
         self.tabs.addTab(tab_data, "数据")
@@ -1294,7 +1340,7 @@ class MainWindow(QMainWindow):
         stats_frame_layout.addWidget(self.stroke_pie_chart, stretch=1)
         stats_layout.addLayout(section_header)
         stats_layout.addWidget(stats_frame, stretch=1)
-        self.tabs.addTab(tab_stats, "统计")
+        self.data_subtabs.addTab(tab_stats, "击球统计")
 
     def _build_pose_tab(self) -> None:
         tab_pose = QWidget()
@@ -1308,17 +1354,17 @@ class MainWindow(QMainWindow):
         pose_frame_layout.setContentsMargins(24, 24, 24, 24)
         pose_frame_layout.setSpacing(10)
 
-        pose_title = QLabel("姿态与轨迹")
+        pose_title = QLabel("场上移动")
         pose_title.setObjectName("sectionTitle")
         header_row = QHBoxLayout()
         header_row.setSpacing(12)
         distance_layout = QVBoxLayout()
         distance_layout.setSpacing(4)
         self.lbl_top_player_distance = QLabel(self._format_player_distance("上方球员", 0.0))
-        self.lbl_top_player_distance.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_top_player_distance.setObjectName("distanceValue")
         self.lbl_top_player_distance.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.lbl_bottom_player_distance = QLabel(self._format_player_distance("下方球员", 0.0))
-        self.lbl_bottom_player_distance.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_bottom_player_distance.setObjectName("distanceValue")
         self.lbl_bottom_player_distance.setAlignment(Qt.AlignmentFlag.AlignRight)
         distance_layout.addWidget(self.lbl_top_player_distance, alignment=Qt.AlignmentFlag.AlignRight)
         distance_layout.addWidget(self.lbl_bottom_player_distance, alignment=Qt.AlignmentFlag.AlignRight)
@@ -1329,30 +1375,81 @@ class MainWindow(QMainWindow):
         pose_frame_layout.addWidget(self.court_widget, stretch=1)
         pose_layout.addLayout(header_row)
         pose_layout.addWidget(pose_frame, stretch=1)
-        self.tabs.addTab(tab_pose, "姿态")
+        self.data_subtabs.addTab(tab_pose, "场上移动")
 
     def _build_log_tab(self) -> None:
         tab_logs = QWidget()
+        self.log_tab = tab_logs
         logs_layout = QVBoxLayout(tab_logs)
         logs_layout.setContentsMargins(12, 12, 12, 12)
+        logs_layout.setSpacing(8)
+
+        self._log_entries: list[str] = []
+        log_toolbar = QHBoxLayout()
+        log_toolbar.setSpacing(8)
+        self.log_filter_combo = QComboBox()
+        self.log_filter_combo.setObjectName("logFilterCombo")
+        self.log_filter_combo.setAccessibleName("日志类型筛选")
+        self.log_filter_combo.addItem("全部日志", "")
+        self.log_filter_combo.addItem("错误", "error")
+        self.log_filter_combo.addItem("警告", "warning")
+        self.log_filter_combo.addItem("球场", "court")
+        self.log_filter_combo.addItem("轨迹", "track")
+        self.log_filter_combo.addItem("报告", "report")
+        self.log_search_edit = QLineEdit()
+        self.log_search_edit.setObjectName("logSearchEdit")
+        self.log_search_edit.setPlaceholderText("搜索日志")
+        self.log_search_edit.setClearButtonEnabled(True)
+        self.log_search_edit.setAccessibleName("搜索日志")
+        self.log_autoscroll = QCheckBox("自动滚动")
+        self.log_autoscroll.setChecked(True)
+        self.log_autoscroll.setAccessibleName("日志自动滚动")
+        self.btn_copy_logs = QPushButton("复制")
+        self.btn_copy_logs.setObjectName("btnCopyLogs")
+        self.btn_clear_logs = QPushButton("清空")
+        self.btn_clear_logs.setObjectName("btnClearLogs")
+        self.btn_export_logs = QPushButton("导出")
+        self.btn_export_logs.setObjectName("btnExportLogs")
+
+        log_toolbar.addWidget(self.log_filter_combo)
+        log_toolbar.addWidget(self.log_search_edit, stretch=1)
+        log_toolbar.addWidget(self.log_autoscroll)
+        log_toolbar.addWidget(self.btn_copy_logs)
+        log_toolbar.addWidget(self.btn_export_logs)
+        log_toolbar.addWidget(self.btn_clear_logs)
 
         self.log_console = QTextEdit()
         self.log_console.setObjectName("logConsole")
         self.log_console.setReadOnly(True)
         self.log_console.setPlaceholderText("系统日志")
+        self.log_console.setAccessibleName("系统诊断日志")
+        self.log_console.document().setMaximumBlockCount(2000)
+        self.log_filter_combo.currentIndexChanged.connect(self._render_logs)
+        self.log_search_edit.textChanged.connect(self._render_logs)
+        self.btn_copy_logs.clicked.connect(self._copy_logs)
+        self.btn_clear_logs.clicked.connect(self.clear_logs)
+        self.btn_export_logs.clicked.connect(self._export_logs)
+        logs_layout.addLayout(log_toolbar)
         logs_layout.addWidget(self.log_console)
-        self.tabs.addTab(tab_logs, "日志")
+        self.settings_subtabs.addTab(tab_logs, "诊断日志")
 
     def _build_settings_tab(self) -> None:
         tab_settings = QWidget()
-        settings_layout = QVBoxLayout(tab_settings)
+        self.settings_container = tab_settings
+        outer_layout = QVBoxLayout(tab_settings)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.settings_subtabs = QTabWidget()
+        self.settings_subtabs.setObjectName("secondaryTabs")
+
+        settings_page = QWidget()
+        settings_layout = QVBoxLayout(settings_page)
         settings_layout.setContentsMargins(12, 12, 12, 12)
         settings_layout.setSpacing(12)
 
         section_header = QHBoxLayout()
         section_title = QLabel("模型设置")
         section_title.setObjectName("sectionTitle")
-        section_note = QLabel("应用后重新加载推理模型")
+        section_note = QLabel("更改模型仅在停止分析时生效")
         section_note.setObjectName("sectionNote")
         section_header.addWidget(section_title)
         section_header.addStretch(1)
@@ -1372,8 +1469,11 @@ class MainWindow(QMainWindow):
         self.pose_model_edit = QLineEdit()
         self.pose_model_edit.setObjectName("modelPathEdit")
         self.pose_model_edit.setPlaceholderText("选择骨骼/姿态模型权重文件")
+        self.pose_model_edit.setAccessibleName("骨骼模型文件路径")
+        pose_label.setBuddy(self.pose_model_edit)
         self.btn_browse_pose_model = QPushButton("浏览")
         self.btn_browse_pose_model.setObjectName("btnBrowsePoseModel")
+        self.btn_browse_pose_model.setAccessibleName("浏览骨骼模型文件")
         self.btn_browse_pose_model.clicked.connect(self.poseModelBrowseRequested.emit)
 
         track_label = QLabel("球轨迹模型")
@@ -1383,15 +1483,18 @@ class MainWindow(QMainWindow):
         self.track_model_edit = QLineEdit()
         self.track_model_edit.setObjectName("modelPathEdit")
         self.track_model_edit.setPlaceholderText("选择球轨迹模型权重文件")
+        self.track_model_edit.setAccessibleName("球轨迹模型文件路径")
+        track_label.setBuddy(self.track_model_edit)
         self.btn_browse_track_model = QPushButton("浏览")
         self.btn_browse_track_model.setObjectName("btnBrowseTrackModel")
+        self.btn_browse_track_model.setAccessibleName("浏览球轨迹模型文件")
         self.btn_browse_track_model.clicked.connect(self.trackModelBrowseRequested.emit)
 
-        debug_label = QLabel("Debug Logs")
+        debug_label = QLabel("逐帧诊断")
         debug_label.setObjectName("styleLabel")
-        self.debug_csv_enabled = ToggleSwitch("Write frame analysis logs")
+        self.debug_csv_enabled = ToggleSwitch("写入逐帧分析日志")
         self.debug_csv_enabled.setChecked(False)
-        debug_note = QLabel("Writes TrackNet filter CSV plus frame JSONL with ball, pose, and hit-point events.")
+        debug_note = QLabel("保存 TrackNet CSV 与包含球、姿态和击球事件的 JSONL。")
         debug_note.setObjectName("sectionNote")
         debug_note.setWordWrap(True)
 
@@ -1399,19 +1502,29 @@ class MainWindow(QMainWindow):
         report_api_label.setObjectName("styleLabel")
         self.report_api_enabled = ToggleSwitch("启用报告模型 API")
         self.report_api_enabled.setChecked(False)
+        self.report_api_enabled.toggled.connect(self._update_report_api_fields_enabled)
         self.report_api_provider_combo = QComboBox()
         self.report_api_provider_combo.setObjectName("modelPathEdit")
+        self.report_api_provider_combo.setAccessibleName("报告 API 服务商")
         self.report_api_provider_combo.addItem("阿里百炼 OpenAI 兼容", "bailian_openai")
         self.report_api_endpoint_edit = QLineEdit()
         self.report_api_endpoint_edit.setObjectName("modelPathEdit")
+        self.report_api_endpoint_edit.setAccessibleName("报告 API 地址")
         self.report_api_endpoint_edit.setPlaceholderText("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
         self.report_api_model_edit = QLineEdit()
         self.report_api_model_edit.setObjectName("modelPathEdit")
+        self.report_api_model_edit.setAccessibleName("报告 API 模型")
         self.report_api_model_edit.setPlaceholderText("qwen-plus")
         self.report_api_key_edit = QLineEdit()
         self.report_api_key_edit.setObjectName("modelPathEdit")
         self.report_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.report_api_key_edit.setPlaceholderText("阿里百炼 API Key")
+        self.report_api_key_edit.setAccessibleName("报告 API 密钥")
+        self.btn_toggle_api_key = QPushButton("显示")
+        self.btn_toggle_api_key.setObjectName("btnToggleApiKey")
+        self.btn_toggle_api_key.setCheckable(True)
+        self.btn_toggle_api_key.setAccessibleName("显示或隐藏 API 密钥")
+        self.btn_toggle_api_key.toggled.connect(self._toggle_api_key_visibility)
 
         settings_frame_layout.addWidget(pose_label, 0, 0)
         settings_frame_layout.addWidget(self.pose_model_enabled, 0, 1)
@@ -1427,12 +1540,19 @@ class MainWindow(QMainWindow):
         settings_frame_layout.addWidget(report_api_label, 3, 0)
         settings_frame_layout.addWidget(self.report_api_enabled, 3, 1)
         settings_frame_layout.addWidget(self.report_api_provider_combo, 3, 2, 1, 2)
-        settings_frame_layout.addWidget(QLabel("Endpoint"), 4, 0)
+        endpoint_label = QLabel("API 地址")
+        endpoint_label.setBuddy(self.report_api_endpoint_edit)
+        settings_frame_layout.addWidget(endpoint_label, 4, 0)
         settings_frame_layout.addWidget(self.report_api_endpoint_edit, 4, 1, 1, 3)
-        settings_frame_layout.addWidget(QLabel("模型"), 5, 0)
+        report_model_label = QLabel("模型")
+        report_model_label.setBuddy(self.report_api_model_edit)
+        settings_frame_layout.addWidget(report_model_label, 5, 0)
         settings_frame_layout.addWidget(self.report_api_model_edit, 5, 1, 1, 3)
-        settings_frame_layout.addWidget(QLabel("API Key"), 6, 0)
-        settings_frame_layout.addWidget(self.report_api_key_edit, 6, 1, 1, 3)
+        api_key_label = QLabel("API 密钥")
+        api_key_label.setBuddy(self.report_api_key_edit)
+        settings_frame_layout.addWidget(api_key_label, 6, 0)
+        settings_frame_layout.addWidget(self.report_api_key_edit, 6, 1, 1, 2)
+        settings_frame_layout.addWidget(self.btn_toggle_api_key, 6, 3)
         settings_frame_layout.setColumnStretch(2, 1)
 
         self.pose_model_enabled.stateChanged.connect(self._emit_model_switches_changed)
@@ -1443,9 +1563,9 @@ class MainWindow(QMainWindow):
         action_row.addStretch(1)
         self.btn_model_defaults = QPushButton("恢复默认")
         self.btn_model_defaults.setObjectName("btnModelDefaults")
-        self.btn_apply_model_settings = QPushButton("应用设置")
+        self.btn_apply_model_settings = QPushButton("应用模型设置")
         self.btn_apply_model_settings.setObjectName("btnApplyModelSettings")
-        self.btn_apply_report_api_settings = QPushButton("保存报告 API")
+        self.btn_apply_report_api_settings = QPushButton("保存报告设置")
         self.btn_apply_report_api_settings.setObjectName("btnApplyReportApiSettings")
         self.btn_model_defaults.clicked.connect(self.modelSettingsDefaultsRequested.emit)
         self.btn_apply_model_settings.clicked.connect(self._emit_model_settings_apply)
@@ -1458,6 +1578,8 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(settings_frame)
         settings_layout.addLayout(action_row)
         settings_layout.addStretch(1)
+        self.settings_subtabs.addTab(settings_page, "模型与服务")
+        outer_layout.addWidget(self.settings_subtabs)
         self.tabs.addTab(tab_settings, "设置")
 
     def _create_metric_card(self, title: str, value: str) -> tuple[QFrame, QLabel]:
@@ -1526,8 +1648,7 @@ class MainWindow(QMainWindow):
 
         margins = (6, 6, 6, 6) if enabled else self._normal_root_margins
         self.root_layout.setContentsMargins(*margins)
-        self.root_layout.setSpacing(8 if enabled else 16)
-        self.body_layout.setSpacing(8 if enabled else 16)
+        self.root_layout.setSpacing(8 if enabled else 12)
         self._set_analytics_panel_opacity(0.46 if enabled else 1.0)
         self.video_player.set_fullscreen_mode(enabled)
 
@@ -1545,8 +1666,6 @@ class MainWindow(QMainWindow):
     def _float_analytics_panel(self) -> None:
         if self._analytics_panel_overlay:
             return
-        self.body_layout.removeWidget(self.analytics_panel)
-        self.body_layout.setStretch(0, 1)
         self.analytics_panel.setParent(self.central_widget)
         self.analytics_panel.show()
         self.analytics_panel.raise_()
@@ -1554,12 +1673,13 @@ class MainWindow(QMainWindow):
 
     def _dock_analytics_panel(self) -> None:
         if not self._analytics_panel_overlay:
-            self.body_layout.setStretch(0, 6)
-            self.body_layout.setStretch(1, 5)
+            self.body_splitter.setStretchFactor(0, 6)
+            self.body_splitter.setStretchFactor(1, 5)
             return
-        self.body_layout.addWidget(self.analytics_panel, stretch=5)
-        self.body_layout.setStretch(0, 6)
-        self.body_layout.setStretch(1, 5)
+        self.body_splitter.insertWidget(1, self.analytics_panel)
+        self.body_splitter.setStretchFactor(0, 6)
+        self.body_splitter.setStretchFactor(1, 5)
+        self.body_splitter.setSizes([690, 570])
         self.analytics_panel.show()
         self._analytics_panel_overlay = False
 
@@ -1682,6 +1802,10 @@ class MainWindow(QMainWindow):
     def set_model_settings(self, pose_model_path: str, track_model_path: str) -> None:
         self.pose_model_edit.setText(pose_model_path)
         self.track_model_edit.setText(track_model_path)
+        self.pose_model_edit.setCursorPosition(0)
+        self.track_model_edit.setCursorPosition(0)
+        self.pose_model_edit.setToolTip(pose_model_path)
+        self.track_model_edit.setToolTip(track_model_path)
 
     def model_settings(self) -> tuple[str, str]:
         return self.pose_model_edit.text().strip(), self.track_model_edit.text().strip()
@@ -1715,6 +1839,9 @@ class MainWindow(QMainWindow):
         self.report_api_endpoint_edit.setText(str(settings.get("endpoint") or ""))
         self.report_api_model_edit.setText(str(settings.get("model") or ""))
         self.report_api_key_edit.setText(str(settings.get("api_key") or ""))
+        self.report_api_endpoint_edit.setCursorPosition(0)
+        self.report_api_model_edit.setCursorPosition(0)
+        self._update_report_api_fields_enabled(self.report_api_enabled.isChecked())
 
     def report_api_settings(self) -> dict[str, object]:
         return {
@@ -1742,9 +1869,11 @@ class MainWindow(QMainWindow):
             self.report_api_endpoint_edit,
             self.report_api_model_edit,
             self.report_api_key_edit,
+            self.btn_toggle_api_key,
         )
         for widget in widgets:
             widget.setEnabled(enabled)
+        self._update_report_api_fields_enabled(enabled and self.report_api_enabled.isChecked())
 
     def _emit_model_settings_apply(self) -> None:
         pose_model_path, track_model_path = self.model_settings()
@@ -1756,6 +1885,22 @@ class MainWindow(QMainWindow):
     def _emit_model_switches_changed(self) -> None:
         pose_enabled, track_enabled = self.model_switches()
         self.modelSwitchesChanged.emit(pose_enabled, track_enabled)
+
+    def _toggle_api_key_visibility(self, visible: bool) -> None:
+        self.report_api_key_edit.setEchoMode(
+            QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        )
+        self.btn_toggle_api_key.setText("隐藏" if visible else "显示")
+
+    def _update_report_api_fields_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.report_api_provider_combo,
+            self.report_api_endpoint_edit,
+            self.report_api_model_edit,
+            self.report_api_key_edit,
+            self.btn_toggle_api_key,
+        ):
+            widget.setEnabled(bool(enabled))
 
     def show_video_frame(
         self,
@@ -1793,22 +1938,117 @@ class MainWindow(QMainWindow):
         self.status_label.setProperty("state", state)
         self._refresh_widget(self.status_label)
 
+    def set_system_status(self, text: str, state: str = "idle") -> None:
+        message = str(text).strip() or "系统状态：待机中"
+        self.status_label.setText(message)
+        self.status_label.setAccessibleDescription(message)
+        self.set_status_state(state)
+
+    def show_status_notice(self, message: str, state: str = "info") -> None:
+        text = str(message).strip()
+        if not text:
+            self.clear_status_notice()
+            return
+        self.status_banner_label.setText(text)
+        self.status_banner_label.setAccessibleDescription(text)
+        self.status_banner.setProperty("state", state)
+        self._refresh_widget(self.status_banner)
+        self.status_banner.setVisible(True)
+
+    def clear_status_notice(self) -> None:
+        self.status_banner.setVisible(False)
+        self.status_banner_label.clear()
+
+    def show_log_tab(self) -> None:
+        settings_index = self.tabs.indexOf(self.settings_container)
+        if settings_index >= 0:
+            self.tabs.setCurrentIndex(settings_index)
+        log_index = self.settings_subtabs.indexOf(self.log_tab)
+        if log_index >= 0:
+            self.settings_subtabs.setCurrentIndex(log_index)
+
+    def set_active_theme(self, theme_name: str) -> None:
+        self.report_preview.set_theme(theme_name)
+        self.stroke_pie_chart.update()
+        self.court_widget.update()
+
     def append_log(self, text: str) -> None:
-        self.log_console.append(text)
+        message = str(text)
+        self._log_entries.append(message)
+        if len(self._log_entries) > 2000:
+            del self._log_entries[:-2000]
+        if self._log_matches(message):
+            self.log_console.append(message)
+            if self.log_autoscroll.isChecked():
+                self.log_console.moveCursor(QTextCursor.MoveOperation.End)
+
+    def clear_logs(self) -> None:
+        self._log_entries.clear()
+        self.log_console.clear()
+
+    def _log_matches(self, message: str) -> bool:
+        category = str(self.log_filter_combo.currentData() or "").casefold()
+        query = self.log_search_edit.text().strip().casefold()
+        normalized = message.casefold()
+        category_terms = {
+            "error": ("错误", "失败", "error", "failed"),
+            "warning": ("警告", "warning", "未找到", "缺少"),
+            "court": ("court", "球场", "标定"),
+            "track": ("track", "轨迹", "event"),
+            "report": ("报告", "report"),
+        }
+        terms = category_terms.get(category, ())
+        category_matches = not terms or any(term in normalized for term in terms)
+        return category_matches and (not query or query in normalized)
+
+    def _render_logs(self, *_args) -> None:
+        visible_entries = [entry for entry in self._log_entries if self._log_matches(entry)]
+        self.log_console.setPlainText("\n".join(visible_entries))
+        if self.log_autoscroll.isChecked():
+            self.log_console.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _copy_logs(self) -> None:
+        QApplication.clipboard().setText(self.log_console.toPlainText())
+
+    def _export_logs(self) -> None:
+        file_path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出诊断日志",
+            str(PROJECT_ROOT / "outputs" / "wfbar_runtime.log"),
+            "日志文件 (*.log *.txt);;所有文件 (*)",
+        )
+        if not file_path:
+            return
+        try:
+            Path(file_path).write_text(self.log_console.toPlainText(), encoding="utf-8")
+        except OSError as exc:
+            self.show_status_notice(f"日志导出失败：{exc}", "error")
 
     def update_progress(self, val: int) -> None:
         if self.progress_bar.minimum() != 0 or self.progress_bar.maximum() != 100:
             self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(val)
+        value = max(0, min(int(val), 100))
+        self.progress_bar.setValue(value)
+        visible = 0 < value < 100
+        if visible:
+            progress_text = f"正在分析视频（{value}%）"
+            self.progress_label.setText(progress_text)
+            self.progress_bar.setAccessibleDescription(progress_text)
+        self.progress_bar.setVisible(visible)
+        self.progress_notice.setVisible(visible)
 
     def set_progress_busy(self, busy: bool, text: str = "") -> None:
         if busy:
             self.progress_bar.setRange(0, 0)
-            if text:
-                self.progress_bar.setFormat(text)
+            progress_text = text.strip() or "正在准备分析任务"
+            self.progress_label.setText(progress_text)
+            self.progress_bar.setAccessibleDescription(progress_text)
+            self.progress_bar.setVisible(True)
+            self.progress_notice.setVisible(True)
             return
         self.progress_bar.setRange(0, 100)
-        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setVisible(False)
+        self.progress_notice.setVisible(False)
 
     def set_rally_data(self, record: object | None) -> None:
         if not isinstance(record, dict):
@@ -1987,7 +2227,6 @@ class MainWindow(QMainWindow):
         self.table_actions.setItem(row, 1, label_item)
 
         conf_item = QTableWidgetItem(f"{conf * 100:.1f}%")
-        conf_item.setForeground(QColor("#22c55e"))
         conf_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.table_actions.setItem(row, 2, conf_item)
 
@@ -2030,11 +2269,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _format_player_distance(label: str, distance_m: float) -> str:
-        return (
-            f"<span style='font-weight:700;color:#111827;'>{label}: </span>"
-            f"<span style='font-weight:700;color:#DC2626;'>{distance_m:.2f}</span>"
-            "<span style='font-weight:700;color:#111827;'> 米</span>"
-        )
+        return f"{label}：{distance_m:.2f} 米"
 
     @staticmethod
     def _safe_distance_m(value: object) -> float:

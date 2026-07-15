@@ -35,3 +35,12 @@ QTabBar::tab:hover:!selected {
     background: #313744;
     color: #E8EDF5;
 }
+
+QTabWidget#secondaryTabs::pane { border: none; border-top: 1px solid #3A3F4B; background: #22262E; }
+QTabWidget#secondaryTabs QTabBar::tab {
+    background: transparent; border: none; border-bottom: 2px solid transparent;
+    border-radius: 0px; padding: 7px 12px; color: #8A95A8;
+}
+QTabWidget#secondaryTabs QTabBar::tab:selected {
+    color: #4FA3E0; border-bottom-color: #4FA3E0; font-weight: 600;
+}

@@ -4,7 +4,7 @@
 
 /* --- 标题 / 副标题 --- */
 QLabel#titleLabel {
-    font-size: 28px;
+    font-size: 22px;
     font-weight: 600;
     color: #1F1F1F;
 }
@@ -86,6 +86,7 @@ QLabel#statusLabel {
 QLabel#statusLabel[state="loading"] { color: #9B5C00; }
 QLabel#statusLabel[state="success"] { color: #107C41; }
 QLabel#statusLabel[state="stopped"] { color: #9B5C00; }
+QLabel#statusLabel[state="warning"] { color: #9B5C00; }
 QLabel#statusLabel[state="error"]   { color: #A4262C; }
 
 /* --- 样式选择器标签 --- */
@@ -93,4 +94,35 @@ QLabel#styleLabel {
     color: #605E5C;
     font-size: 12px;
     font-weight: 400;
+}
+
+QLabel#distanceValue {
+    color: #323130;
+    font-weight: 600;
+}
+
+QFrame#statusBanner {
+    background-color: #EAF2F8;
+    border: 1px solid #8AB4D6;
+    border-radius: 2px;
+}
+
+QFrame#statusBanner[state="warning"] {
+    background-color: #FFF4CE;
+    border-color: #E0B84F;
+}
+
+QFrame#statusBanner[state="error"] {
+    background-color: #FDE7E9;
+    border-color: #D96C75;
+}
+
+QFrame#statusBanner[state="success"] {
+    background-color: #EAF4EA;
+    border-color: #77B879;
+}
+
+QLabel#statusBannerLabel {
+    color: #1F1F1F;
+    font-weight: 500;
 }

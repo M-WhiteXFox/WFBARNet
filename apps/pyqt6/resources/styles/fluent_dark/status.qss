@@ -3,7 +3,7 @@
  * ============================================================ */
 
 QLabel#titleLabel {
-    font-size: 28px;
+    font-size: 22px;
     font-weight: 600;
     color: #E8EDF5;
 }
@@ -73,6 +73,7 @@ QLabel#statusLabel {
 QLabel#statusLabel[state="loading"] { color: #FCD34D; }
 QLabel#statusLabel[state="success"] { color: #4ADE80; }
 QLabel#statusLabel[state="stopped"] { color: #FCD34D; }
+QLabel#statusLabel[state="warning"] { color: #FCD34D; }
 QLabel#statusLabel[state="error"]   { color: #F87171; }
 
 QLabel#styleLabel {
@@ -80,3 +81,19 @@ QLabel#styleLabel {
     font-size: 12px;
     font-weight: 400;
 }
+
+QLabel#distanceValue {
+    color: #C8D0DC;
+    font-weight: 600;
+}
+
+QFrame#statusBanner {
+    background-color: #0F2040;
+    border: 1px solid #315F8C;
+    border-radius: 6px;
+}
+
+QFrame#statusBanner[state="warning"] { background-color: #2B1F0A; border-color: #92400E; }
+QFrame#statusBanner[state="error"] { background-color: #2B0F0F; border-color: #7F1D1D; }
+QFrame#statusBanner[state="success"] { background-color: #0D2B1A; border-color: #166534; }
+QLabel#statusBannerLabel { color: #E8EDF5; font-weight: 500; }

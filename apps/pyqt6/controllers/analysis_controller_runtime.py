@@ -1699,10 +1699,12 @@ class MainController:
         self._manual_court_active = False
         self._court_source_key: tuple[str, str] | None = None
         self._pending_seek_ms: int | None = None
+        self._pending_video_start_ms: int | None = None
         self._last_display_frame_time: float | None = None
         self._last_metrics_update_time: float | None = None
         self._display_fps_ema = 0.0
         self._last_court_log_frame = -1
+        self._court_bootstrap_exhausted = False
         self._last_track_debug_log_time = 0.0
         self._last_track_debug_log_key = ""
 
@@ -1728,6 +1730,12 @@ class MainController:
         self._bind_court_service()
         self._bind_events()
         self.view.populate_stylesheets(self._theme_dirs, self._active_theme_name)
+        active_theme = next((d for d in self._theme_dirs if d.name == self._active_theme_name), None)
+        app = QApplication.instance()
+        if app is not None and active_theme is not None:
+            apply_theme(app, active_theme)
+        if hasattr(self.view, "set_active_theme"):
+            self.view.set_active_theme(self._active_theme_name)
         self.view.video_timeline.set_interactive(True)
         self._reset_metrics()
         self._set_idle_state()
@@ -1750,6 +1758,7 @@ class MainController:
 
     def _reset_court_detection(self, *, request_initial_prediction: bool = False) -> None:
         self._last_court_log_frame = -1
+        self._court_bootstrap_exhausted = False
         if self._court_service is not None:
             self._court_service.reset()
             if request_initial_prediction:
@@ -1900,6 +1909,20 @@ class MainController:
         provisional = bool(payload.get("provisional"))
         if bool(payload.get("valid")) or provisional:
             self.view.set_court_overlay(payload)
+
+        metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+        if bool(payload.get("valid")):
+            self._court_bootstrap_exhausted = False
+            self._resume_pending_video_start()
+        elif self._pending_video_start_ms is not None:
+            if bool(metrics.get("bootstrap_exhausted")):
+                self._cancel_pending_video_start(
+                    "[Court] 自动扫描结束但未获得可信球场线，未开始播放；"
+                    "请点击“重新标注球场”修正后再次开始分析。"
+                )
+        if not bool(payload.get("valid")) and bool(metrics.get("bootstrap_exhausted")):
+            self._court_bootstrap_exhausted = True
+
         frame_id = int(payload.get("frame_id", -1))
         if frame_id == self._last_court_log_frame:
             return
@@ -1940,7 +1963,9 @@ class MainController:
             self.view.append_log("[Court] 自动标定未找到可靠球场，可点击“重新标注球场”手动修正。")
 
     def _on_court_detection_failed(self, message: str) -> None:
-        self.view.append_log(f"[Court] 自动标定失败: {message}；可点击“重新标注球场”手动修正。")
+        notice = f"自动标定失败：{message}。可点击“重新标注球场”手动修正。"
+        self.view.append_log(f"[Court] {notice}")
+        self._show_status_notice(notice, "warning")
 
     def _load_model_path(self, key: str, default_path: str) -> str:
         raw_value = self._settings.value(key, default_path)
@@ -1966,6 +1991,9 @@ class MainController:
         return self._project_root / path
 
     def _resolve_initial_theme_name(self) -> str:
+        saved_theme = str(self._settings.value("ui_theme", "") or "").strip()
+        if saved_theme and any(theme_dir.name == saved_theme for theme_dir in self._theme_dirs):
+            return saved_theme
         if any(theme_dir.name == "office_light" for theme_dir in self._theme_dirs):
             return "office_light"
         return self._theme_dirs[0].name if self._theme_dirs else ""
@@ -2080,7 +2108,9 @@ class MainController:
                 self._bst_model = self._build_bst_model()
         except Exception as exc:
             self.view.set_progress_busy(False)
-            self.view.set_status_state("error")
+            message = f"模型加载失败：{exc}"
+            self._set_view_status("error", f"系统状态：{message}")
+            self._show_status_notice(f"{message}。请检查设置中的模型路径后重试。", "error")
             self.view.append_log(f"[模型] 加载失败: {exc}")
             return False
 
@@ -2174,6 +2204,23 @@ class MainController:
         self.view.debugCsvChanged.connect(self.handle_debug_csv_changed)
         self.view.reportApiSettingsApplyRequested.connect(self.handle_report_api_settings_apply)
 
+    def _set_view_status(self, state: str, text: str) -> None:
+        if hasattr(self.view, "set_system_status"):
+            self.view.set_system_status(text, state)
+            return
+        status_label = getattr(self.view, "status_label", None)
+        if status_label is not None and hasattr(status_label, "setText"):
+            status_label.setText(text)
+        self.view.set_status_state(state)
+
+    def _show_status_notice(self, message: str, state: str = "info") -> None:
+        if hasattr(self.view, "show_status_notice"):
+            self.view.show_status_notice(message, state)
+
+    def _clear_status_notice(self) -> None:
+        if hasattr(self.view, "clear_status_notice"):
+            self.view.clear_status_notice()
+
     def _set_idle_state(self) -> None:
         self._analysis_busy = False
         has_video = self._selected_video_path is not None
@@ -2202,10 +2249,11 @@ class MainController:
         self.view.btn_redetect_court.setEnabled(self._input_mode != "batch")
         self.view.video_timeline.set_interactive(self._input_mode == "video")
         self.view.set_model_settings_enabled(True)
-        self.view.set_status_state("idle")
+        self._set_view_status("idle", "系统状态：待机中")
 
     def _set_running_state(self) -> None:
         self._analysis_busy = True
+        self._clear_status_notice()
         self.view.btn_analyze.setEnabled(False)
         self.view.btn_reset.setEnabled(True)
         self.view.video_player.btn_select_video.setEnabled(False)
@@ -2219,7 +2267,7 @@ class MainController:
         self.view.btn_redetect_court.setEnabled(False)
         self.view.video_timeline.set_interactive(False)
         self.view.set_model_settings_enabled(False)
-        self.view.set_status_state("loading")
+        self._set_view_status("loading", "系统状态：正在准备分析...")
 
     def _reset_metrics(self) -> None:
         self.view.set_progress_busy(False)
@@ -2641,12 +2689,13 @@ class MainController:
         try:
             self._selected_video_path = None
             self._video_meta = {}
-            self.view.set_status_state("error")
             self.view.set_video_state("error")
             self.view.btn_analyze.setEnabled(False)
             self.view.video_player.btn_select_video.setEnabled(True)
             self.view.video_player.btn_force_stop.setEnabled(False)
             self.view.append_log(f"[错误] {message}")
+            self._set_view_status("error", "系统状态：视频加载失败")
+            self._show_status_notice(f"视频加载失败：{message}", "error")
         finally:
             self._release_probe_worker(worker)
 
@@ -2660,11 +2709,67 @@ class MainController:
 
         if not self._selected_video_path:
             self.view.append_log("[警告] 开始分析前请先选择视频。")
+            self._show_status_notice("请先选择视频，再开始分析。", "warning")
             return
 
         self._pending_seek_ms = None
         start_ms = int(self._video_meta.get("position_ms", 0)) if self._video_meta else 0
-        self._start_playback(start_ms=start_ms, request_court_prediction=True)
+        if not self._ensure_models_ready():
+            self._set_idle_state()
+            self._set_view_status("error", "系统状态：模型加载失败，请检查设置")
+            return
+
+        latest_court = self._latest_court_prediction_dict()
+        if isinstance(latest_court, dict) and bool(latest_court.get("valid")):
+            self._start_playback(start_ms=start_ms, request_court_prediction=False)
+            return
+
+        metrics = (
+            latest_court.get("metrics")
+            if isinstance(latest_court, dict) and isinstance(latest_court.get("metrics"), dict)
+            else {}
+        )
+        if self._court_bootstrap_exhausted or bool(metrics.get("bootstrap_exhausted")):
+            message = (
+                "当前自动扫描未获得可信球场线，视频不会播放；"
+                "请点击“重新标注球场”修正后再次开始分析。"
+            )
+            self.view.append_log(f"[Court] {message}")
+            self._show_status_notice(message, "warning")
+            self._set_view_status("stopped", "系统状态：等待人工球场标定")
+            return
+
+        self._pending_video_start_ms = start_ms
+        self._set_court_waiting_state()
+        self._request_court_prediction()
+        self.view.append_log(
+            "[Court] 正在等待可信球场线，视频暂不播放；标定完成后将自动开始分析。"
+        )
+
+    def _set_court_waiting_state(self) -> None:
+        self._set_running_state()
+        self.view.set_progress_busy(True, "正在识别可信球场线...")
+        self._set_view_status("loading", "系统状态：正在识别可信球场线，视频暂未播放")
+
+    def _resume_pending_video_start(self) -> None:
+        if getattr(self, "_pending_video_start_ms", None) is None:
+            return
+        start_ms = self._pending_video_start_ms
+        self._pending_video_start_ms = None
+        self.view.set_progress_busy(False)
+        self.view.append_log("[Court] 已获得可信球场线，开始播放并执行推理。")
+        self._start_playback(start_ms=start_ms, request_court_prediction=False)
+
+    def _cancel_pending_video_start(self, message: str) -> None:
+        if self._pending_video_start_ms is None:
+            return
+        self._pending_video_start_ms = None
+        self.view.set_progress_busy(False)
+        self._set_idle_state()
+        self.view.append_log(message)
+        notice = message.removeprefix("[Court] ")
+        self._show_status_notice(notice, "warning")
+        self._set_view_status("stopped", "系统状态：未开始播放")
 
     def _start_batch_inference(self) -> None:
         if not self._selected_batch_folder:
@@ -2785,7 +2890,8 @@ class MainController:
         if self._playback_worker is not None or self._camera_worker is not None:
             self.view.append_log("[信息] 正在等待上一项推理任务结束...")
             return
-        self._reset_court_detection(request_initial_prediction=request_court_prediction)
+        if request_court_prediction:
+            self._reset_court_detection(request_initial_prediction=True)
         self._set_current_rally_record(None)
         self._set_running_state()
         self.view.video_player.play()
@@ -2865,8 +2971,9 @@ class MainController:
 
         self.view.lbl_valid_pose.setText(f"{infer_fps:.1f} FPS")
         self.view.lbl_realtime_fps.setText(f"{self._display_fps_ema:.1f} FPS")
-        self.view.status_label.setText(
-            f"系统状态：TrackNet + YOLO26s-Pose 运行中 | 人数 {person_count} | Score {current_score:.2f}{court_text}"
+        self._set_view_status(
+            "loading",
+            f"系统状态：视频分析中 | 人数 {person_count} | 球轨迹置信度 {current_score:.2f}{court_text}",
         )
 
     def _on_camera_frame_ready(self, payload: object) -> None:
@@ -2903,8 +3010,9 @@ class MainController:
 
         self.view.lbl_valid_pose.setText(f"{infer_fps:.1f} FPS")
         self.view.lbl_realtime_fps.setText(f"{self._display_fps_ema:.1f} FPS")
-        self.view.status_label.setText(
-            f"系统状态：摄像头 TrackNet + YOLO26s-Pose 推理中 | 人数 {person_count} | Score {current_score:.2f}{court_text}"
+        self._set_view_status(
+            "loading",
+            f"系统状态：摄像头分析中 | 人数 {person_count} | 球轨迹置信度 {current_score:.2f}{court_text}",
         )
 
     def _on_batch_progress(self, payload: object) -> None:
@@ -2917,7 +3025,7 @@ class MainController:
             index = int(payload.get("index", 0)) + 1
             total = int(payload.get("total", 0))
             self.view.append_log(f"[批量推理] {index}/{total} {video_name}")
-        self.view.status_label.setText(f"系统状态：批量推理中 | {progress}% | {video_name}")
+        self._set_view_status("loading", f"系统状态：批量分析中 | {progress}% | {video_name}")
 
     def _on_batch_rally_finished(self, record: object) -> None:
         if not isinstance(record, dict):
@@ -2950,20 +3058,25 @@ class MainController:
         completed = int(payload.get("completed", 0)) if isinstance(payload, dict) else len(self._batch_results)
         failed = int(payload.get("failed", 0)) if isinstance(payload, dict) else 0
         if stopped:
-            self.view.set_status_state("stopped")
             self.view.append_log(f"[批量推理] 已停止 | 已完成 {completed}/{total}")
+            final_state = "stopped"
+            final_text = f"系统状态：批量分析已停止 | 已完成 {completed}/{total}"
         else:
-            self.view.set_status_state("success")
             self.view.update_progress(100)
             self.view.append_log(f"[批量推理] 全部完成 | 成功 {completed}/{total} | 失败 {failed}")
+            final_state = "warning" if failed else "success"
+            final_text = f"系统状态：批量分析完成 | 成功 {completed}/{total} | 失败 {failed}"
         self.view.set_batch_export_enabled(bool(self._batch_results))
         self._set_idle_state()
+        self._set_view_status(final_state, final_text)
+        self._show_status_notice(final_text.removeprefix("系统状态："), final_state)
 
     def _on_batch_failed(self, message: str) -> None:
         self.view.set_progress_busy(False)
-        self.view.set_status_state("error")
         self.view.append_log(f"[错误] {message}")
         self._set_idle_state()
+        self._set_view_status("error", "系统状态：批量分析失败")
+        self._show_status_notice(f"批量分析失败：{message}", "error")
 
     def _append_bst_predictions(self, payload: dict[str, Any]) -> None:
         errors = payload.get("bst_errors", [])
@@ -3015,12 +3128,14 @@ class MainController:
                 name = str(item.get("display_name", item.get("class_name", item.get("class_id", ""))))
                 prob = float(item.get("probability", 0.0))
                 top_items.append(f"{name} {prob * 100:.1f}%")
-        h_text = "court H" if prediction.get("used_homography") else "fallback pos"
-        top_text = ", ".join(top_items) if top_items else "n/a"
+        source_text = "球场坐标" if prediction.get("used_homography") else "人体姿态"
+        top_text = "、".join(top_items) if top_items else "暂无其他候选"
+        video_len = int(prediction.get("video_len", 0))
+        failed_frames = int(prediction.get("failed_frames", 0))
+        valid_frames = max(0, video_len - failed_frames)
         return (
-            f"frame {int(prediction.get('event_frame_id', -1))} | "
-            f"clip {int(prediction.get('video_len', 0))}/{int(prediction.get('seq_len', 0))} | "
-            f"{h_text} | failed {int(prediction.get('failed_frames', 0))} | top3 {top_text}"
+            f"基于{source_text} | 有效帧 {valid_frames}/{video_len} | "
+            f"候选：{top_text}"
         )
 
     def _format_time_ms(self, timestamp_ms: int) -> str:
@@ -3108,12 +3223,14 @@ class MainController:
         stopped = bool(payload.get("stopped")) if isinstance(payload, dict) else False
 
         if stopped:
-            self.view.set_status_state("stopped")
             self.view.video_player.stop()
             self.view.append_log("[TrackNet] 摄像头实时推理已停止。")
+            final_state = "stopped"
+            final_text = "系统状态：摄像头分析已停止"
         else:
-            self.view.set_status_state("success")
             self.view.video_player.stop()
+            final_state = "success"
+            final_text = "系统状态：摄像头分析完成"
             if isinstance(payload, dict):
                 self.view.append_log(
                     f"[TrackNet] 摄像头实时推理结束 | "
@@ -3128,26 +3245,31 @@ class MainController:
         if isinstance(payload, dict):
             self._set_current_rally_record(payload.get("rally_record"))
         self._set_idle_state()
+        self._set_view_status(final_state, final_text)
         self._maybe_start_stopped_report(stopped)
 
     def _on_camera_failed(self, message: str) -> None:
         self.view.set_progress_busy(False)
-        self.view.set_status_state("error")
         self.view.video_player.stop()
         self.view.append_log(f"[错误] {message}")
         self._set_idle_state()
+        self._set_view_status("error", "系统状态：摄像头分析失败")
+        self._show_status_notice(f"摄像头分析失败：{message}", "error")
 
     def _on_playback_finished(self, payload: object) -> None:
+        self.view.set_progress_busy(False)
         stopped = bool(payload.get("stopped")) if isinstance(payload, dict) else False
 
         if stopped:
-            self.view.set_status_state("stopped")
             self.view.video_player.stop()
             self.view.append_log("[TrackNet] 播放已停止。")
+            final_state = "stopped"
+            final_text = "系统状态：视频分析已停止"
         else:
-            self.view.set_status_state("success")
             self.view.video_player.stop()
             self.view.update_progress(100)
+            final_state = "success"
+            final_text = "系统状态：视频分析完成，可查看数据与报告"
             if isinstance(payload, dict):
                 self.view.append_log(
                     f"[TrackNet] 已完成 | "
@@ -3162,6 +3284,7 @@ class MainController:
         if isinstance(payload, dict):
             self._set_current_rally_record(payload.get("rally_record"))
         self._set_idle_state()
+        self._set_view_status(final_state, final_text)
         self._maybe_start_stopped_report(stopped)
 
         if self._pending_seek_ms is not None and self._selected_video_path is not None:
@@ -3177,10 +3300,12 @@ class MainController:
             )
 
     def _on_playback_failed(self, message: str) -> None:
-        self.view.set_status_state("error")
+        self.view.set_progress_busy(False)
         self.view.video_player.stop()
         self.view.append_log(f"[错误] {message}")
         self._set_idle_state()
+        self._set_view_status("error", "系统状态：视频分析失败")
+        self._show_status_notice(f"视频分析失败：{message}", "error")
 
     def handle_seek(self, position_ms: int) -> None:
         if self._selected_video_path is None:
@@ -3198,6 +3323,11 @@ class MainController:
         self._start_probe(self._selected_video_path, position_ms)
 
     def handle_force_stop(self) -> None:
+        if self._pending_video_start_ms is not None:
+            self._cancel_pending_video_start("[Court] 已取消等待球场标定，视频未开始播放。")
+            self.view.video_player.stop()
+            return
+
         if self._camera_worker is not None and self._camera_worker.isRunning():
             self._auto_report_after_stop = True
             self.view.append_log("[信息] 正在停止摄像头实时推理...")
@@ -3217,7 +3347,7 @@ class MainController:
             return
 
         self.view.video_player.stop()
-        self.view.set_status_state("stopped")
+        self._set_view_status("stopped", "系统状态：当前没有进行中的分析任务")
         self.view.append_log("[信息] 没有正在进行的播放任务。")
 
     def handle_reset(self) -> None:
@@ -3236,7 +3366,10 @@ class MainController:
         self.view.set_batch_rally_options([])
         self.view.set_batch_export_enabled(False)
         self._set_current_rally_record(None)
-        self.view.log_console.clear()
+        if hasattr(self.view, "clear_logs"):
+            self.view.clear_logs()
+        else:
+            self.view.log_console.clear()
         self._reset_metrics()
         self._set_idle_state()
         self.view.append_log("[系统] 工作区已重置。")
@@ -3244,6 +3377,7 @@ class MainController:
     def _stop_workers(self, *, clear_pending_seek: bool) -> None:
         if clear_pending_seek:
             self._pending_seek_ms = None
+            self._pending_video_start_ms = None
             self._auto_report_after_stop = False
 
         if self._probe_worker is not None and self._probe_worker.isRunning():
@@ -3538,6 +3672,10 @@ class MainController:
         def _apply() -> None:
             apply_theme(app, theme_dir)
             self._active_theme_name = theme_dir.name
+            self._settings.setValue("ui_theme", theme_dir.name)
+            self._settings.sync()
+            if hasattr(self.view, "set_active_theme"):
+                self.view.set_active_theme(theme_dir.name)
             self.view.append_log(f"[主题] 已切换至 {theme_dir.name}")
 
         QTimer.singleShot(

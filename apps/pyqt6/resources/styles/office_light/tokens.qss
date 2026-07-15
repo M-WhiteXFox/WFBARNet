@@ -1,13 +1,13 @@
 /*
  * ============================================================
- *  DESIGN TOKENS  —  Fluent Light
+ *  DESIGN TOKENS  —  Office Light
  *  所有颜色、字体、圆角均在此定义（注释形式，供各片段引用）
  * ============================================================
  *
  *  Brand / Accent
- *    --accent:          #0F6CBD
- *    --accent-hover:    #005A9E
- *    --accent-pressed:  #004A83
+ *    --accent:          #217346
+ *    --accent-hover:    #1B5E20
+ *    --accent-pressed:  #144A17
  *
  *  Surface
  *    --bg-app:          #F4F6F9

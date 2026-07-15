@@ -2,8 +2,37 @@
  *  FORM  —  QLineEdit / QComboBox / QProgressBar / QTextEdit
  * ============================================================ */
 
-/* --- 进度条 --- */
-QProgressBar#topProgress,
+/* --- 分析进度状态条 --- */
+QFrame#analysisProgressNotice {
+    background-color: #F4F9FD;
+    border: 1px solid #B6D6EF;
+    border-radius: 6px;
+}
+
+QLabel#analysisProgressDot {
+    background-color: #0F6CBD;
+    border: none;
+    border-radius: 4px;
+}
+
+QLabel#analysisProgressLabel {
+    color: #172033;
+    font-weight: 500;
+}
+
+QProgressBar#topProgress {
+    background-color: #D7E9F7;
+    border: none;
+    border-radius: 2px;
+    min-height: 4px;
+    max-height: 4px;
+}
+
+QProgressBar#topProgress::chunk {
+    background-color: #0F6CBD;
+    border-radius: 2px;
+}
+
 QProgressBar {
     background-color: #E2E8F0;
     border: none;
@@ -20,7 +49,8 @@ QProgressBar::chunk {
 
 /* --- 文本输入框 --- */
 QLineEdit#videoPathEdit,
-QLineEdit#modelPathEdit {
+QLineEdit#modelPathEdit,
+QLineEdit#logSearchEdit {
     background-color: #FFFFFF;
     border: 1px solid #CBD5E1;
     border-radius: 4px;
@@ -29,9 +59,12 @@ QLineEdit#modelPathEdit {
 }
 
 QLineEdit#videoPathEdit:focus,
-QLineEdit#modelPathEdit:focus { border-color: #0F6CBD; }
+QLineEdit#modelPathEdit:focus,
+QLineEdit#logSearchEdit:focus { border-color: #0F6CBD; }
 
-QComboBox#cameraDeviceCombo {
+QComboBox#cameraDeviceCombo,
+QComboBox#modelPathEdit,
+QComboBox#logFilterCombo {
     background-color: #FFFFFF;
     border: 1px solid #CBD5E1;
     border-radius: 4px;
@@ -39,7 +72,9 @@ QComboBox#cameraDeviceCombo {
     padding: 6px 10px;
 }
 
-QComboBox#cameraDeviceCombo:focus { border-color: #0F6CBD; }
+QComboBox#cameraDeviceCombo:focus,
+QComboBox#modelPathEdit:focus,
+QComboBox#logFilterCombo:focus { border-color: #0F6CBD; }
 
 /* --- 主题切换按钮 --- */
 QToolButton#styleBtn {

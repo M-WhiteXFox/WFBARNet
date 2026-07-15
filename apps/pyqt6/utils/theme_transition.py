@@ -262,7 +262,7 @@ def start_theme_ripple_transition(
     apply_change: Callable[[], None],
     *,
     origin_widget: QWidget | None = None,
-    duration_ms: int = 1400,
+    duration_ms: int = 220,
 ) -> None:
     if not root.isVisible() or root.width() <= 0 or root.height() <= 0:
         apply_change()

@@ -3,7 +3,7 @@
  * ============================================================ */
 
 QTabWidget#mainTabs::pane {
-    border: 1px solid #525252;
+    border: 1px solid #D2D0CE;
     border-radius: 2px;
     top: -1px;
     background-color: #FFFFFF;
@@ -20,7 +20,7 @@ QTabBar::tab {
     margin-right: 2px;
     border-top-left-radius: 2px;
     border-top-right-radius: 2px;
-    border: 1px solid #525252;
+    border: 1px solid #D2D0CE;
     border-bottom: none;
 }
 
@@ -34,4 +34,25 @@ QTabBar::tab:selected {
 QTabBar::tab:hover:!selected {
     background: #F8F8F8;
     color: #1F1F1F;
+}
+
+QTabWidget#secondaryTabs::pane {
+    border: none;
+    border-top: 1px solid #D9D9D9;
+    background-color: #FFFFFF;
+}
+
+QTabWidget#secondaryTabs QTabBar::tab {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0px;
+    padding: 7px 12px;
+    color: #605E5C;
+}
+
+QTabWidget#secondaryTabs QTabBar::tab:selected {
+    color: #217346;
+    border-bottom-color: #217346;
+    font-weight: 600;
 }

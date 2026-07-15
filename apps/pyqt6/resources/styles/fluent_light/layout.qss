@@ -54,3 +54,7 @@ QFrame#videoTimelineCard {
     border: none;
     padding: 0px;
 }
+
+QSplitter#bodySplitter::handle { background: transparent; margin: 0px 2px; }
+QSplitter#bodySplitter::handle:hover,
+QSplitter#bodySplitter::handle:pressed { background: #BFDBFE; }
