@@ -133,6 +133,19 @@ class CourtKeyNetDetectorTest(unittest.TestCase):
 
         self.assertEqual(resolved, expected.resolve())
 
+    def test_relative_weight_path_cannot_escape_project_root(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            project_root = temp_root / "project"
+            project_root.mkdir()
+            outside = temp_root / "outside.safetensors"
+            outside.touch()
+            with mock.patch.object(courtkeynet_detector_module, "PROJECT_ROOT", project_root):
+                with self.assertRaises(FileNotFoundError) as context:
+                    resolve_courtkeynet_weights("../outside.safetensors")
+
+        self.assertIn(str(outside.resolve()), str(context.exception))
+
     def test_malformed_model_output_returns_invalid_prediction(self) -> None:
         class MalformedCourtKeyNet(torch.nn.Module):
             def forward(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:

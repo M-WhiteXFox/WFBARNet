@@ -32,8 +32,17 @@ class CourtKeyNetConfig:
 
 def resolve_courtkeynet_weights(raw: str | Path) -> Path:
     path = Path(raw)
-    expected = path if path.is_absolute() else PROJECT_ROOT / path
-    expected = expected.resolve()
+    if path.is_absolute():
+        expected = path.resolve()
+    else:
+        project_root = PROJECT_ROOT.resolve()
+        expected = (project_root / path).resolve()
+        try:
+            expected.relative_to(project_root)
+        except ValueError as exc:
+            raise FileNotFoundError(
+                f"CourtKeyNet weights not found at expected path: {expected}"
+            ) from exc
     if expected.is_file():
         return expected
     raise FileNotFoundError(f"CourtKeyNet weights not found at expected path: {expected}")
