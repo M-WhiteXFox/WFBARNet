@@ -112,6 +112,20 @@ class _SequenceCourtKeyNet(_FakeCourtKeyNet):
 
 
 class CourtKeyNetDetectorTest(unittest.TestCase):
+    def test_config_rejects_non_finite_and_out_of_range_confidence_thresholds(self) -> None:
+        invalid_thresholds = [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            -0.01,
+            1.01,
+        ]
+
+        for threshold in invalid_thresholds:
+            with self.subTest(threshold=threshold):
+                with self.assertRaisesRegex(ValueError, "confidence_threshold"):
+                    CourtKeyNetConfig(confidence_threshold=threshold)
+
     def test_maps_normalized_corners_to_non_square_source_geometry(self) -> None:
         normalized = torch.tensor(
             [[[0.2, 0.25], [0.8, 0.25], [0.85, 0.9], [0.15, 0.9]]],
@@ -290,7 +304,7 @@ class CourtKeyNetDetectorTest(unittest.TestCase):
         self.assertEqual(first.status, "courtkeynet confirmation 1/3")
         self.assertEqual(after_reset.status, "courtkeynet confirmation 1/3")
 
-        detector.config.confidence_threshold = 1.1
+        detector.config.confidence_threshold = 1.0
         rejected = detector.predict(frame, 2, 80, force=True)
         detector.config.confidence_threshold = 0.5
         after_rejection = detector.predict(frame, 3, 120, force=True)
@@ -335,6 +349,31 @@ class CourtKeyNetDetectorTest(unittest.TestCase):
         self.assertEqual(first.status, "courtkeynet confirmation 1/3")
         self.assertEqual(malformed.status, "courtkeynet candidate rejected")
         self.assertEqual(after_malformed.status, "courtkeynet confirmation 1/3")
+
+    @unittest.skipUnless(
+        Path("assets/weights/courtkeynet/CourtKeyNet.safetensors").exists(),
+        "CourtKeyNet SafeTensors weight is not available",
+    )
+    def test_real_weight_strict_load_and_forward_smoke(self) -> None:
+        detector = CourtKeyNetLineDetector(
+            CourtKeyNetConfig(device="cpu", confirmation_frames=1)
+        )
+
+        prediction = detector.predict(
+            np.zeros((720, 1280, 3), dtype=np.uint8),
+            frame_id=0,
+            timestamp_ms=0,
+            force=True,
+        )
+
+        self.assertTrue(prediction.attempted)
+        self.assertEqual(len(prediction.corners), 4)
+        self.assertTrue(np.isfinite(np.asarray(prediction.corners)).all())
+        combined = prediction.metrics["components"].get(
+            "courtkeynet_combined_confidence"
+        )
+        self.assertIsNotNone(combined)
+        self.assertTrue(np.isfinite(float(combined)))
 
 
 if __name__ == "__main__":

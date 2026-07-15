@@ -58,13 +58,16 @@ def is_trusted_automatic_court_prediction(prediction: CourtLinePrediction) -> bo
     metrics = prediction.metrics if isinstance(prediction.metrics, dict) else {}
     components = metrics.get("components") if isinstance(metrics.get("components"), dict) else {}
     if prediction.scheme == "courtkeynet":
-        combined = components.get("courtkeynet_combined_confidence")
-        threshold = components.get("courtkeynet_confidence_threshold")
+        try:
+            combined = float(components["courtkeynet_combined_confidence"])
+            threshold = float(components["courtkeynet_confidence_threshold"])
+        except (KeyError, TypeError, ValueError):
+            return False
         return bool(
-            combined is not None
-            and threshold is not None
+            np.isfinite(combined)
+            and np.isfinite(threshold)
             and _metric_value(components.get("courtkeynet_confirmation_complete")) >= 1.0
-            and _metric_value(combined) >= _metric_value(threshold)
+            and combined >= threshold
         )
     min_singles_support = _metric_value(components.get("singles_min_support"))
     singles_support_ratio = _metric_value(components.get("singles_support_ratio"))

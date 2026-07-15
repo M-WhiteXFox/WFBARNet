@@ -29,6 +29,19 @@ class CourtKeyNetConfig:
     max_corner_shift_ratio: float = 0.035
     device: str = ""
 
+    def __post_init__(self) -> None:
+        try:
+            threshold = float(self.confidence_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "CourtKeyNet confidence_threshold must be finite and within [0, 1]."
+            ) from exc
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError(
+                "CourtKeyNet confidence_threshold must be finite and within [0, 1]."
+            )
+        self.confidence_threshold = threshold
+
 
 def resolve_courtkeynet_weights(raw: str | Path) -> Path:
     path = Path(raw)

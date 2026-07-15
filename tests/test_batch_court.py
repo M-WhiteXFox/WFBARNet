@@ -636,6 +636,41 @@ class BatchCourtPredictorTest(unittest.TestCase):
         self.assertFalse(is_trusted_automatic_court_prediction(unconfirmed))
         self.assertTrue(is_trusted_automatic_court_prediction(confirmed))
 
+    def test_courtkeynet_trust_rejects_non_finite_confidence_metrics(self) -> None:
+        plausible_corners = [
+            [30.0, 30.0],
+            [130.0, 30.0],
+            [145.0, 110.0],
+            [15.0, 110.0],
+        ]
+        components = {
+            "courtkeynet_combined_confidence": 0.82,
+            "courtkeynet_confidence_threshold": 0.50,
+            "courtkeynet_confirmation_complete": 1.0,
+        }
+
+        for metric_name in (
+            "courtkeynet_combined_confidence",
+            "courtkeynet_confidence_threshold",
+        ):
+            for value in (float("nan"), float("inf")):
+                with self.subTest(metric_name=metric_name, value=value):
+                    prediction = _prediction(
+                        valid=True,
+                        scheme="courtkeynet",
+                        metrics={
+                            "components": {
+                                **components,
+                                metric_name: value,
+                            }
+                        },
+                        corners=plausible_corners,
+                    )
+
+                    self.assertFalse(
+                        is_trusted_automatic_court_prediction(prediction)
+                    )
+
     def test_shared_trust_gate_requires_outer_lines_and_plausible_court_geometry(self) -> None:
         plausible_corners = [[30.0, 30.0], [130.0, 30.0], [145.0, 110.0], [15.0, 110.0]]
         strong_metrics = {
