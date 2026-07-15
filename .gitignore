@@ -126,3 +126,6 @@ assets/docs/
 !assets/readme/**
 
 AgentPlan.md
+
+# Isolated feature worktrees
+.worktrees/
