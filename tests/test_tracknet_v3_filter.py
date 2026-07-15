@@ -421,6 +421,85 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
         self.assertFalse(reappeared.visible)
         self.assertEqual(track_filter.last_debug_record()["reason"], "person_occlusion_candidate_high_score")
 
+    def test_runtime_filter_bridges_reliable_low_speed_single_gap(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=30.0, debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+        for point in [(500.0, 300.0), (501.0, 296.0), (502.0, 291.0)]:
+            track_filter.update_candidates(
+                [_track(*point, 0.85)],
+                dt=1.0 / 30.0,
+                frame_shape=frame_shape,
+            )
+
+        bridged = track_filter.update_candidates(
+            [_missing(0.10)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+        )
+
+        self.assertTrue(bridged.visible)
+        self.assertEqual(track_filter.last_debug_record()["action"], "coast")
+
+    def test_runtime_filter_masks_low_speed_downward_branch_outlier(self) -> None:
+        track_filter = BallTrackFilter(
+            BallTrackFilterConfig(fps=30.0, static_hotspot_enabled=False),
+            debug_enabled=True,
+        )
+        frame_shape = (720, 1280, 3)
+        for point in [(500.0, 300.0), (501.0, 298.0), (502.0, 297.0), (503.0, 296.0)]:
+            track_filter.update_candidates(
+                [_track(*point, 0.85)],
+                dt=1.0 / 30.0,
+                frame_shape=frame_shape,
+            )
+
+        guarded = track_filter.update_candidates(
+            [_track(510.0, 340.0, 0.92)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+        )
+
+        self.assertFalse(guarded.visible)
+        self.assertEqual(track_filter.last_debug_record()["reason"], "literature_prediction_outlier")
+
+        recovered = track_filter.update_candidates(
+            [_track(511.0, 339.0, 0.92), _track(504.0, 295.0, 0.45)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+        )
+
+        self.assertTrue(recovered.visible)
+        self.assertEqual(recovered.ball_xy, [504.0, 295.0])
+
+    def test_runtime_filter_resets_motion_model_after_occlusion_reversal(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=30.0, debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+        full_frame_person = [(0.0, 0.0, 1280.0, 720.0)]
+        for point in [(500.0, 300.0), (502.0, 320.0), (504.0, 342.0)]:
+            track_filter.update_candidates(
+                [_track(*point, 0.90)],
+                dt=1.0 / 30.0,
+                frame_shape=frame_shape,
+                person_bboxes=full_frame_person,
+            )
+        track_filter.update_candidates(
+            [_missing(0.10)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+            person_bboxes=full_frame_person,
+        )
+
+        reset = track_filter.update_candidates(
+            [_track(470.0, 250.0, 0.93)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+            person_bboxes=full_frame_person,
+        )
+
+        self.assertTrue(reset.visible)
+        self.assertEqual(reset.ball_xy, [470.0, 250.0])
+        self.assertEqual(track_filter.last_debug_record()["reason"], "literature_occlusion_model_reset")
+
     def test_runtime_filter_accepts_motion_consistent_ball_inside_person_bbox(self) -> None:
         track_filter = create_tracknet_v3_ball_track_filter(fps=30.0, debug_enabled=True)
         frame_shape = (720, 1280, 3)

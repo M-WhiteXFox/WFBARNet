@@ -157,6 +157,21 @@ class BallTrackFilterConfig:
     static_hotspot_edge_max_motion_px: float = 32.0
     bootstrap_static_max_x_span_px: float = 3.0
     bootstrap_static_max_y_std_px: float = 15.0
+    literature_short_gap_enabled: bool = True
+    literature_short_gap_frames: int = 1
+    literature_short_gap_min_real_points: int = 3
+    literature_short_gap_top_band_ratio: float = 0.06
+    literature_branch_guard_enabled: bool = True
+    literature_branch_guard_min_confidence: float = 0.80
+    literature_branch_guard_max_speed_px_per_sec: float = 260.0
+    literature_branch_guard_min_prediction_error_px: float = 32.0
+    literature_branch_guard_min_downward_jump_px: float = 28.0
+    literature_branch_recovery_frames: int = 3
+    literature_branch_recovery_distance_scale_px: float = 4.0
+    literature_occlusion_reset_enabled: bool = True
+    literature_occlusion_reset_confidence: float = 0.85
+    literature_occlusion_reset_max_prediction_error_px: float = 480.0
+    literature_occlusion_reset_min_angle_deg: float = 94.0
 
 
 @dataclass(slots=True)
@@ -249,6 +264,7 @@ class BallTrackFilter:
         self._static_hotspot_count = 0
         self._decision_action = "unknown"
         self._decision_reason = ""
+        self._literature_branch_recovery_remaining = 0
 
     @property
     def debug_records(self) -> list[dict[str, object]]:
@@ -286,6 +302,7 @@ class BallTrackFilter:
         self._static_hotspot_count = 0
         self._decision_action = "unknown"
         self._decision_reason = ""
+        self._literature_branch_recovery_remaining = 0
 
     def update(
         self,
@@ -361,6 +378,7 @@ class BallTrackFilter:
                 track,
                 step_dt,
                 allow_coast=not candidate_conflict,
+                allow_short_gap_bridge=not candidate_conflict,
                 frame_size=frame_size,
                 court_filter=court_filter,
                 occlusion_active=person_occlusion_active,
@@ -378,12 +396,29 @@ class BallTrackFilter:
         elif self._measurement_is_top_edge_hallucination(measurement, step_dt, frame_size):
             self._mark_decision("reject", "top_edge_hallucination")
             result = self._reject(track, step_dt, allow_coast=True, frame_size=frame_size, court_filter=court_filter)
+        elif self._literature_prediction_outlier(measurement, float(track.score), step_dt, frame_size):
+            self._literature_branch_recovery_remaining = max(
+                1,
+                int(self.config.literature_branch_recovery_frames),
+            )
+            self._mark_decision("reject", "literature_prediction_outlier", force=True)
+            result = self._reject(
+                track,
+                step_dt,
+                allow_coast=False,
+                frame_size=frame_size,
+                court_filter=court_filter,
+            )
         elif (
             person_occlusion_active
             and self._point_inside_person_bbox(measurement, normalized_person_bboxes)
         ):
             score = float(track.score)
-            if (
+            if self._literature_occlusion_model_reset(measurement, score, step_dt):
+                self._drop_lock()
+                self._mark_decision("relock_accept", "literature_occlusion_model_reset", force=True)
+                result = self._accept(track, measurement, step_dt, frame_size)
+            elif (
                 score >= self.config.person_occlusion_accept_confidence
                 and self._passes_gate(measurement, score, step_dt, frame_size)
             ):
@@ -396,18 +431,34 @@ class BallTrackFilter:
                 suppress_coast = (
                     score > self.config.person_occlusion_suppress_coast_candidate_score
                 )
+                prediction_recovery = (
+                    suppress_coast
+                    and self._literature_short_gap_can_bridge(step_dt, frame_size, court_filter)
+                    and self._last_point is not None
+                    and _distance(measurement, self._predict(step_dt))
+                    >= float(self.config.literature_branch_guard_min_prediction_error_px)
+                )
                 if suppress_coast:
-                    self._mark_decision("reject", "person_occlusion_candidate_high_score", force=True)
+                    self._mark_decision(
+                        "reject",
+                        "literature_prediction_bridge" if prediction_recovery else "person_occlusion_candidate_high_score",
+                        force=True,
+                    )
                 else:
                     self._mark_decision("reject", "person_occlusion_candidate")
                 result = self._reject(
                     track,
                     step_dt,
-                    allow_coast=not suppress_coast,
+                    allow_coast=prediction_recovery or not suppress_coast,
+                    allow_short_gap_bridge=prediction_recovery,
                     frame_size=frame_size,
                     court_filter=court_filter,
                     occlusion_active=True,
-                    coast_reason="person_occlusion_prediction",
+                    coast_reason=(
+                        "literature_prediction_bridge"
+                        if prediction_recovery
+                        else "person_occlusion_prediction"
+                    ),
                 )
         elif self._passes_gate(measurement, float(track.score), step_dt, frame_size):
             predicted = self._predict(step_dt)
@@ -493,6 +544,7 @@ class BallTrackFilter:
             candidate_frame_index,
             target_time_seconds,
         )
+        recovery_before_update = self._literature_branch_recovery_remaining
         track = self._select_candidate(
             tracks,
             step_dt,
@@ -501,13 +553,19 @@ class BallTrackFilter:
             normalized_person_bboxes,
             target_time_seconds,
         )
-        return self.update(
+        result = self.update(
             track,
             dt=step_dt,
             frame_shape=frame_shape,
             court_prediction=court_prediction,
             person_bboxes=normalized_person_bboxes,
         )
+        if recovery_before_update > 0:
+            self._literature_branch_recovery_remaining = max(
+                0,
+                self._literature_branch_recovery_remaining - 1,
+            )
+        return result
 
     def _select_candidate(
         self,
@@ -625,7 +683,20 @@ class BallTrackFilter:
             if person_occlusion_active and self._point_inside_person_bbox(measurement, person_bboxes)
             else 0.0
         )
-        return gate_bonus + score * 12.0 - distance_penalty - heatmap_rank_penalty - occlusion_penalty
+        recovery_penalty = 0.0
+        if self._literature_branch_recovery_remaining > 0:
+            recovery_penalty = distance_to_prediction / max(
+                1.0,
+                float(self.config.literature_branch_recovery_distance_scale_px),
+            )
+        return (
+            gate_bonus
+            + score * 12.0
+            - distance_penalty
+            - recovery_penalty
+            - heatmap_rank_penalty
+            - occlusion_penalty
+        )
 
     def _resolve_frame_size(self, frame_shape: tuple[int, ...] | list[int] | None) -> FrameSize | None:
         if frame_shape is None:
@@ -1046,6 +1117,7 @@ class BallTrackFilter:
         dt: float,
         *,
         allow_coast: bool,
+        allow_short_gap_bridge: bool = False,
         frame_size: FrameSize | None,
         court_filter: _CourtFilter | None,
         occlusion_active: bool = False,
@@ -1056,7 +1128,13 @@ class BallTrackFilter:
             self._mark_decision("top_exit_enter", "likely_top_exit", force=True)
             return self._invisible(track)
 
-        if allow_coast and self._can_coast(dt, frame_size, court_filter, occlusion_active=occlusion_active):
+        if allow_coast and (
+            self._can_coast(dt, frame_size, court_filter, occlusion_active=occlusion_active)
+            or (
+                allow_short_gap_bridge
+                and self._literature_short_gap_can_bridge(dt, frame_size, court_filter)
+            )
+        ):
             return self._coast(track, dt, frame_size, court_filter, reason=coast_reason)
 
         self._missed_frames += 1
@@ -1066,6 +1144,109 @@ class BallTrackFilter:
         else:
             self._mark_decision("reject", "hidden_after_reject")
         return self._invisible(track)
+
+    def _literature_short_gap_can_bridge(
+        self,
+        dt: float,
+        frame_size: FrameSize | None,
+        court_filter: _CourtFilter | None,
+    ) -> bool:
+        if not self.config.literature_short_gap_enabled:
+            return False
+        if not self._locked or self._last_point is None:
+            return False
+        if self._missed_frames >= max(0, int(self.config.literature_short_gap_frames)):
+            return False
+        min_points = max(2, int(self.config.literature_short_gap_min_real_points))
+        if self._real_detections_since_relock < min_points or len(self._history) < min_points:
+            return False
+        recent = list(self._history)[-min_points:]
+        if recent[-1].frame_index != self._frame_index - 1:
+            return False
+        if any(
+            recent[index].frame_index != recent[index - 1].frame_index + 1
+            for index in range(1, len(recent))
+        ):
+            return False
+        prediction = self._predict(dt)
+        if frame_size is not None:
+            _, height = frame_size
+            top_band = height * max(0.0, float(self.config.literature_short_gap_top_band_ratio))
+            if self._last_point[1] <= top_band or prediction[1] <= top_band:
+                return False
+        if self._top_exit_is_likely(dt, frame_size):
+            return False
+        return self._point_can_be_predicted(prediction, frame_size, court_filter)
+
+    def _literature_prediction_outlier(
+        self,
+        measurement: Point,
+        score: float,
+        dt: float,
+        frame_size: FrameSize | None,
+    ) -> bool:
+        if not self.config.literature_branch_guard_enabled:
+            return False
+        if not self._locked or self._last_point is None:
+            return False
+        if self._missed_frames or self._coast_frames:
+            return False
+        min_points = max(3, int(self.config.literature_short_gap_min_real_points))
+        if len(self._history) < min_points:
+            return False
+        recent = list(self._history)[-min_points:]
+        if recent[-1].frame_index != self._frame_index - 1:
+            return False
+        if recent[-1].frame_index - recent[0].frame_index > min_points:
+            return False
+        if score < float(self.config.literature_branch_guard_min_confidence):
+            return False
+        speed = _length(self._velocity)
+        if speed > max(0.0, float(self.config.literature_branch_guard_max_speed_px_per_sec)):
+            return False
+        displacement_y = measurement[1] - self._last_point[1]
+        if displacement_y < max(0.0, float(self.config.literature_branch_guard_min_downward_jump_px)):
+            return False
+        prediction = self._predict(dt)
+        if _distance(measurement, prediction) < max(
+            0.0,
+            float(self.config.literature_branch_guard_min_prediction_error_px),
+        ):
+            return False
+        if self._point_is_out_of_frame_prediction(prediction, frame_size):
+            return False
+        return True
+
+    def _literature_occlusion_model_reset(
+        self,
+        measurement: Point,
+        score: float,
+        dt: float,
+    ) -> bool:
+        if not self.config.literature_occlusion_reset_enabled:
+            return False
+        if self._last_point is None or self._missed_frames < 1:
+            return False
+        if score < float(self.config.literature_occlusion_reset_confidence):
+            return False
+        speed = _length(self._velocity)
+        if speed < max(1.0, float(self.config.inertia_min_speed_px_per_sec)):
+            return False
+        displacement = (
+            measurement[0] - self._last_point[0],
+            measurement[1] - self._last_point[1],
+        )
+        displacement_length = _length(displacement)
+        if displacement_length <= 1e-6:
+            return False
+        prediction = self._predict(dt)
+        if _distance(measurement, prediction) > float(
+            self.config.literature_occlusion_reset_max_prediction_error_px
+        ):
+            return False
+        direction_cos = _dot(displacement, self._velocity) / max(displacement_length * speed, 1e-6)
+        angle_threshold = cos(radians(float(self.config.literature_occlusion_reset_min_angle_deg)))
+        return direction_cos <= angle_threshold
 
     def _can_coast(
         self,
@@ -1578,6 +1759,7 @@ class BallTrackFilter:
         self._real_detections_since_relock = 0
         self._history.clear()
         self._top_exit_frames_remaining = 0
+        self._literature_branch_recovery_remaining = 0
 
     def _start_decision(self) -> None:
         self._decision_action = "unknown"
