@@ -91,6 +91,8 @@ class CourtLineDetection:
 class TrackingState:
     current: CourtLineDetection | None = None
     last_candidate: CourtLineDetection | None = None
+    startup_candidate: CourtLineDetection | None = None
+    startup_candidate_count: int = 0
     last_attempt_frame: int = -1
     last_attempt_time: float = 0.0
     last_update_type: str = "none"
@@ -1023,6 +1025,68 @@ def projected_template_support(projected_lines: dict[str, np.ndarray], mask: np.
     return float(np.mean(supports)), supported_lines
 
 
+def projected_singles_support_components(
+    projected_lines: dict[str, np.ndarray],
+    mask: np.ndarray,
+    aggregate_support: float,
+) -> dict[str, float]:
+    dilated = cv2.dilate(
+        mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    left_support = projected_line_mask_support(
+        dilated,
+        np.asarray(projected_lines.get("singles_left_sideline", []), dtype=np.float32),
+    )
+    right_support = projected_line_mask_support(
+        dilated,
+        np.asarray(projected_lines.get("singles_right_sideline", []), dtype=np.float32),
+    )
+    min_support = min(left_support, right_support)
+    return {
+        "singles_left_support": float(left_support),
+        "singles_right_support": float(right_support),
+        "singles_min_support": float(min_support),
+        "singles_support_ratio": float(min_support / max(float(aggregate_support), 1.0e-6)),
+    }
+
+
+def projected_outer_support_components(
+    projected_lines: dict[str, np.ndarray],
+    mask: np.ndarray,
+    *,
+    sample_step: float = 8.0,
+    radius: int = 3,
+) -> dict[str, float]:
+    """Measure white-line support independently on all four doubles-court edges."""
+    edge_names = ("top", "right", "bottom", "left")
+    supports = {f"outer_{name}_support": 0.0 for name in edge_names}
+    raw_outer = np.asarray(projected_lines.get("doubles_outer", []), dtype=np.float32)
+    if raw_outer.size != 8:
+        supports.update({"outer_min_support": 0.0, "outer_mean_support": 0.0})
+        return supports
+    outer = raw_outer.reshape(4, 2)
+    if not np.isfinite(outer).all() or mask.size == 0:
+        supports.update({"outer_min_support": 0.0, "outer_mean_support": 0.0})
+        return supports
+
+    edge_values: list[float] = []
+    for index, name in enumerate(edge_names):
+        edge = np.asarray([outer[index], outer[(index + 1) % 4]], dtype=np.float32)
+        value = projected_line_mask_support(
+            mask,
+            edge,
+            sample_step=sample_step,
+            radius=radius,
+        )
+        supports[f"outer_{name}_support"] = float(value)
+        edge_values.append(float(value))
+    supports["outer_min_support"] = float(np.min(edge_values))
+    supports["outer_mean_support"] = float(np.mean(edge_values))
+    return supports
+
+
 def sample_mask(mask: np.ndarray, point: np.ndarray) -> float:
     height, width = mask.shape[:2]
     x = int(round(float(point[0])))
@@ -1345,6 +1409,14 @@ def build_detection_from_corners(
         debug_merged_lines=merged_lines,
     )
     confidence, components, reason = score_court_detection(detection, previous, mask.shape[:2], args)
+    components.update(
+        projected_singles_support_components(
+            projected_lines,
+            mask,
+            mask_support,
+        )
+    )
+    components.update(projected_outer_support_components(projected_lines, mask))
     detection.confidence = confidence
     detection.components = components
     detection.reason = reason
@@ -1656,34 +1728,116 @@ def update_tracking_state(
     state.last_attempt_time = timestamp
     state.last_candidate = candidate
     if candidate is None:
+        state.startup_candidate = None
+        state.startup_candidate_count = 0
         state.last_update_type = "no candidate"
         state.rejected_count += 1
         return
 
+    if (
+        state.current is not None
+        and state.current.scheme == "court_pose_white_line"
+        and candidate.scheme == "court_pose_coarse"
+    ):
+        state.startup_candidate = None
+        state.startup_candidate_count = 0
+        state.last_update_type = "quality downgrade rejected"
+        state.rejected_count += 1
+        return
+
     if candidate.confidence >= float(args.reliable_conf):
-        alpha = float(args.smooth_alpha_reliable)
+        state.startup_candidate = None
+        state.startup_candidate_count = 0
+        quality_upgrade = bool(
+            state.current is not None
+            and state.current.scheme == "court_pose_coarse"
+            and candidate.scheme == "court_pose_white_line"
+        )
+        alpha = 1.0 if quality_upgrade else float(args.smooth_alpha_reliable)
         state.current = blend_detections(state.current, candidate, alpha, frame_id, timestamp, "reliable")
         state.last_update_type = "reliable update"
         state.rejected_count = 0
     elif candidate.confidence >= float(args.medium_conf):
         alpha = float(args.smooth_alpha_medium)
         if state.current is None:
+            confirm_frames = max(0, int(getattr(args, "coarse_startup_confirm_frames", 0)))
+            if candidate.scheme == "court_pose_coarse" and confirm_frames > 1:
+                max_shift_ratio = max(
+                    0.0,
+                    float(getattr(args, "coarse_startup_max_corner_shift_ratio", 0.03)),
+                )
+                if state.startup_candidate is None or not _detections_geometry_consistent(
+                    state.startup_candidate,
+                    candidate,
+                    max_shift_ratio,
+                ):
+                    state.startup_candidate = candidate
+                    state.startup_candidate_count = 1
+                else:
+                    state.startup_candidate_count += 1
+                if state.startup_candidate_count >= confirm_frames:
+                    state.current = blend_detections(
+                        None,
+                        candidate,
+                        1.0,
+                        frame_id,
+                        timestamp,
+                        "medium startup",
+                    )
+                    state.startup_candidate = None
+                    state.startup_candidate_count = 0
+                    state.last_update_type = "medium startup"
+                    state.rejected_count = 0
+                    return
+                state.last_update_type = f"coarse confirmation {state.startup_candidate_count}/{confirm_frames}"
+                return
+            state.startup_candidate = None
+            state.startup_candidate_count = 0
             state.last_update_type = "rejected"
             state.rejected_count += 1
             return
         else:
+            state.startup_candidate = None
+            state.startup_candidate_count = 0
             state.current = blend_detections(state.current, candidate, alpha, frame_id, timestamp, "medium smooth")
             state.last_update_type = "medium smooth"
         state.rejected_count = 0
     else:
+        state.startup_candidate = None
+        state.startup_candidate_count = 0
         state.last_update_type = "rejected"
         state.rejected_count += 1
+
+
+def _detections_geometry_consistent(
+    reference: CourtLineDetection,
+    candidate: CourtLineDetection,
+    max_corner_shift_ratio: float,
+) -> bool:
+    reference_corners = np.asarray(reference.corners, dtype=np.float32).reshape(-1, 2)
+    candidate_corners = np.asarray(candidate.corners, dtype=np.float32).reshape(-1, 2)
+    if reference_corners.shape != (4, 2) or candidate_corners.shape != (4, 2):
+        return False
+    if not np.isfinite(reference_corners).all() or not np.isfinite(candidate_corners).all():
+        return False
+    reference_scale = max(
+        float(np.linalg.norm(reference_corners[2] - reference_corners[0])),
+        float(np.linalg.norm(reference_corners[3] - reference_corners[1])),
+        1.0,
+    )
+    max_shift = float(np.max(np.linalg.norm(candidate_corners - reference_corners, axis=1)))
+    return (max_shift / reference_scale) <= max_corner_shift_ratio
 
 
 def should_redetect(state: TrackingState, frame_id: int, timestamp: float, args: argparse.Namespace) -> bool:
     if frame_id == 0 or state.current is None:
         return True
     interval = max(0.1, float(args.redetect_interval))
+    if state.current.scheme == "court_pose_coarse":
+        interval = min(
+            interval,
+            max(0.1, float(getattr(args, "coarse_redetect_interval", interval))),
+        )
     return (timestamp - state.last_attempt_time) >= interval
 
 

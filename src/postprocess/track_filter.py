@@ -56,14 +56,14 @@ class TrackFilterAlgorithm(Protocol):
 class BallTrackFilterConfig:
     fps: float = 25.0
     min_confidence: float = 0.35
-    soft_min_confidence: float = 0.25
+    soft_min_confidence: float = 0.32
     relock_confidence: float = 0.50
     strong_relock_confidence: float = 0.72
     bootstrap_confirm_min_confidence: float = 0.55
-    impact_relock_confidence: float = 0.48
-    impact_relock_confirm_frames: int = 2
+    impact_relock_confidence: float = 0.60
+    impact_relock_confirm_frames: int = 1
     impact_relock_min_missed_frames: int = 1
-    impact_relock_min_angle_deg: float = 100.0
+    impact_relock_min_angle_deg: float = 94.0
     impact_relock_max_prediction_error_px: float = 260.0
     impact_relock_max_prediction_error_per_missed_px: float = 28.0
     close_gate_confidence: float = 0.50
@@ -94,7 +94,7 @@ class BallTrackFilterConfig:
     person_occlusion_padding_px: float = 18.0
     person_occlusion_coast_frames: int = 7
     person_occlusion_min_speed_px_per_sec: float = 250.0
-    person_occlusion_candidate_penalty: float = 140.0
+    person_occlusion_candidate_penalty: float = 96.0
     person_occlusion_suppress_coast_candidate_score: float = 0.35
     person_occlusion_accept_confidence: float = 0.50
     frame_measurement_margin_px: float = 6.0
@@ -106,7 +106,7 @@ class BallTrackFilterConfig:
     parabola_max_gap_frames: int = 8
     parabola_min_motion_px: float = 42.0
     parabola_max_fit_rmse_px: float = 48.0
-    parabola_gate_px: float = 62.0
+    parabola_gate_px: float = 90.0
     parabola_max_gate_px: float = 160.0
     parabola_gate_growth_px: float = 24.0
     parabola_fit_error_scale: float = 1.8
@@ -148,11 +148,11 @@ class BallTrackFilterConfig:
     ground_bounce_guard_suppression_seconds: float = 0.75
     static_hotspot_enabled: bool = True
     static_hotspot_radius_px: float = 18.0
-    static_hotspot_min_frames: int = 4
+    static_hotspot_min_frames: int = 5
     static_hotspot_max_motion_px: float = 12.0
     static_hotspot_memory_frames: int = 90
     static_hotspot_suppression_frames: int = 45
-    static_hotspot_tracking_speed_px_per_sec: float = 900.0
+    static_hotspot_tracking_speed_px_per_sec: float = 50.0
     static_hotspot_edge_band_ratio: float = 0.07
     static_hotspot_edge_max_motion_px: float = 32.0
     bootstrap_static_max_x_span_px: float = 3.0

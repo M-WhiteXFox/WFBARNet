@@ -45,6 +45,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--person-confidence", type=float)
     parser.add_argument("--court-lateral-ratio", type=float)
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Temporarily override a BallTrackFilterConfig field; may be repeated.",
+    )
     return parser.parse_args()
 
 
@@ -160,6 +167,71 @@ def _csv_value(value: Any) -> Any:
     return value
 
 
+def _segment_summary(
+    rows: Iterable[dict[str, Any]],
+    predicate: Any,
+) -> dict[str, Any]:
+    segments: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    for row in rows:
+        if predicate(row):
+            if current and row["frame_id"] != current[-1]["frame_id"] + 1:
+                segments.append(
+                    {
+                        "start": current[0]["frame_id"],
+                        "end": current[-1]["frame_id"],
+                        "length": len(current),
+                    }
+                )
+                current = []
+            current.append(row)
+        elif current:
+            segments.append(
+                {
+                    "start": current[0]["frame_id"],
+                    "end": current[-1]["frame_id"],
+                    "length": len(current),
+                }
+            )
+            current = []
+    if current:
+        segments.append(
+            {
+                "start": current[0]["frame_id"],
+                "end": current[-1]["frame_id"],
+                "length": len(current),
+            }
+        )
+    return {
+        "frame_count": sum(int(segment["length"]) for segment in segments),
+        "longest_run": max((int(segment["length"]) for segment in segments), default=0),
+        "segments": segments,
+    }
+
+
+def _apply_config_overrides(config: BallTrackFilterConfig, values: list[str]) -> None:
+    for value in values:
+        try:
+            name, raw_value = value.split("=", maxsplit=1)
+        except ValueError as exc:
+            raise ValueError(f"Invalid --set value: {value!r}") from exc
+        if not hasattr(config, name):
+            raise ValueError(f"Unknown BallTrackFilterConfig field: {name}")
+        current = getattr(config, name)
+        if isinstance(current, bool):
+            normalized = raw_value.strip().lower()
+            if normalized not in {"true", "false", "1", "0"}:
+                raise ValueError(f"Invalid boolean value for {name}: {raw_value!r}")
+            parsed: Any = normalized in {"true", "1"}
+        elif isinstance(current, int):
+            parsed = int(raw_value)
+        elif isinstance(current, float):
+            parsed = float(raw_value)
+        else:
+            raise ValueError(f"Unsupported config field type for {name}: {type(current).__name__}")
+        setattr(config, name, parsed)
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
@@ -188,6 +260,7 @@ def _evaluate_dataset(
     active_range: tuple[int, int] | None,
     person_confidence: float | None,
     court_lateral_ratio: float | None,
+    config_overrides: list[str],
 ) -> dict[str, Any]:
     metadata = cache_meta["datasets"][name]
     fps = float(metadata["fps"])
@@ -207,6 +280,7 @@ def _evaluate_dataset(
         config.person_occlusion_accept_confidence = float(person_confidence)
     if court_lateral_ratio is not None:
         config.court_air_lateral_expansion_ratio = float(court_lateral_ratio)
+    _apply_config_overrides(config, config_overrides)
     track_filter = BallTrackFilter(config, debug_enabled=True)
 
     analysis_rows: list[dict[str, Any]] = []
@@ -367,6 +441,46 @@ def _evaluate_dataset(
             "p90": _percentile(overlap_errors, 0.90),
             "max": max(overlap_errors) if overlap_errors else None,
         },
+        "active_missing_output": _segment_summary(
+            active_rows,
+            lambda row: row["gt_visible"] and row["output_point"] is None,
+        ),
+        "active_drift_output": _segment_summary(
+            active_rows,
+            lambda row: (
+                row["gt_visible"]
+                and row["output_point"] is not None
+                and _distance(row["output_point"], row["gt_point"]) > threshold
+            ),
+        ),
+        "active_severe_drift_output": _segment_summary(
+            active_rows,
+            lambda row: (
+                row["gt_visible"]
+                and row["output_point"] is not None
+                and _distance(row["output_point"], row["gt_point"]) > 50.0
+            ),
+        ),
+        "active_failure_output": _segment_summary(
+            active_rows,
+            lambda row: (
+                row["gt_visible"]
+                and (
+                    row["output_point"] is None
+                    or _distance(row["output_point"], row["gt_point"]) > threshold
+                )
+            ),
+        ),
+        "compact_ground_bounce_frames": [
+            row["frame_id"]
+            for row in analysis_rows
+            if row["reason"] == "compact_ground_bounce"
+        ],
+        "post_landing_visible_0p5s": sum(
+            row["output_point"] is not None
+            for row in analysis_rows
+            if active_end < row["frame_id"] <= active_end + int(math.ceil(fps * 0.5))
+        ),
         "person_occlusion_rejects_active": len(person_reject_rows),
         f"person_occlusion_rejects_correct_input_{threshold_label}": sum(
             row["input_point"] is not None
@@ -414,6 +528,7 @@ def main() -> None:
             active_range=active_ranges.get(name),
             person_confidence=args.person_confidence,
             court_lateral_ratio=args.court_lateral_ratio,
+            config_overrides=list(args.set),
         )
         for name in args.datasets
     }

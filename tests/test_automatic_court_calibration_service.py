@@ -12,11 +12,12 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from apps.pyqt6.services.automatic_court_calibration_service import AutomaticCourtCalibrationService
 from apps.pyqt6.services.manual_court_calibration_service import manual_court_prediction_from_corners
+from src.court.batch_court import BatchCourtPredictor
 
 
 def _prediction(*, scheme: str, frame_id: int = 1):
     prediction = manual_court_prediction_from_corners(
-        [[100.0, 40.0], [420.0, 48.0], [470.0, 320.0], [70.0, 310.0]],
+        [[100.0, 80.0], [420.0, 88.0], [470.0, 320.0], [70.0, 310.0]],
         source_size=(520, 360),
         frame_id=frame_id,
         timestamp_ms=40,
@@ -25,6 +26,25 @@ def _prediction(*, scheme: str, frame_id: int = 1):
     prediction.update_type = scheme
     prediction.status = scheme
     prediction.confidence = 0.92
+    if scheme == "court_pose_white_line":
+        prediction.metrics = {"components": {"pose_white_line_refined": 1.0}}
+    elif scheme == "shuttlecourt_seg":
+        prediction.metrics = {
+            "components": {
+                "seg_line_fit": 1.0,
+                "singles_min_support": 0.80,
+                "singles_support_ratio": 1.0,
+                "outer_min_support": 0.80,
+            }
+        }
+    elif scheme == "monotrack":
+        prediction.metrics = {
+            "components": {
+                "singles_min_support": 0.50,
+                "singles_support_ratio": 0.75,
+                "outer_min_support": 0.60,
+            }
+        }
     return prediction
 
 
@@ -114,6 +134,119 @@ class AutomaticCourtCalibrationServiceTest(unittest.TestCase):
         self.assertEqual(automatic.reset_count, 1)
         self.assertEqual(automatic.request_count, 1)
         self.assertEqual(service.latest_prediction_dict()["scheme"], "court_pose_white_line")
+
+    def test_existing_automatic_prediction_can_be_refreshed(self) -> None:
+        automatic = _FakeAutomaticService()
+        service = AutomaticCourtCalibrationService(automatic_service=automatic)
+        automatic.emit_prediction(_prediction(scheme="court_pose_white_line", frame_id=1))
+
+        service.request_prediction()
+        submitted = service.submit_frame(np.zeros((32, 48, 3), dtype=np.uint8), 2, 80)
+        automatic.emit_prediction(_prediction(scheme="shuttlecourt_seg", frame_id=2))
+
+        self.assertEqual(automatic.request_count, 1)
+        self.assertTrue(submitted)
+        self.assertEqual(service.latest_prediction().frame_id, 2)
+        self.assertEqual(service.latest_prediction().scheme, "shuttlecourt_seg")
+
+    def test_reset_clears_cached_automatic_and_provisional_results(self) -> None:
+        automatic = _FakeAutomaticService()
+        service = AutomaticCourtCalibrationService(automatic_service=automatic)
+        automatic.emit_prediction(_prediction(scheme="court_pose_white_line", frame_id=1))
+
+        service.reset()
+
+        self.assertIsNone(service.latest_prediction())
+        self.assertIsNone(service.latest_display_prediction_dict())
+        self.assertEqual(automatic.reset_count, 1)
+
+    def test_invalid_refresh_keeps_last_valid_automatic_prediction(self) -> None:
+        automatic = _FakeAutomaticService()
+        service = AutomaticCourtCalibrationService(automatic_service=automatic)
+        valid = _prediction(scheme="court_pose_white_line", frame_id=1)
+        automatic.emit_prediction(valid)
+        invalid = _prediction(scheme="court_pose_white_line", frame_id=2)
+        invalid.valid = False
+
+        automatic.emit_prediction(invalid)
+
+        self.assertIs(service.latest_prediction(), valid)
+
+    def test_coarse_prediction_remains_provisional_for_automatic_overlay(self) -> None:
+        automatic = _FakeAutomaticService()
+        service = AutomaticCourtCalibrationService(automatic_service=automatic)
+        emitted: list[object] = []
+        service.resultReady.connect(emitted.append)
+
+        automatic.emit_prediction(_prediction(scheme="court_pose_coarse", frame_id=1))
+
+        self.assertIsNone(service.latest_prediction())
+        display = service.latest_display_prediction_dict()
+        self.assertIsNotNone(display)
+        self.assertTrue(display["provisional"])
+        self.assertEqual(len(display["corners"]), 4)
+        self.assertIn("doubles_outer", display["projected_lines"])
+        self.assertEqual(len(emitted), 1)
+        self.assertFalse(emitted[0]["valid"])
+        self.assertTrue(emitted[0]["provisional"])
+        self.assertEqual(emitted[0]["status"], "provisional automatic court; waiting for verified white-line evidence")
+
+    def test_low_evidence_monotrack_does_not_replace_verified_prediction(self) -> None:
+        automatic = _FakeAutomaticService()
+        service = AutomaticCourtCalibrationService(automatic_service=automatic)
+        verified = _prediction(scheme="court_pose_white_line", frame_id=1)
+        automatic.emit_prediction(verified)
+        weak = _prediction(scheme="monotrack", frame_id=2)
+        weak.metrics = {
+            "components": {
+                "singles_min_support": 0.10,
+                "singles_support_ratio": 0.20,
+            }
+        }
+
+        automatic.emit_prediction(weak)
+
+        self.assertIs(service.latest_prediction(), verified)
+
+    def test_manual_prediction_blocks_automatic_refresh(self) -> None:
+        automatic = _FakeAutomaticService()
+        service = AutomaticCourtCalibrationService(automatic_service=automatic)
+        service.set_calibration(
+            [[100.0, 40.0], [420.0, 48.0], [470.0, 320.0], [70.0, 310.0]],
+            source_size=(520, 360),
+        )
+
+        service.request_prediction()
+        submitted = service.submit_frame(np.zeros((32, 48, 3), dtype=np.uint8), 2, 80)
+
+        self.assertEqual(automatic.request_count, 0)
+        self.assertFalse(submitted)
+
+    def test_default_automatic_detector_uses_full_backend_fallback_order(self) -> None:
+        service = AutomaticCourtCalibrationService()
+
+        detector = service._automatic._detector_factory()
+
+        self.assertIsInstance(detector, BatchCourtPredictor)
+        self.assertEqual(
+            detector.backends,
+            ("court_pose", "shuttlecourt_seg", "monotrack", "opencv"),
+        )
+        self.assertEqual(detector.fallback_confirm_frames, 3)
+        self.assertTrue(detector.reset_unaccepted_detector_state)
+        self.assertTrue(detector.lock_confirmed_fallback_geometry)
+
+    def test_verified_prediction_replaces_provisional_display_candidate(self) -> None:
+        automatic = _FakeAutomaticService()
+        service = AutomaticCourtCalibrationService(automatic_service=automatic)
+
+        automatic.emit_prediction(_prediction(scheme="court_pose_coarse", frame_id=1))
+        provisional = service.latest_display_prediction_dict()
+        automatic.emit_prediction(_prediction(scheme="court_pose_white_line", frame_id=2))
+
+        self.assertTrue(provisional["provisional"])
+        self.assertEqual(service.latest_prediction().frame_id, 2)
+        self.assertFalse(service.latest_display_prediction_dict().get("provisional", False))
 
 
 if __name__ == "__main__":

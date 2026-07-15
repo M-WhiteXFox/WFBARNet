@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from src.postprocess.track_filter import BallTrackFilter
+from src.postprocess.track_filter import BallTrackFilter, BallTrackFilterConfig
 from src.postprocess.trajectory_events import RealtimeTrajectoryEventDetector, TrajectoryEventDetectorConfig
 from src.postprocess.tracknet_v3_filter import (
     TrackNetV3TrajectoryFilter,
@@ -470,10 +470,13 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
         )
 
         self.assertFalse(low_score_impact.visible)
-        self.assertEqual(track_filter.last_debug_record()["reason"], "candidate_failed_motion_gate")
+        self.assertEqual(track_filter.last_debug_record()["reason"], "missing_or_low_confidence")
 
     def test_runtime_filter_prefers_candidate_continuing_pending_impact_relock(self) -> None:
-        track_filter = create_tracknet_v3_ball_track_filter(fps=30.0, debug_enabled=True)
+        track_filter = BallTrackFilter(
+            BallTrackFilterConfig(fps=30.0, impact_relock_confirm_frames=2),
+            debug_enabled=True,
+        )
         frame_shape = (720, 1280, 3)
         for x, y in [(100.0, 300.0), (100.0, 350.0), (100.0, 400.0)]:
             track_filter.update_candidates(
@@ -502,6 +505,77 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
         self.assertEqual(track_filter.last_debug_record()["selected_candidate_index"], 0)
         self.assertEqual(track_filter.last_debug_record()["reason"], "high_score_fast_relock")
 
+    def test_runtime_filter_default_impact_relock_accepts_first_strong_reversal(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=30.0, debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+        for x, y in [(100.0, 300.0), (100.0, 350.0), (100.0, 400.0)]:
+            track_filter.update_candidates(
+                [_track(x, y, 0.90)],
+                dt=1.0 / 30.0,
+                frame_shape=frame_shape,
+            )
+        track_filter.update_candidates(
+            [_missing()],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+        )
+
+        accepted = track_filter.update_candidates(
+            [_track(80.0, 280.0, 0.62)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+        )
+
+        self.assertTrue(accepted.visible)
+        self.assertEqual(accepted.ball_xy, [80.0, 280.0])
+        self.assertEqual(track_filter.last_debug_record()["reason"], "impact_direction_change")
+
+    def test_runtime_filter_motion_consistent_person_candidate_beats_far_outside_peak(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=30.0, debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+        person = [(100.0, 180.0, 180.0, 300.0)]
+        track_filter.update_candidates(
+            [_track(100.0, 200.0, 0.90)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+        )
+        track_filter.update_candidates(
+            [_track(120.0, 220.0, 0.90)],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+        )
+
+        accepted = track_filter.update_candidates(
+            [
+                _track(700.0, 500.0, 0.90),
+                _track(140.0, 240.0, 0.55),
+            ],
+            dt=1.0 / 30.0,
+            frame_shape=frame_shape,
+            person_bboxes=person,
+        )
+
+        self.assertTrue(accepted.visible)
+        self.assertEqual(accepted.ball_xy, [140.0, 240.0])
+        self.assertEqual(track_filter.last_debug_record()["selected_candidate_index"], 1)
+        self.assertEqual(track_filter.last_debug_record()["reason"], "person_occlusion_motion_gate")
+
+    def test_runtime_filter_slow_moving_track_claims_static_hotspot(self) -> None:
+        track_filter = create_tracknet_v3_ball_track_filter(fps=30.0, debug_enabled=True)
+        frame_shape = (720, 1280, 3)
+        outputs = []
+        for frame_index in range(8):
+            outputs.append(
+                track_filter.update_candidates(
+                    [_track(500.0 + frame_index, 400.0 + frame_index * 2.0, 0.90)],
+                    dt=1.0 / 30.0,
+                    frame_shape=frame_shape,
+                )
+            )
+
+        self.assertTrue(all(output.visible for output in outputs))
+        self.assertEqual(track_filter.last_debug_record()["static_filtered_count"], 0)
+
     def test_runtime_filter_stops_low_confidence_ground_bounce_tail(self) -> None:
         track_filter = create_tracknet_v3_ball_track_filter(fps=20.0, debug_enabled=True)
         frame_shape = (500, 500, 3)
@@ -511,7 +585,7 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
             (104.0, 410.0, 0.80),
             (106.0, 450.0, 0.70),
             (108.0, 440.0, 0.55),
-            (110.0, 420.0, 0.30),
+            (110.0, 420.0, 0.32),
         ]
         for x, y, score in samples:
             result = track_filter.update_candidates(
@@ -522,7 +596,7 @@ class TrackNetV3TrajectoryFilterTest(unittest.TestCase):
             self.assertTrue(result.visible)
 
         stopped = track_filter.update_candidates(
-            [_track(112.0, 400.0, 0.32)],
+            [_track(112.0, 400.0, 0.33)],
             dt=0.05,
             frame_shape=frame_shape,
         )

@@ -74,11 +74,12 @@ def manual_court_prediction_from_corners(
     frame_id: int = 0,
     timestamp_ms: int = 0,
 ) -> CourtLinePrediction:
-    corner_array = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
-    if corner_array.shape != (4, 2):
+    raw_corners = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
+    if raw_corners.shape != (4, 2):
         raise ValueError("Manual court calibration requires exactly four points.")
-    if not _court_core.is_convex_quad(corner_array):
-        raise ValueError("Manual court calibration points must form a convex quadrilateral.")
+    corner_array = _court_core.order_quad_points(raw_corners)
+    if corner_array is None:
+        raise ValueError("Manual court calibration points must form a valid convex quadrilateral.")
 
     court_to_image_h, image_to_court_h = _court_core.compute_homographies(corner_array)
     if court_to_image_h is None or image_to_court_h is None:
@@ -111,6 +112,7 @@ def manual_court_prediction_from_corners(
         projected_lines={name: _points_to_list(points) for name, points in projected_lines.items()},
         metrics={
             "manual": True,
+            "corner_order": "tl_tr_br_bl",
             "supported_keypoints": len(keypoint_names),
         },
         detect_ms=0.0,

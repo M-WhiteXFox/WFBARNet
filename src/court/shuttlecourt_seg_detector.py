@@ -233,6 +233,19 @@ class ShuttleCourtSegLineDetector:
                 rejected += 1
                 continue
 
+            detection.components.update(
+                _court_core.projected_singles_support_components(
+                    detection.projected_lines,
+                    line_mask,
+                    detection.mask_support,
+                )
+            )
+            detection.components.update(
+                _court_core.projected_outer_support_components(
+                    detection.projected_lines,
+                    line_mask,
+                )
+            )
             line_fit = bool(detection.components.get("seg_line_fit"))
             line_confidence = float(detection.confidence)
             rank, fused_confidence, components, reason = _score_segmentation_candidate(
@@ -571,6 +584,15 @@ def _detection_from_quad(
             "refine_corner_shift": float(refine_corner_shift),
             "refine_accepted": 1.0 if refine_accepted else 0.0,
             "keypoint_scheme": 6.0 if keypoint_scheme == "6" else 8.0,
+            **_court_core.projected_singles_support_components(
+                projected_lines,
+                line_mask,
+                mask_support,
+            ),
+            **_court_core.projected_outer_support_components(
+                projected_lines,
+                line_mask,
+            ),
         },
         line_count=0,
         merged_line_count=0,

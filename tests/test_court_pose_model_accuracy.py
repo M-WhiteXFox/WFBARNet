@@ -9,6 +9,7 @@ from pathlib import Path
 import statistics
 import sys
 import time
+from typing import Any
 import unittest
 
 import cv2
@@ -37,6 +38,7 @@ class EvaluationConfig:
     device: str = "0"
     preview_count: int = 12
     refine_white_lines: bool = False
+    stateful: bool = False
 
 
 def _order_quad_tl_tr_br_bl(corners: np.ndarray) -> np.ndarray:
@@ -158,6 +160,66 @@ def _percentile(values: np.ndarray, percentile: float) -> float:
     return float(np.percentile(values, percentile)) if values.size else float("nan")
 
 
+def _predict_refined_sample(
+    detector: Any,
+    frame: np.ndarray,
+    *,
+    frame_id: int,
+    timestamp_ms: int,
+    stateful: bool,
+) -> object:
+    if not stateful:
+        detector.reset()
+    return detector.predict(
+        frame,
+        frame_id=frame_id,
+        timestamp_ms=timestamp_ms,
+        force=True,
+    )
+
+
+class _ProtocolTestDetector:
+    def __init__(self) -> None:
+        self.reset_count = 0
+        self.predict_count = 0
+
+    def reset(self) -> None:
+        self.reset_count += 1
+
+    def predict(
+        self,
+        frame: np.ndarray,
+        frame_id: int,
+        timestamp_ms: int,
+        *,
+        force: bool = False,
+    ) -> object:
+        self.predict_count += 1
+        return object()
+
+
+class CourtPoseEvaluationProtocolTest(unittest.TestCase):
+    def test_refined_evaluation_resets_detector_for_each_cold_start_sample(self) -> None:
+        detector = _ProtocolTestDetector()
+        frame = np.zeros((12, 16, 3), dtype=np.uint8)
+
+        _predict_refined_sample(detector, frame, frame_id=10, timestamp_ms=400, stateful=False)
+        _predict_refined_sample(detector, frame, frame_id=20, timestamp_ms=800, stateful=False)
+
+        self.assertEqual(detector.reset_count, 2)
+        self.assertEqual(detector.predict_count, 2)
+
+    def test_refined_evaluation_can_explicitly_preserve_state(self) -> None:
+        detector = _ProtocolTestDetector()
+        frame = np.zeros((12, 16, 3), dtype=np.uint8)
+
+        _predict_refined_sample(detector, frame, frame_id=10, timestamp_ms=400, stateful=True)
+        _predict_refined_sample(detector, frame, frame_id=20, timestamp_ms=800, stateful=True)
+
+        self.assertEqual(detector.reset_count, 0)
+        self.assertEqual(detector.predict_count, 2)
+
+
 def evaluate_court_pose(config: EvaluationConfig) -> dict[str, object]:
     if config.samples < 2:
         raise ValueError("samples must be at least 2")
@@ -214,11 +276,12 @@ def evaluate_court_pose(config: EvaluationConfig) -> dict[str, object]:
                 continue
             started = time.perf_counter()
             if detector is not None:
-                refined = detector.predict(
+                refined = _predict_refined_sample(
+                    detector,
                     frame,
                     frame_id=int(frame_index),
                     timestamp_ms=int(round(frame_index / fps * 1000.0)),
-                    force=True,
+                    stateful=config.stateful,
                 )
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 wall_times_ms.append(elapsed_ms)
@@ -336,6 +399,7 @@ def evaluate_court_pose(config: EvaluationConfig) -> dict[str, object]:
         "confidence_threshold": config.confidence,
         "device": config.device,
         "mode": "pose_plus_white_line_refinement" if config.refine_white_lines else "raw_yolo_pose",
+        "evaluation_protocol": "stateful" if config.stateful else "cold_start",
         "manual_reference": reference_metadata,
         "metrics": metrics,
         "missed_frame_indices": missed_indices,
@@ -424,6 +488,7 @@ class CourtPoseModelAccuracyTest(unittest.TestCase):
         samples = int(os.environ.get("COURT_POSE_SAMPLES", "24"))
         device = os.environ.get("COURT_POSE_DEVICE", "0")
         refine_white_lines = os.environ.get("COURT_POSE_REFINE_WHITE_LINES") == "1"
+        stateful = os.environ.get("COURT_POSE_STATEFUL") == "1"
         report = evaluate_court_pose(
             EvaluationConfig(
                 weights=weights,
@@ -433,6 +498,7 @@ class CourtPoseModelAccuracyTest(unittest.TestCase):
                 samples=samples,
                 device=device,
                 refine_white_lines=refine_white_lines,
+                stateful=stateful,
             )
         )
         print(json.dumps(report["metrics"], ensure_ascii=False, indent=2))
@@ -452,6 +518,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--preview-count", type=int, default=12)
     parser.add_argument("--assert-quality", action="store_true")
     parser.add_argument("--refine-white-lines", action="store_true")
+    parser.add_argument(
+        "--stateful",
+        action="store_true",
+        help="Preserve detector history between sampled frames; the default evaluates every sample as a cold start.",
+    )
     return parser.parse_args()
 
 
@@ -470,6 +541,7 @@ def main() -> None:
             device=args.device,
             preview_count=args.preview_count,
             refine_white_lines=args.refine_white_lines,
+            stateful=args.stateful,
         )
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))

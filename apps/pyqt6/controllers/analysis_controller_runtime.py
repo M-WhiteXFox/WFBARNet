@@ -24,7 +24,11 @@ from PyQt6.QtWidgets import QApplication, QFileDialog
 from apps.pyqt6.utils.style import apply_theme, discover_themes
 from apps.pyqt6.utils.theme_transition import start_theme_ripple_transition
 from apps.pyqt6.views.main_window_refined import MainWindow
-from src.court.batch_court import BatchCourtPredictor
+from src.court.batch_court import (
+    BatchCourtPredictor,
+    default_batch_court_backends,
+    is_trusted_automatic_court_prediction,
+)
 from src.models.bst_runtime import build_bst_model
 from src.models.bst_stroke_runtime import BSTStrokeRecognizer
 from src.models.pose_branch import PoseBranch
@@ -55,6 +59,7 @@ DEFAULT_REPORT_API_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1
 DEFAULT_REPORT_API_MODEL = "qwen-plus"
 POSE_CROP_MIN_BOX_CONF = 0.45
 POSE_MAX_CROPS = 8
+COURT_BOOTSTRAP_OFFSETS_MS = (0, 750, 1500, 2250, 3000, 3750)
 
 
 def _flush_stderr_if_available() -> None:
@@ -404,6 +409,37 @@ class VideoProbeWorker(QThread):
             "image": frame_to_qimage(frame),
             "court_frame": frame,
         }
+        court_samples = [
+            {
+                "frame": frame,
+                "frame_id": payload["frame_id"],
+                "timestamp_ms": payload["position_ms"],
+            }
+        ]
+        sampled_frame_ids = {int(payload["frame_id"])}
+        for offset_ms in COURT_BOOTSTRAP_OFFSETS_MS[1:]:
+            target_ms = self._preview_ms + int(offset_ms)
+            if duration_ms > 0 and target_ms >= duration_ms:
+                break
+            cap.set(cv2.CAP_PROP_POS_MSEC, float(target_ms))
+            sample_ok, sample_frame = cap.read()
+            if not sample_ok or sample_frame is None:
+                continue
+            sample_position_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            if sample_position_ms is None or sample_position_ms <= 0:
+                sample_position_ms = float(target_ms)
+            sample_frame_id = max(0, int(round((sample_position_ms / 1000.0) * fps)))
+            if sample_frame_id in sampled_frame_ids:
+                continue
+            sampled_frame_ids.add(sample_frame_id)
+            court_samples.append(
+                {
+                    "frame": sample_frame,
+                    "frame_id": sample_frame_id,
+                    "timestamp_ms": max(0, int(round(sample_position_ms))),
+                }
+            )
+        payload["court_samples"] = court_samples
         cap.release()
         self.finished.emit(self._file_path, payload)
 
@@ -1350,10 +1386,14 @@ class BatchInferenceWorker(QThread):
             predict_missing_motion=True,
             motion_prediction_scale=0.55,
         )
-        court_predictor = (
-            BatchCourtPredictor(backends=tuple(self._court_backends))
-            if self._court_backends
-            else BatchCourtPredictor()
+        court_predictor = BatchCourtPredictor(
+            backends=tuple(self._court_backends) if self._court_backends else default_batch_court_backends(),
+            fallback_confirm_frames=3,
+            reset_unaccepted_detector_state=True,
+            lock_confirmed_fallback_geometry=True,
+            prediction_acceptor=lambda backend, prediction: is_trusted_automatic_court_prediction(
+                prediction
+            ),
         )
         distance_accumulator = PlayerDistanceAccumulator()
         event_detector = RealtimeTrajectoryEventDetector(fps=fps)
@@ -1657,6 +1697,7 @@ class MainController:
         self._auto_report_after_stop = False
         self._manual_court_points: list[list[float]] = []
         self._manual_court_active = False
+        self._court_source_key: tuple[str, str] | None = None
         self._pending_seek_ms: int | None = None
         self._last_display_frame_time: float | None = None
         self._last_metrics_update_time: float | None = None
@@ -1802,7 +1843,13 @@ class MainController:
     def _finish_manual_court_calibration(self, *, cancelled: bool) -> None:
         self._manual_court_active = False
         self._manual_court_points = []
-        self.view.set_manual_court_capture_enabled(False)
+        set_capture_enabled = getattr(
+            self.view,
+            "set_manual_court_capture_enabled",
+            None,
+        )
+        if callable(set_capture_enabled):
+            set_capture_enabled(False)
         if cancelled:
             self.view.append_log("[Court] 已取消重新标注。")
 
@@ -1813,9 +1860,23 @@ class MainController:
             clear_calibration()
         self.view.set_court_overlay(None)
 
+    def _activate_court_source(self, source_key: tuple[str, str]) -> None:
+        if self._court_source_key is None:
+            self._court_source_key = source_key
+            return
+        if self._court_source_key == source_key:
+            return
+        self._clear_manual_court_calibration()
+        self._court_source_key = source_key
+
     def _latest_court_prediction_dict(self) -> dict[str, Any] | None:
         if self._court_service is None:
             return None
+        latest_display = getattr(self._court_service, "latest_display_prediction_dict", None)
+        if callable(latest_display):
+            value = latest_display()
+            if isinstance(value, dict):
+                return value
         latest_dict = getattr(self._court_service, "latest_prediction_dict", None)
         if callable(latest_dict):
             value = latest_dict()
@@ -1826,10 +1887,18 @@ class MainController:
         value = to_dict() if callable(to_dict) else prediction
         return value if isinstance(value, dict) else None
 
+    def _court_prediction_for_display(self, payload: object) -> object:
+        if isinstance(payload, dict) and bool(
+            payload.get("valid") or payload.get("provisional")
+        ):
+            return payload
+        return self._latest_court_prediction_dict() or payload
+
     def _on_court_prediction_ready(self, payload: object) -> None:
         if not isinstance(payload, dict):
             return
-        if bool(payload.get("valid")):
+        provisional = bool(payload.get("provisional"))
+        if bool(payload.get("valid")) or provisional:
             self.view.set_court_overlay(payload)
         frame_id = int(payload.get("frame_id", -1))
         if frame_id == self._last_court_log_frame:
@@ -1848,6 +1917,23 @@ class MainController:
                 self.view.append_log(
                     f"[Court] 自动标定完成 | {scheme} | frame {frame_id} | "
                     f"conf {confidence:.2f} | {detect_ms:.0f} ms；可点击重新标注或拖动角点修正。"
+                )
+        elif provisional:
+            self._last_court_log_frame = frame_id
+            scheme = str(payload.get("scheme", "automatic"))
+            candidate_confidence = float(payload.get("candidate_confidence", 0.0) or 0.0)
+            metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+            if bool(metrics.get("bootstrap_exhausted")):
+                self.view.append_log(
+                    f"[Court] 自动扫描完成，当前草稿未通过白线验证 | {scheme} | "
+                    f"frame {frame_id} | candidate {candidate_confidence:.2f}；"
+                    "黄色虚线不会用于几何统计，可直接拖动角点完成确认。"
+                )
+            else:
+                self.view.append_log(
+                    f"[Court] 已显示待确认自动标注 | {scheme} | frame {frame_id} | "
+                    f"candidate {candidate_confidence:.2f}；黄色虚线仅用于预览，可拖动角点修正，"
+                    "白线证据通过后会自动升级为绿色可信标注。"
                 )
         elif not valid and self._last_court_log_frame < 0:
             self._last_court_log_frame = frame_id
@@ -2178,6 +2264,9 @@ class MainController:
             return
 
         self._stop_workers(clear_pending_seek=True)
+        if mode != self._input_mode:
+            self._clear_manual_court_calibration()
+            self._court_source_key = None
         self._input_mode = mode
         self.view.set_input_mode(mode)
         self._reset_metrics()
@@ -2390,7 +2479,7 @@ class MainController:
         self._video_meta = {}
         self._reset_metrics()
         self._set_current_rally_record(None)
-        self._clear_manual_court_calibration()
+        self._activate_court_source(("video", str(Path(file_path).resolve())))
         self.view.set_video_path(file_path)
         self.view.set_video_state("loaded")
         self.view.append_log(f"[信息] 正在加载预览: {Path(file_path).name}")
@@ -2414,7 +2503,7 @@ class MainController:
         self._selected_batch_folder = folder_path
         self._batch_results.clear()
         self._batch_order.clear()
-        self._clear_manual_court_calibration()
+        self._activate_court_source(("batch", str(Path(folder_path).resolve())))
         options = self._batch_video_options(folder_path)
         self.view.set_batch_folder_path(folder_path)
         self.view.set_batch_rally_options(options)
@@ -2476,6 +2565,7 @@ class MainController:
         return []
 
     def _start_probe(self, video_path: str, position_ms: int) -> None:
+        self._activate_court_source(("video", str(Path(video_path).resolve())))
         if self._probe_worker is not None and self._probe_worker.isRunning():
             self._probe_worker.quit()
             if not self._probe_worker.wait(300):
@@ -2495,7 +2585,11 @@ class MainController:
                 return
 
             court_frame = payload.get("court_frame")
-            self._video_meta = {key: value for key, value in payload.items() if key != "court_frame"}
+            self._video_meta = {
+                key: value
+                for key, value in payload.items()
+                if key not in {"court_frame", "court_samples"}
+            }
             self.view.show_video_frame(
                 payload["image"],
                 int(payload.get("position_ms", 0)),
@@ -2511,13 +2605,33 @@ class MainController:
             )
             if isinstance(court_frame, np.ndarray) and self._court_service is not None:
                 self._reset_court_detection(request_initial_prediction=True)
-                submitted = self._court_service.submit_frame(
-                    court_frame,
-                    int(payload.get("frame_id", 0)),
-                    int(payload.get("position_ms", 0)),
-                )
-                if submitted:
-                    self.view.append_log("[Court] 正在使用球场模型进行自动标定...")
+                court_samples = payload.get("court_samples")
+                submit_bootstrap = getattr(self._court_service, "submit_bootstrap_frames", None)
+                submitted_count = 0
+                if isinstance(court_samples, list) and callable(submit_bootstrap):
+                    samples = [
+                        (
+                            sample["frame"],
+                            int(sample["frame_id"]),
+                            int(sample["timestamp_ms"]),
+                        )
+                        for sample in court_samples
+                        if isinstance(sample, dict) and isinstance(sample.get("frame"), np.ndarray)
+                    ]
+                    submitted_count = int(submit_bootstrap(samples))
+                if submitted_count <= 0:
+                    submitted_count = int(
+                        self._court_service.submit_frame(
+                            court_frame,
+                            int(payload.get("frame_id", 0)),
+                            int(payload.get("position_ms", 0)),
+                        )
+                    )
+                if submitted_count > 0:
+                    self.view.append_log(
+                        f"[Court] 正在跨 {submitted_count} 个预览采样帧自动标定；"
+                        "首个可信结果产生后会提前停止扫描。"
+                    )
             self._set_idle_state()
         finally:
             self._release_probe_worker(worker)
@@ -2617,6 +2731,7 @@ class MainController:
             self._set_idle_state()
             return
 
+        self._activate_court_source(("camera", str(camera_index)))
         self._stop_workers(clear_pending_seek=True)
         if self._playback_worker is not None or self._camera_worker is not None:
             self.view.append_log("[信息] 正在等待上一项推理任务结束...")
@@ -2713,6 +2828,7 @@ class MainController:
             return
 
         image = payload.get("image")
+        court_prediction = self._court_prediction_for_display(payload.get("court"))
         if isinstance(image, QImage):
             ball_visual_intersection = payload.get(
                 "ball_visual_intersection",
@@ -2722,7 +2838,7 @@ class MainController:
                 image,
                 int(payload.get("position_ms", 0)),
                 int(payload.get("duration_ms", 0)),
-                payload.get("court"),
+                court_prediction,
                 ball_visual_intersection,
                 payload.get("player_projections"),
             )
@@ -2742,7 +2858,7 @@ class MainController:
         infer_fps = float(payload.get("infer_fps", 0.0))
         track = payload.get("track", {})
         current_score = float(track.get("score", 0.0)) if isinstance(track, dict) else 0.0
-        court = payload.get("court", {})
+        court = court_prediction
         court_text = ""
         if isinstance(court, dict) and court.get("valid"):
             court_text = f" | Court {float(court.get('confidence', 0.0)):.2f}"
@@ -2758,12 +2874,13 @@ class MainController:
             return
 
         image = payload.get("image")
+        court_prediction = self._court_prediction_for_display(payload.get("court"))
         if isinstance(image, QImage):
             ball_visual_intersection = payload.get(
                 "ball_visual_intersection",
                 payload.get("ball_projection"),
             )
-            self.view.video_player.display_image(image, court=payload.get("court"))
+            self.view.video_player.display_image(image, court=court_prediction)
             self.view.court_widget.set_ball_projection(ball_visual_intersection)
             self.view.court_widget.set_player_projections(payload.get("player_projections"))
             self.view.set_player_distances(payload.get("player_distances_m"))
@@ -2779,7 +2896,7 @@ class MainController:
         track = payload.get("track", {})
         current_score = float(track.get("score", 0.0)) if isinstance(track, dict) else 0.0
         infer_fps = float(payload.get("infer_fps", 0.0))
-        court = payload.get("court", {})
+        court = court_prediction
         court_text = ""
         if isinstance(court, dict) and court.get("valid"):
             court_text = f" | Court {float(court.get('confidence', 0.0)):.2f}"
@@ -3050,7 +3167,14 @@ class MainController:
         if self._pending_seek_ms is not None and self._selected_video_path is not None:
             pending_seek_ms = self._pending_seek_ms
             self._pending_seek_ms = None
-            self._start_playback(start_ms=pending_seek_ms, request_court_prediction=False)
+            latest_court = self._latest_court_prediction_dict()
+            request_court_prediction = not (
+                isinstance(latest_court, dict) and latest_court.get("scheme") == "manual"
+            )
+            self._start_playback(
+                start_ms=pending_seek_ms,
+                request_court_prediction=request_court_prediction,
+            )
 
     def _on_playback_failed(self, message: str) -> None:
         self.view.set_status_state("error")
@@ -3105,6 +3229,7 @@ class MainController:
         self._batch_order.clear()
         self._video_meta = {}
         self._clear_manual_court_calibration()
+        self._court_source_key = None
         self.view.clear_video()
         self.view.set_input_mode(self._input_mode)
         self.view.set_batch_folder_path("")

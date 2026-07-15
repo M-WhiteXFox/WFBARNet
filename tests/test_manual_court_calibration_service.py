@@ -54,14 +54,35 @@ class ManualCourtCalibrationServiceTest(unittest.TestCase):
         self.assertIsNone(service.latest_prediction())
         self.assertIsNone(service.latest_prediction_dict())
 
+    def test_manual_corners_are_normalized_to_tl_tr_br_bl(self) -> None:
+        prediction = manual_court_prediction_from_corners(
+            [
+                [470.0, 320.0],
+                [100.0, 40.0],
+                [70.0, 310.0],
+                [420.0, 48.0],
+            ],
+            source_size=(520, 360),
+        )
+
+        self.assertEqual(
+            prediction.corners,
+            [
+                [100.0, 40.0],
+                [420.0, 48.0],
+                [470.0, 320.0],
+                [70.0, 310.0],
+            ],
+        )
+
     def test_invalid_manual_corners_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
             manual_court_prediction_from_corners(
                 [
                     [100.0, 40.0],
                     [420.0, 48.0],
+                    [420.0, 48.0],
                     [70.0, 310.0],
-                    [470.0, 320.0],
                 ],
                 source_size=(520, 360),
             )

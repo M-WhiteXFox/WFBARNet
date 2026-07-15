@@ -89,9 +89,10 @@ class CourtLineOverlayWidget(QWidget):
 
         court = self._court
         projected_lines = court.get("projected_lines") if isinstance(court, dict) else None
+        provisional = bool(isinstance(court, dict) and court.get("provisional"))
         if (
             not isinstance(court, dict)
-            or not court.get("valid")
+            or not (court.get("valid") or provisional)
             or not isinstance(projected_lines, dict)
             or self._source_size.width() <= 0
             or self._source_size.height() <= 0
@@ -110,16 +111,22 @@ class CourtLineOverlayWidget(QWidget):
 
         outer = projected_lines.get("doubles_outer")
         outer_polygon = self._polygon_from_points(outer)
-        if outer_polygon.count() >= 3 and self._mask_alpha > 0.0:
+        if outer_polygon.count() >= 3 and self._mask_alpha > 0.0 and not provisional:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(90, 210, 35, int(max(0.0, min(self._mask_alpha, 1.0)) * 255)))
             painter.drawPolygon(outer_polygon)
 
-        dark_pen = QPen(QColor(25, 65, 0), self._line_thickness + 3.0)
-        bright_pen = QPen(QColor(110, 245, 40), self._line_thickness)
+        if provisional:
+            dark_pen = QPen(QColor(90, 55, 0), self._line_thickness + 3.0)
+            bright_pen = QPen(QColor(255, 190, 45), self._line_thickness)
+        else:
+            dark_pen = QPen(QColor(25, 65, 0), self._line_thickness + 3.0)
+            bright_pen = QPen(QColor(110, 245, 40), self._line_thickness)
         for pen in (dark_pen, bright_pen):
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            if provisional:
+                pen.setStyle(Qt.PenStyle.DashLine)
 
         painter.setBrush(Qt.BrushStyle.NoBrush)
         for name, points in projected_lines.items():
@@ -136,7 +143,9 @@ class CourtLineOverlayWidget(QWidget):
 
     def corners(self) -> list[tuple[float, float]]:
         court = self._court
-        if not isinstance(court, dict) or not court.get("valid"):
+        if not isinstance(court, dict) or not (
+            court.get("valid") or court.get("provisional")
+        ):
             return []
         return self._points_from_object(court.get("corners"))
 
@@ -152,7 +161,9 @@ class CourtLineOverlayWidget(QWidget):
         return None
 
     def _make_court_key(self, court: dict[str, Any] | None) -> tuple[Any, ...] | None:
-        if not isinstance(court, dict) or not court.get("valid"):
+        if not isinstance(court, dict) or not (
+            court.get("valid") or court.get("provisional")
+        ):
             return None
         projected_lines = court.get("projected_lines")
         if not isinstance(projected_lines, dict):
@@ -173,6 +184,8 @@ class CourtLineOverlayWidget(QWidget):
             line_items.append((str(name), tuple(points)))
         return (
             tuple(court.get("source_size") or ()),
+            bool(court.get("valid")),
+            bool(court.get("provisional")),
             tuple(line_items),
         )
 
@@ -215,15 +228,16 @@ class CourtLineOverlayWidget(QWidget):
         scale_x = self._display_rect.width() / max(1, self._source_size.width())
         scale_y = self._display_rect.height() / max(1, self._source_size.height())
         radius = 7.0
+        provisional = bool(court.get("provisional"))
         for x, y in corners:
             label_x = self._display_rect.left() + x * scale_x
             label_y = self._display_rect.top() + y * scale_y
             center = QPointF(label_x, label_y)
-            painter.setPen(QPen(QColor(15, 55, 0), 3.0))
+            painter.setPen(QPen(QColor(90, 55, 0) if provisional else QColor(15, 55, 0), 3.0))
             painter.setBrush(QColor(255, 255, 255, 235))
             painter.drawEllipse(center, radius + 2.0, radius + 2.0)
-            painter.setPen(QPen(QColor(75, 190, 30), 2.0))
-            painter.setBrush(QColor(110, 245, 40, 240))
+            painter.setPen(QPen(QColor(210, 125, 15) if provisional else QColor(75, 190, 30), 2.0))
+            painter.setBrush(QColor(255, 190, 45, 240) if provisional else QColor(110, 245, 40, 240))
             painter.drawEllipse(center, radius, radius)
 
 

@@ -15,7 +15,9 @@ from src.court.shuttlecourt_seg_detector import (
     ShuttleCourtSegConfig,
     ShuttleCourtSegLineDetector,
     _detection_from_quad,
+    _projected_lines_roi_support,
     _score_segmentation_candidate,
+    _segmentation_roi_mask,
     _to_numpy,
 )
 
@@ -36,7 +38,16 @@ class CourtPoseConfig(ShuttleCourtSegConfig):
     min_pose_line_support: float = 0.08
     min_pose_snap_points: int = 10
     max_pose_refine_shift_ratio: float = 0.10
+    max_pose_refine_corner_shift_ratio: float = 0.11
+    max_pose_refine_corner_outlier_ratio: float = 3.0
+    min_pose_monotrack_supported_lines: int = 4
+    min_pose_outer_line_support: float = 0.10
+    min_pose_outer_edge_support: float = 0.04
+    min_pose_roi_support: float = 0.70
     coarse_confidence_scale: float = 0.62
+    coarse_startup_confirm_frames: int = 3
+    coarse_startup_max_corner_shift_ratio: float = 0.03
+    coarse_redetect_interval: float = 0.75
     corner_snap: bool = True
     corner_snap_radius: int = 130
     corner_snap_max_shift: int = 110
@@ -165,11 +176,28 @@ class CourtPoseLineDetector(ShuttleCourtSegLineDetector):
             if detection is None:
                 continue
 
-            mean_shift = float(np.mean(np.linalg.norm(detection.corners - raw_quad, axis=1)))
-            max_shift = float(np.hypot(frame.shape[1], frame.shape[0])) * float(
+            refine_offsets = np.linalg.norm(detection.corners - raw_quad, axis=1)
+            mean_shift = float(np.mean(refine_offsets))
+            median_shift = float(np.median(refine_offsets))
+            max_corner_shift = float(np.max(refine_offsets))
+            frame_diagonal = float(np.hypot(frame.shape[1], frame.shape[0]))
+            max_mean_shift = frame_diagonal * float(
                 self.config.max_pose_refine_shift_ratio
             )
-            if mean_shift > max_shift:
+            max_allowed_corner_shift = frame_diagonal * float(
+                self.config.max_pose_refine_corner_shift_ratio
+            )
+            max_outlier_shift = max(
+                8.0,
+                median_shift * float(self.config.max_pose_refine_corner_outlier_ratio),
+            )
+            unsafe_refinement = (
+                mean_shift > max_mean_shift
+                or max_corner_shift > max_allowed_corner_shift
+                or max_corner_shift > max_outlier_shift
+            )
+            if unsafe_refinement:
+                refinement_components = dict(detection.components)
                 detection = self._coarse_detection(
                     raw_quad,
                     box_confidence=box_confidence,
@@ -179,17 +207,48 @@ class CourtPoseLineDetector(ShuttleCourtSegLineDetector):
                 )
                 if detection is None:
                     continue
+                _copy_pose_diagnostics(detection.components, refinement_components)
+                detection.components["pose_refine_shift_rejected"] = 1.0
                 mean_shift = 0.0
                 corner_snap_count = 0
                 corner_snap_shift = 0.0
 
             homography_refined = bool(detection.components.get("refine_accepted", 0.0))
             monotrack_fused = bool(detection.components.get("pose_monotrack_fused", 0.0))
-            white_line_refined = monotrack_fused or (
-                homography_refined
-                and detection.mask_support >= float(self.config.min_pose_line_support)
-                and detection.snap_points >= int(self.config.min_pose_snap_points)
-            ) or corner_snap_count >= int(self.config.min_pose_corner_snaps)
+            monotrack_white_line_evidence = bool(
+                detection.components.get("pose_monotrack_white_line_evidence", 0.0)
+            )
+            weak_monotrack_refinement = monotrack_fused and not monotrack_white_line_evidence
+            if weak_monotrack_refinement and not unsafe_refinement:
+                refinement_components = dict(detection.components)
+                coarse = self._coarse_detection(
+                    raw_quad,
+                    box_confidence=box_confidence,
+                    area_ratio=area_ratio,
+                    line_mask=line_mask,
+                    green_mask=green_mask,
+                )
+                if coarse is None:
+                    continue
+                _copy_pose_diagnostics(coarse.components, refinement_components)
+                detection = coarse
+                mean_shift = 0.0
+                corner_snap_count = 0
+                corner_snap_shift = 0.0
+                homography_refined = False
+
+            white_line_refined = (not unsafe_refinement) and (
+                (monotrack_fused and monotrack_white_line_evidence)
+                or (
+                    homography_refined
+                    and detection.mask_support >= float(self.config.min_pose_line_support)
+                    and detection.snap_points >= int(self.config.min_pose_snap_points)
+                )
+                or (
+                    monotrack_white_line_evidence
+                    and corner_snap_count >= int(self.config.min_pose_corner_snaps)
+                )
+            )
             rank, fused_confidence, components, reason = _score_segmentation_candidate(
                 quad=detection.corners,
                 frame_shape=frame.shape,
@@ -221,6 +280,8 @@ class CourtPoseLineDetector(ShuttleCourtSegLineDetector):
                     "pose_keypoint_confidence": float(np.clip(keypoint_confidence, 0.0, 1.0)),
                     "pose_white_line_refined": 1.0 if white_line_refined else 0.0,
                     "pose_refine_mean_shift_px": mean_shift,
+                    "pose_refine_max_shift_px": max_corner_shift,
+                    "pose_refine_shift_rejected": 1.0 if unsafe_refinement else 0.0,
                     "pose_corner_snap_count": float(corner_snap_count),
                     "pose_corner_snap_mean_shift_px": float(corner_snap_shift),
                 }
@@ -241,7 +302,15 @@ class CourtPoseLineDetector(ShuttleCourtSegLineDetector):
         line_mask: np.ndarray,
         green_mask: np.ndarray,
     ) -> tuple[_court_core.CourtLineDetection | None, int, float]:
-        monotrack = detect_monotrack_court_lines(frame, previous, self._monotrack_args)
+        pose_roi = _segmentation_roi_mask(raw_quad, frame.shape, self._args)
+        if pose_roi is None:
+            return None, 0, 0.0
+        monotrack = detect_monotrack_court_lines(
+            frame,
+            previous,
+            self._monotrack_args,
+            roi_mask=pose_roi,
+        )
         if monotrack is None:
             return None, 0, 0.0
 
@@ -264,9 +333,11 @@ class CourtPoseLineDetector(ShuttleCourtSegLineDetector):
             selected_flags = [False, False, False, False]
 
         snap_count = int(sum(selected_flags))
-        mean_shift = float(np.mean(np.linalg.norm(ordered - monotrack.corners, axis=1)))
+        snap_offsets = np.linalg.norm(ordered - monotrack.corners, axis=1)
+        mean_shift = float(np.mean(snap_offsets))
+        max_corner_shift = float(np.max(snap_offsets))
         max_shift = float(np.hypot(frame.shape[1], frame.shape[0])) * float(self.config.max_pose_corner_snap_shift_ratio)
-        if mean_shift > max_shift:
+        if mean_shift > max_shift or max_corner_shift > max_shift:
             ordered = monotrack.corners.copy()
             snap_count = 0
             mean_shift = 0.0
@@ -279,22 +350,37 @@ class CourtPoseLineDetector(ShuttleCourtSegLineDetector):
             green_mask=green_mask,
         )
         if fused is None:
-            return monotrack, 0, 0.0
-        if fused.mask_support + 0.03 < monotrack.mask_support * 0.70:
-            return monotrack, 0, 0.0
+            fused = monotrack
+            snap_count = 0
+            mean_shift = 0.0
+        elif fused.mask_support + 0.03 < monotrack.mask_support * 0.70:
+            fused = monotrack
+            snap_count = 0
+            mean_shift = 0.0
+        else:
+            fused.confidence = float(np.clip(0.70 * monotrack.confidence + 0.30 * box_confidence, 0.0, 1.0))
+            fused.line_count = monotrack.line_count
+            fused.merged_line_count = monotrack.merged_line_count
+            fused.intersection_count = monotrack.intersection_count
+            fused.debug_segments = monotrack.debug_segments
+            fused.debug_merged_lines = monotrack.debug_merged_lines
+            fused.snap_points = max(monotrack.snap_points, snap_count)
+            fused.snap_mean_shift = mean_shift
+            for name, value in monotrack.components.items():
+                if str(name).startswith("monotrack_"):
+                    fused.components[str(name)] = value
 
-        fused.confidence = float(np.clip(0.70 * monotrack.confidence + 0.30 * box_confidence, 0.0, 1.0))
-        fused.line_count = monotrack.line_count
-        fused.merged_line_count = monotrack.merged_line_count
-        fused.intersection_count = monotrack.intersection_count
-        fused.debug_segments = monotrack.debug_segments
-        fused.debug_merged_lines = monotrack.debug_merged_lines
-        fused.snap_points = max(monotrack.snap_points, snap_count)
-        fused.snap_mean_shift = mean_shift
-        fused.components.update(monotrack.components)
+        evidence, evidence_components = _monotrack_white_line_evidence(
+            fused,
+            line_mask=line_mask,
+            pose_roi=pose_roi,
+            config=self.config,
+        )
+        fused.components.update(evidence_components)
         fused.components.update(
             {
                 "pose_monotrack_fused": 1.0,
+                "pose_monotrack_white_line_evidence": 1.0 if evidence else 0.0,
                 "pose_outer_corner_count": float(snap_count),
                 "pose_outer_mean_shift_px": mean_shift,
             }
@@ -351,6 +437,51 @@ def _select_pose_consistent_outer_corners(
             selected[index] = outer_quad[index]
             selected_flags[index] = True
     return selected, selected_flags
+
+
+def _copy_pose_diagnostics(
+    target: dict[str, float],
+    source: dict[str, float],
+) -> None:
+    """Keep pose-specific diagnostics without replacing metrics for fallback geometry."""
+    for name, value in source.items():
+        if str(name).startswith("pose_"):
+            target[str(name)] = value
+
+
+def _monotrack_white_line_evidence(
+    detection: _court_core.CourtLineDetection,
+    *,
+    line_mask: np.ndarray,
+    pose_roi: np.ndarray,
+    config: CourtPoseConfig,
+) -> tuple[bool, dict[str, float]]:
+    template_support, supported_lines = _court_core.projected_template_support(
+        detection.projected_lines,
+        line_mask,
+    )
+    outer_components = _court_core.projected_outer_support_components(
+        detection.projected_lines,
+        line_mask,
+    )
+    outer_support = float(outer_components["outer_mean_support"])
+    min_outer_edge_support = float(outer_components["outer_min_support"])
+    roi_support = _projected_lines_roi_support(detection.projected_lines, pose_roi)
+    accepted = bool(
+        template_support >= float(config.min_pose_line_support)
+        and supported_lines >= int(config.min_pose_monotrack_supported_lines)
+        and outer_support >= float(config.min_pose_outer_line_support)
+        and min_outer_edge_support >= float(config.min_pose_outer_edge_support)
+        and roi_support >= float(config.min_pose_roi_support)
+    )
+    return accepted, {
+        **outer_components,
+        "pose_monotrack_template_support": float(template_support),
+        "pose_monotrack_supported_lines": float(supported_lines),
+        "pose_monotrack_outer_support": outer_support,
+        "pose_monotrack_min_outer_edge_support": min_outer_edge_support,
+        "pose_monotrack_roi_support": float(roi_support),
+    }
 
 
 def _complete_outer_sides_from_vanishing_point(

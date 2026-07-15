@@ -203,6 +203,8 @@ def detect_monotrack_court_lines(
     frame: np.ndarray,
     previous: _court_core.CourtLineDetection | None,
     args: SimpleNamespace,
+    *,
+    roi_mask: np.ndarray | None = None,
 ) -> _court_core.CourtLineDetection | None:
     detect_frame, scale = _court_core.resize_for_detection(frame, int(args.detect_max_width))
     previous_small = (
@@ -211,6 +213,18 @@ def detect_monotrack_court_lines(
         else previous
     )
     mask = create_monotrack_line_mask(detect_frame, args)
+    if roi_mask is not None:
+        roi = np.asarray(roi_mask, dtype=np.uint8)
+        if roi.ndim == 3:
+            roi = roi[..., 0]
+        if roi.shape != detect_frame.shape[:2]:
+            roi = cv2.resize(
+                roi,
+                (detect_frame.shape[1], detect_frame.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        roi = np.where(roi > 0, 255, 0).astype(np.uint8)
+        mask = cv2.bitwise_and(mask, roi)
     segments = detect_monotrack_hough_segments(mask, args)
     if len(segments) < 4:
         return None
@@ -436,6 +450,19 @@ def build_monotrack_detection(
         debug_merged_lines=merged_lines,
     )
     confidence, components, reason = _court_core.score_court_detection(detection, previous, mask.shape[:2], args)
+    components.update(
+        _court_core.projected_singles_support_components(
+            projected_lines,
+            mask,
+            mask_support,
+        )
+    )
+    components.update(
+        _court_core.projected_outer_support_components(
+            projected_lines,
+            mask,
+        )
+    )
     components["monotrack_model"] = float(np.clip(model_score / max(1.0, np.hypot(mask.shape[1], mask.shape[0])), 0.0, 1.0))
     detection.confidence = confidence
     detection.components = components
