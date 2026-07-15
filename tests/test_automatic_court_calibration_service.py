@@ -205,8 +205,8 @@ class AutomaticCourtCalibrationServiceTest(unittest.TestCase):
         pending = _prediction(scheme="courtkeynet", frame_id=2)
         pending.valid = False
         pending.updated = False
-        pending.status = "courtkeynet confirmation 2/3"
-        pending.metrics["components"]["courtkeynet_confirmation_count"] = 2.0
+        pending.status = "courtkeynet confirmation 1/3"
+        pending.metrics["components"]["courtkeynet_confirmation_count"] = 1.0
         pending.metrics["components"]["courtkeynet_confirmation_required"] = 3.0
 
         automatic.emit_prediction(pending)
@@ -214,8 +214,31 @@ class AutomaticCourtCalibrationServiceTest(unittest.TestCase):
         display = service.latest_display_prediction_dict()
         self.assertEqual(
             display["status"],
-            "provisional CourtKeyNet court; confirmation 2/3",
+            "provisional CourtKeyNet court; confirmation 1/3",
         )
+
+    def test_rejected_courtkeynet_candidate_does_not_report_zero_confirmation(self) -> None:
+        automatic = _FakeAutomaticService()
+        service = AutomaticCourtCalibrationService(automatic_service=automatic)
+        rejected = _prediction(scheme="courtkeynet", frame_id=2)
+        rejected.valid = False
+        rejected.updated = False
+        rejected.status = "courtkeynet confidence below threshold"
+        rejected.metrics = {
+            "components": {
+                "courtkeynet_combined_confidence": 0.40,
+                "courtkeynet_confidence_threshold": 0.50,
+            }
+        }
+
+        automatic.emit_prediction(rejected)
+
+        display = service.latest_display_prediction_dict()
+        self.assertEqual(
+            display["status"],
+            "provisional automatic court; waiting for verified white-line evidence",
+        )
+        self.assertNotIn("0/0", display["status"])
 
     def test_low_evidence_monotrack_does_not_replace_verified_prediction(self) -> None:
         automatic = _FakeAutomaticService()

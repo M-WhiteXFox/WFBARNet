@@ -38,9 +38,24 @@ def _provisional_payload(payload: dict, prediction: CourtLinePrediction) -> dict
         status = "automatic scan complete; no usable court geometry found"
     elif prediction.scheme == "courtkeynet":
         components = metrics.get("components") if isinstance(metrics.get("components"), dict) else {}
-        count = int(float(components.get("courtkeynet_confirmation_count", 0)))
-        required = int(float(components.get("courtkeynet_confirmation_required", 0)))
-        status = f"provisional CourtKeyNet court; confirmation {count}/{required}"
+        try:
+            count_value = float(components["courtkeynet_confirmation_count"])
+            required_value = float(components["courtkeynet_confirmation_required"])
+        except (KeyError, TypeError, ValueError):
+            count_value = 0.0
+            required_value = 0.0
+        if (
+            np.isfinite(count_value)
+            and np.isfinite(required_value)
+            and count_value >= 1.0
+            and required_value >= 1.0
+        ):
+            status = (
+                "provisional CourtKeyNet court; confirmation "
+                f"{int(count_value)}/{int(required_value)}"
+            )
+        else:
+            status = "provisional automatic court; waiting for verified white-line evidence"
     else:
         status = "provisional automatic court; waiting for verified white-line evidence"
     filtered.update(

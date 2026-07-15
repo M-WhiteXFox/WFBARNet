@@ -495,11 +495,16 @@ def _predictions_geometry_consistent(
         return False
     if not np.isfinite(anchor_corners).all() or not np.isfinite(candidate_corners).all():
         return False
-    reference_scale = max(
-        float(np.linalg.norm(anchor_corners[2] - anchor_corners[0])),
-        float(np.linalg.norm(anchor_corners[3] - anchor_corners[1])),
-        1.0,
-    )
+    try:
+        source_width, source_height = (float(value) for value in anchor.source_size)
+        candidate_size = tuple(float(value) for value in candidate.source_size)
+    except (TypeError, ValueError):
+        return False
+    if candidate_size != (source_width, source_height):
+        return False
+    reference_scale = math.hypot(source_width, source_height)
+    if not math.isfinite(reference_scale) or reference_scale <= 0.0:
+        return False
     max_shift = float(np.max(np.linalg.norm(candidate_corners - anchor_corners, axis=1)))
     return max_shift / reference_scale <= max(0.0, float(max_corner_shift_ratio))
 

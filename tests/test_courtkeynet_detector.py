@@ -215,7 +215,7 @@ class CourtKeyNetDetectorTest(unittest.TestCase):
         self.assertEqual(locked.projected_lines, trusted.projected_lines)
         self.assertEqual(model.forward_count, 3)
 
-    def test_confirmation_compares_each_fresh_frame_to_first_anchor(self) -> None:
+    def test_confirmation_uses_source_diagonal_and_first_frame_anchor(self) -> None:
         base = torch.tensor(
             [[[0.20, 0.25], [0.80, 0.25], [0.85, 0.90], [0.15, 0.90]]],
             dtype=torch.float32,
@@ -225,6 +225,36 @@ class CourtKeyNetDetectorTest(unittest.TestCase):
         detector = CourtKeyNetLineDetector(
             CourtKeyNetConfig(max_corner_shift_ratio=0.035),
             model=_SequenceCourtKeyNet([base, base + shift_three, base + shift_six]),
+        )
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+
+        predictions = [
+            detector.predict(frame, index, index * 40, force=True)
+            for index in range(3)
+        ]
+
+        self.assertEqual(
+            [prediction.status for prediction in predictions],
+            [
+                "courtkeynet confirmation 1/3",
+                "courtkeynet confirmation 2/3",
+                "courtkeynet detection",
+            ],
+        )
+        self.assertTrue(predictions[2].valid)
+
+    def test_confirmation_resets_when_anchor_shift_exceeds_source_ratio(self) -> None:
+        base = torch.tensor(
+            [[[0.20, 0.25], [0.80, 0.25], [0.85, 0.90], [0.15, 0.90]]],
+            dtype=torch.float32,
+        )
+        shift_three = torch.tensor([3.0 / 160.0, 0.0], dtype=torch.float32)
+        shift_over_seven = torch.tensor([7.1 / 160.0, 0.0], dtype=torch.float32)
+        detector = CourtKeyNetLineDetector(
+            CourtKeyNetConfig(max_corner_shift_ratio=0.035),
+            model=_SequenceCourtKeyNet(
+                [base, base + shift_three, base + shift_over_seven]
+            ),
         )
         frame = np.zeros((120, 160, 3), dtype=np.uint8)
 
