@@ -7,7 +7,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from apps.pyqt6.services.court_detection_service import CourtDetectionService
 from apps.pyqt6.services.manual_court_calibration_service import manual_court_prediction_from_corners
-from src.court import CourtLineBackend, CourtPoseConfig, create_court_line_detector
+from src.court import CourtKeyNetConfig, CourtLineBackend, create_court_line_detector
 from src.court.batch_court import (
     BatchCourtPredictor,
     is_trusted_automatic_court_prediction,
@@ -16,7 +16,7 @@ from src.court.opencv_court_detector import CourtLinePrediction
 
 
 _AUTOMATIC_BACKENDS: tuple[CourtLineBackend, ...] = (
-    "court_pose",
+    "courtkeynet",
     "shuttlecourt_seg",
     "monotrack",
     "opencv",
@@ -36,6 +36,11 @@ def _provisional_payload(payload: dict, prediction: CourtLinePrediction) -> dict
         status = "automatic scan complete; editable draft did not pass white-line verification"
     elif scan_exhausted:
         status = "automatic scan complete; no usable court geometry found"
+    elif prediction.scheme == "courtkeynet":
+        components = metrics.get("components") if isinstance(metrics.get("components"), dict) else {}
+        count = int(float(components.get("courtkeynet_confirmation_count", 0)))
+        required = int(float(components.get("courtkeynet_confirmation_required", 0)))
+        status = f"provisional CourtKeyNet court; confirmation {count}/{required}"
     else:
         status = "provisional automatic court; waiting for verified white-line evidence"
     filtered.update(
@@ -57,10 +62,11 @@ def _provisional_payload(payload: dict, prediction: CourtLinePrediction) -> dict
     return filtered
 
 
-def _create_automatic_detector(config: CourtPoseConfig | None) -> BatchCourtPredictor:
+def _create_automatic_detector(config: CourtKeyNetConfig | None) -> BatchCourtPredictor:
     if config is None:
         return BatchCourtPredictor(
             backends=_AUTOMATIC_BACKENDS,
+            authoritative_backends=("courtkeynet",),
             fallback_confirm_frames=3,
             reset_unaccepted_detector_state=True,
             lock_confirmed_fallback_geometry=True,
@@ -70,12 +76,13 @@ def _create_automatic_detector(config: CourtPoseConfig | None) -> BatchCourtPred
         )
 
     def detector_factory(backend: CourtLineBackend):
-        backend_config = config if backend == "court_pose" else None
+        backend_config = config if backend == "courtkeynet" else None
         return create_court_line_detector(backend, config=backend_config)
 
     return BatchCourtPredictor(
         backends=_AUTOMATIC_BACKENDS,
         detector_factory=detector_factory,
+        authoritative_backends=("courtkeynet",),
         fallback_confirm_frames=3,
         reset_unaccepted_detector_state=True,
         lock_confirmed_fallback_geometry=True,
@@ -93,7 +100,7 @@ class AutomaticCourtCalibrationService(QObject):
 
     def __init__(
         self,
-        config: CourtPoseConfig | None = None,
+        config: CourtKeyNetConfig | None = None,
         *,
         automatic_service: Any | None = None,
     ) -> None:
@@ -206,7 +213,7 @@ class AutomaticCourtCalibrationService(QObject):
 
 
 def create_automatic_court_calibration_service(
-    config: CourtPoseConfig | None = None,
+    config: CourtKeyNetConfig | None = None,
 ) -> AutomaticCourtCalibrationService:
     service = AutomaticCourtCalibrationService(config)
     service.start()

@@ -18,10 +18,17 @@ from src.court.shuttlecourt_seg_detector import (
     ShuttleCourtSegLineDetector,
 )
 from src.court.court_pose_detector import CourtPoseConfig, CourtPoseLineDetector
+from src.court.courtkeynet_detector import CourtKeyNetConfig, CourtKeyNetLineDetector
 
 
-CourtLineBackend = Literal["court_pose", "shuttlecourt_seg", "monotrack", "opencv"]
-CourtLineConfig = CourtPoseConfig | ShuttleCourtSegConfig | MonoTrackCourtLineConfig | OpenCVCourtLineConfig
+CourtLineBackend = Literal["courtkeynet", "court_pose", "shuttlecourt_seg", "monotrack", "opencv"]
+CourtLineConfig = (
+    CourtKeyNetConfig
+    | CourtPoseConfig
+    | ShuttleCourtSegConfig
+    | MonoTrackCourtLineConfig
+    | OpenCVCourtLineConfig
+)
 
 
 @runtime_checkable
@@ -48,6 +55,10 @@ def create_court_line_detector(
     *,
     config: CourtLineConfig | None = None,
 ) -> CourtLineDetector:
+    if backend == "courtkeynet":
+        if config is not None and not isinstance(config, CourtKeyNetConfig):
+            raise TypeError("CourtKeyNet detector requires CourtKeyNetConfig.")
+        return CourtKeyNetLineDetector(config)
     if backend == "court_pose":
         if config is not None and not isinstance(config, CourtPoseConfig):
             raise TypeError("Court pose detector requires CourtPoseConfig.")

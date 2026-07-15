@@ -10,6 +10,8 @@ import cv2
 import numpy as np
 
 from src.court import (
+    CourtKeyNetConfig,
+    CourtKeyNetLineDetector,
     CourtPoseConfig,
     CourtPoseLineDetector,
     CourtLineDetector,
@@ -170,6 +172,22 @@ class OpenCVCourtLineDetectorTest(unittest.TestCase):
 
         self.assertIsInstance(detector, CourtLineDetector)
         self.assertIsInstance(detector, CourtPoseLineDetector)
+
+    def test_courtkeynet_backend_returns_native_detector(self) -> None:
+        config = CourtKeyNetConfig(device="cpu")
+
+        detector = create_court_line_detector(backend="courtkeynet", config=config)
+
+        self.assertIsInstance(detector, CourtLineDetector)
+        self.assertIsInstance(detector, CourtKeyNetLineDetector)
+        self.assertIs(detector.config, config)
+
+    def test_courtkeynet_backend_rejects_wrong_config_type(self) -> None:
+        with self.assertRaisesRegex(TypeError, "CourtKeyNet detector requires"):
+            create_court_line_detector(
+                backend="courtkeynet",
+                config=CourtPoseConfig(device="cpu"),
+            )
 
     def test_predict_court_lines_module_api(self) -> None:
         result = predict_court_lines(

@@ -13,6 +13,7 @@ PyQt6>=6.6
 PyQt6-WebEngine>=6.6
 torch>=2.2
 torchvision>=0.17
+safetensors>=0.5
 tqdm>=4.66
 ultralytics>=8.3
 

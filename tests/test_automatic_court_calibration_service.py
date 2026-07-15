@@ -45,6 +45,14 @@ def _prediction(*, scheme: str, frame_id: int = 1):
                 "outer_min_support": 0.60,
             }
         }
+    elif scheme == "courtkeynet":
+        prediction.metrics = {
+            "components": {
+                "courtkeynet_combined_confidence": 0.92,
+                "courtkeynet_confidence_threshold": 0.50,
+                "courtkeynet_confirmation_complete": 1.0,
+            }
+        }
     return prediction
 
 
@@ -191,6 +199,24 @@ class AutomaticCourtCalibrationServiceTest(unittest.TestCase):
         self.assertTrue(emitted[0]["provisional"])
         self.assertEqual(emitted[0]["status"], "provisional automatic court; waiting for verified white-line evidence")
 
+    def test_pending_courtkeynet_prediction_reports_native_confirmation_progress(self) -> None:
+        automatic = _FakeAutomaticService()
+        service = AutomaticCourtCalibrationService(automatic_service=automatic)
+        pending = _prediction(scheme="courtkeynet", frame_id=2)
+        pending.valid = False
+        pending.updated = False
+        pending.status = "courtkeynet confirmation 2/3"
+        pending.metrics["components"]["courtkeynet_confirmation_count"] = 2.0
+        pending.metrics["components"]["courtkeynet_confirmation_required"] = 3.0
+
+        automatic.emit_prediction(pending)
+
+        display = service.latest_display_prediction_dict()
+        self.assertEqual(
+            display["status"],
+            "provisional CourtKeyNet court; confirmation 2/3",
+        )
+
     def test_low_evidence_monotrack_does_not_replace_verified_prediction(self) -> None:
         automatic = _FakeAutomaticService()
         service = AutomaticCourtCalibrationService(automatic_service=automatic)
@@ -230,8 +256,9 @@ class AutomaticCourtCalibrationServiceTest(unittest.TestCase):
         self.assertIsInstance(detector, BatchCourtPredictor)
         self.assertEqual(
             detector.backends,
-            ("court_pose", "shuttlecourt_seg", "monotrack", "opencv"),
+            ("courtkeynet", "shuttlecourt_seg", "monotrack", "opencv"),
         )
+        self.assertEqual(detector.authoritative_backends, ("courtkeynet",))
         self.assertEqual(detector.fallback_confirm_frames, 3)
         self.assertTrue(detector.reset_unaccepted_detector_state)
         self.assertTrue(detector.lock_confirmed_fallback_geometry)

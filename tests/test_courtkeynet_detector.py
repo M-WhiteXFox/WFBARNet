@@ -98,6 +98,19 @@ class _FakeCourtKeyNet(torch.nn.Module):
         }
 
 
+class _SequenceCourtKeyNet(_FakeCourtKeyNet):
+    def __init__(self, keypoints: list[torch.Tensor]) -> None:
+        super().__init__(keypoints[-1])
+        self.keypoint_sequence = keypoints
+        self.forward_count = 0
+
+    def forward(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+        index = min(self.forward_count, len(self.keypoint_sequence) - 1)
+        self.keypoints = self.keypoint_sequence[index]
+        self.forward_count += 1
+        return super().forward(inputs)
+
+
 class CourtKeyNetDetectorTest(unittest.TestCase):
     def test_maps_normalized_corners_to_non_square_source_geometry(self) -> None:
         normalized = torch.tensor(
@@ -121,6 +134,10 @@ class CourtKeyNetDetectorTest(unittest.TestCase):
         )
         self.assertEqual(prediction.scheme, "courtkeynet")
         self.assertIn("doubles_outer", prediction.projected_lines)
+        self.assertEqual(
+            prediction.metrics["components"]["courtkeynet_confirmation_complete"],
+            1.0,
+        )
 
     def test_relative_weight_path_is_resolved_only_from_project_root(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -164,6 +181,130 @@ class CourtKeyNetDetectorTest(unittest.TestCase):
         self.assertFalse(prediction.valid)
         self.assertTrue(prediction.attempted)
         self.assertEqual(prediction.rejected_count, 1)
+
+    def test_three_fresh_consistent_frames_lock_trusted_geometry(self) -> None:
+        normalized = torch.tensor(
+            [[[0.20, 0.25], [0.80, 0.25], [0.85, 0.90], [0.15, 0.90]]],
+            dtype=torch.float32,
+        )
+        model = _SequenceCourtKeyNet([normalized, normalized, normalized])
+        detector = CourtKeyNetLineDetector(CourtKeyNetConfig(), model=model)
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+
+        first = detector.predict(frame, 0, 0, force=True)
+        second = detector.predict(frame, 1, 40, force=True)
+        trusted = detector.predict(frame, 2, 80, force=True)
+        locked = detector.predict(frame, 3, 120, force=True)
+
+        self.assertEqual(first.status, "courtkeynet confirmation 1/3")
+        self.assertEqual(second.status, "courtkeynet confirmation 2/3")
+        self.assertEqual(first.update_type, "provisional")
+        self.assertEqual(second.update_type, "provisional")
+        self.assertFalse(first.valid)
+        self.assertFalse(second.valid)
+        self.assertTrue(trusted.valid)
+        self.assertEqual(
+            trusted.metrics["components"]["courtkeynet_confirmation_complete"],
+            1.0,
+        )
+        self.assertEqual(locked.status, "locked trusted calibration")
+        self.assertEqual(locked.update_type, "locked trusted calibration")
+        self.assertFalse(locked.attempted)
+        self.assertFalse(locked.updated)
+        self.assertEqual(locked.corners, trusted.corners)
+        self.assertEqual(locked.projected_lines, trusted.projected_lines)
+        self.assertEqual(model.forward_count, 3)
+
+    def test_confirmation_compares_each_fresh_frame_to_first_anchor(self) -> None:
+        base = torch.tensor(
+            [[[0.20, 0.25], [0.80, 0.25], [0.85, 0.90], [0.15, 0.90]]],
+            dtype=torch.float32,
+        )
+        shift_three = torch.tensor([3.0 / 160.0, 0.0], dtype=torch.float32)
+        shift_six = torch.tensor([6.0 / 160.0, 0.0], dtype=torch.float32)
+        detector = CourtKeyNetLineDetector(
+            CourtKeyNetConfig(max_corner_shift_ratio=0.035),
+            model=_SequenceCourtKeyNet([base, base + shift_three, base + shift_six]),
+        )
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+
+        statuses = [
+            detector.predict(frame, index, index * 40, force=True).status
+            for index in range(3)
+        ]
+
+        self.assertEqual(
+            statuses,
+            [
+                "courtkeynet confirmation 1/3",
+                "courtkeynet confirmation 2/3",
+                "courtkeynet confirmation 1/3",
+            ],
+        )
+
+    def test_reset_and_rejected_candidates_clear_unfinished_confirmation(self) -> None:
+        normalized = torch.tensor(
+            [[[0.20, 0.25], [0.80, 0.25], [0.85, 0.90], [0.15, 0.90]]],
+            dtype=torch.float32,
+        )
+        detector = CourtKeyNetLineDetector(
+            CourtKeyNetConfig(),
+            model=_SequenceCourtKeyNet([normalized, normalized, normalized]),
+        )
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+
+        first = detector.predict(frame, 0, 0, force=True)
+        detector.reset()
+        after_reset = detector.predict(frame, 1, 40, force=True)
+
+        self.assertEqual(first.status, "courtkeynet confirmation 1/3")
+        self.assertEqual(after_reset.status, "courtkeynet confirmation 1/3")
+
+        detector.config.confidence_threshold = 1.1
+        rejected = detector.predict(frame, 2, 80, force=True)
+        detector.config.confidence_threshold = 0.5
+        after_rejection = detector.predict(frame, 3, 120, force=True)
+
+        self.assertEqual(rejected.status, "courtkeynet confidence below threshold")
+        self.assertEqual(after_rejection.status, "courtkeynet confirmation 1/3")
+
+    def test_malformed_candidate_clears_unfinished_confirmation(self) -> None:
+        normalized = torch.tensor(
+            [[[0.20, 0.25], [0.80, 0.25], [0.85, 0.90], [0.15, 0.90]]],
+            dtype=torch.float32,
+        )
+
+        class ValidMalformedValidCourtKeyNet(_FakeCourtKeyNet):
+            def __init__(self) -> None:
+                super().__init__(normalized)
+                self.forward_count = 0
+
+            def forward(self, inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+                self.forward_count += 1
+                if self.forward_count == 2:
+                    return {
+                        "heatmaps": torch.zeros(
+                            (1, 4, 4, 4),
+                            dtype=torch.int64,
+                            device=inputs.device,
+                        ),
+                        "kpts_refined": normalized.to(inputs.device),
+                    }
+                return super().forward(inputs)
+
+        detector = CourtKeyNetLineDetector(
+            CourtKeyNetConfig(),
+            model=ValidMalformedValidCourtKeyNet(),
+        )
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+
+        first = detector.predict(frame, 0, 0, force=True)
+        malformed = detector.predict(frame, 1, 40, force=True)
+        after_malformed = detector.predict(frame, 2, 80, force=True)
+
+        self.assertEqual(first.status, "courtkeynet confirmation 1/3")
+        self.assertEqual(malformed.status, "courtkeynet candidate rejected")
+        self.assertEqual(after_malformed.status, "courtkeynet confirmation 1/3")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ from typing import Callable
 import numpy as np
 
 from src.court.court_line_detector import CourtLineBackend, CourtLineDetector, create_court_line_detector
-from src.court.court_pose_detector import resolve_court_pose_weights
+from src.court.courtkeynet_detector import resolve_courtkeynet_weights
 from src.court.opencv_court_detector import CourtLinePrediction
 from src.court.shuttlecourt_seg_detector import resolve_shuttlecourt_weights
 
@@ -19,11 +19,11 @@ def default_batch_court_backends() -> tuple[CourtLineBackend, ...]:
     """Return the batch court fallback order available in the current workspace."""
     backends: list[CourtLineBackend] = []
     try:
-        resolve_court_pose_weights("assets/weights/court_pose/CourtPose.pt")
+        resolve_courtkeynet_weights("assets/weights/courtkeynet/CourtKeyNet.safetensors")
     except FileNotFoundError:
         pass
     else:
-        backends.append("court_pose")
+        backends.append("courtkeynet")
     try:
         resolve_shuttlecourt_weights("weights/shttlecourtnet")
     except FileNotFoundError:
@@ -57,6 +57,15 @@ def is_trusted_automatic_court_prediction(prediction: CourtLinePrediction) -> bo
 
     metrics = prediction.metrics if isinstance(prediction.metrics, dict) else {}
     components = metrics.get("components") if isinstance(metrics.get("components"), dict) else {}
+    if prediction.scheme == "courtkeynet":
+        combined = components.get("courtkeynet_combined_confidence")
+        threshold = components.get("courtkeynet_confidence_threshold")
+        return bool(
+            combined is not None
+            and threshold is not None
+            and _metric_value(components.get("courtkeynet_confirmation_complete")) >= 1.0
+            and _metric_value(combined) >= _metric_value(threshold)
+        )
     min_singles_support = _metric_value(components.get("singles_min_support"))
     singles_support_ratio = _metric_value(components.get("singles_support_ratio"))
     min_outer_support = _metric_value(components.get("outer_min_support"))
@@ -97,6 +106,7 @@ class BatchCourtPredictor:
     fallback_max_corner_shift_ratio: float = 0.035
     active_backend: str = ""
     errors: list[str] = field(default_factory=list)
+    authoritative_backends: tuple[CourtLineBackend, ...] = ("court_pose",)
     _active_detector: CourtLineDetector | None = field(default=None, init=False, repr=False)
     _latest_prediction: CourtLinePrediction | None = field(default=None, init=False, repr=False)
     _detectors: dict[CourtLineBackend, CourtLineDetector] = field(default_factory=dict, init=False, repr=False)
@@ -344,6 +354,10 @@ class BatchCourtPredictor:
             and self._locked_fallback_prediction is not None
         ):
             return prediction
+        if backend in self.authoritative_backends:
+            self._clear_fallback_confirmation()
+            self._clear_locked_fallback()
+            return prediction
         if not self._higher_priority_backends(backend):
             self._clear_fallback_confirmation()
             self._clear_locked_fallback()
@@ -416,7 +430,7 @@ class BatchCourtPredictor:
 
     def _locked_upgrade_backends(self, backend: str) -> tuple[CourtLineBackend, ...]:
         higher = self._higher_priority_backends(backend)
-        return ("court_pose",) if "court_pose" in higher else ()
+        return tuple(candidate for candidate in higher if candidate in self.authoritative_backends)
 
     def _recheck_backends(
         self,

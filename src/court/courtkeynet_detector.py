@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -167,10 +167,15 @@ class CourtKeyNetLineDetector:
         self._weights_path: Path | None = None
         self._device = _resolve_device(self.config.device)
         self._latest_prediction: CourtLinePrediction | None = None
+        self._confirmation_anchor: CourtLinePrediction | None = None
+        self._confirmation_count = 0
+        self._locked_prediction: CourtLinePrediction | None = None
         self._rejected_count = 0
 
     def reset(self) -> None:
         self._latest_prediction = None
+        self._clear_confirmation()
+        self._locked_prediction = None
         self._rejected_count = 0
 
     def latest_prediction(self) -> CourtLinePrediction | None:
@@ -192,6 +197,19 @@ class CourtKeyNetLineDetector:
 
         frame_id = int(frame_id)
         timestamp_ms = max(0, int(timestamp_ms))
+        if self._locked_prediction is not None:
+            prediction = replace(
+                self._locked_prediction,
+                frame_id=frame_id,
+                timestamp_ms=timestamp_ms,
+                attempted=False,
+                updated=False,
+                update_type="locked trusted calibration",
+                status="locked trusted calibration",
+            )
+            self._latest_prediction = prediction
+            return prediction
+
         height, width = frame.shape[:2]
         started_at = perf_counter()
         candidate_confidence: float | None = None
@@ -236,6 +254,7 @@ class CourtKeyNetLineDetector:
                 projected_lines=projected_lines,
             )
         except (KeyError, TypeError, ValueError) as exc:
+            self._clear_confirmation()
             self._rejected_count += 1
             prediction = self._invalid_prediction(
                 frame_id=frame_id,
@@ -253,6 +272,7 @@ class CourtKeyNetLineDetector:
         confirmation_frames = max(1, int(self.config.confirmation_frames))
         detect_ms = (perf_counter() - started_at) * 1000.0
         if candidate_confidence < threshold:
+            self._clear_confirmation()
             self._rejected_count += 1
             prediction = CourtLinePrediction(
                 frame_id=frame_id,
@@ -272,28 +292,8 @@ class CourtKeyNetLineDetector:
                 rejected_count=int(self._rejected_count),
                 **geometry,
             )
-        elif confirmation_frames > 1:
-            status = f"courtkeynet confirmation 1/{confirmation_frames}"
-            prediction = CourtLinePrediction(
-                frame_id=frame_id,
-                timestamp_ms=timestamp_ms,
-                source_size=(int(width), int(height)),
-                valid=False,
-                attempted=True,
-                updated=False,
-                update_type="courtkeynet confirmation",
-                status=status,
-                confidence=0.0,
-                candidate_confidence=candidate_confidence,
-                reason=status,
-                scheme="courtkeynet",
-                metrics={"components": components},
-                detect_ms=float(detect_ms),
-                rejected_count=int(self._rejected_count),
-                **geometry,
-            )
         else:
-            prediction = CourtLinePrediction(
+            candidate = CourtLinePrediction(
                 frame_id=frame_id,
                 timestamp_ms=timestamp_ms,
                 source_size=(int(width), int(height)),
@@ -311,9 +311,61 @@ class CourtKeyNetLineDetector:
                 rejected_count=int(self._rejected_count),
                 **geometry,
             )
+            prediction = self._confirm_candidate(candidate, confirmation_frames)
 
         self._latest_prediction = prediction
         return prediction
+
+    def _confirm_candidate(
+        self,
+        candidate: CourtLinePrediction,
+        required: int,
+    ) -> CourtLinePrediction:
+        if required <= 1:
+            count = required
+        elif (
+            self._confirmation_anchor is not None
+            and _predictions_geometry_consistent(
+                self._confirmation_anchor,
+                candidate,
+                max_corner_shift_ratio=float(self.config.max_corner_shift_ratio),
+            )
+        ):
+            self._confirmation_count = min(required, self._confirmation_count + 1)
+            count = self._confirmation_count
+        else:
+            self._confirmation_anchor = candidate
+            self._confirmation_count = 1
+            count = 1
+
+        components = dict(candidate.metrics.get("components", {}))
+        components.update(
+            {
+                "courtkeynet_confirmation_count": float(count),
+                "courtkeynet_confirmation_required": float(required),
+                "courtkeynet_confirmation_complete": float(count >= required),
+            }
+        )
+        candidate = replace(candidate, metrics={"components": components})
+        if count >= required:
+            self._clear_confirmation()
+            self._locked_prediction = candidate
+            return candidate
+
+        status = f"courtkeynet confirmation {count}/{required}"
+        return replace(
+            candidate,
+            valid=False,
+            updated=False,
+            update_type="provisional",
+            status=status,
+            confidence=0.0,
+            reason=status,
+        )
+
+    def _clear_confirmation(self) -> None:
+        self._confirmation_anchor = None
+        self._confirmation_count = 0
 
     def _ensure_model(self) -> Any:
         if self._model is None:
@@ -429,6 +481,27 @@ def _preprocess_courtkeynet_frame(
 
 def _tensor_scalar(value: torch.Tensor) -> float:
     return float(value.reshape(-1)[0].detach().cpu().item())
+
+
+def _predictions_geometry_consistent(
+    anchor: CourtLinePrediction,
+    candidate: CourtLinePrediction,
+    *,
+    max_corner_shift_ratio: float,
+) -> bool:
+    anchor_corners = np.asarray(anchor.corners, dtype=np.float32).reshape(-1, 2)
+    candidate_corners = np.asarray(candidate.corners, dtype=np.float32).reshape(-1, 2)
+    if anchor_corners.shape != (4, 2) or candidate_corners.shape != (4, 2):
+        return False
+    if not np.isfinite(anchor_corners).all() or not np.isfinite(candidate_corners).all():
+        return False
+    reference_scale = max(
+        float(np.linalg.norm(anchor_corners[2] - anchor_corners[0])),
+        float(np.linalg.norm(anchor_corners[3] - anchor_corners[1])),
+        1.0,
+    )
+    max_shift = float(np.max(np.linalg.norm(candidate_corners - anchor_corners, axis=1)))
+    return max_shift / reference_scale <= max(0.0, float(max_corner_shift_ratio))
 
 
 def _prediction_geometry(

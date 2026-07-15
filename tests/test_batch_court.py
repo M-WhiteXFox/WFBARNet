@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from src.court.batch_court import (
     BatchCourtPredictor,
+    default_batch_court_backends,
     is_trusted_automatic_court_prediction,
 )
 from src.court.opencv_court_detector import CourtLinePrediction
@@ -95,6 +97,34 @@ class _SequenceDetector(_FakeDetector):
 
 
 class BatchCourtPredictorTest(unittest.TestCase):
+    def test_default_backend_order_starts_with_available_courtkeynet(self) -> None:
+        with (
+            patch("src.court.batch_court.resolve_courtkeynet_weights") as courtkeynet,
+            patch("src.court.batch_court.resolve_shuttlecourt_weights") as shuttlecourt,
+        ):
+            backends = default_batch_court_backends()
+
+        courtkeynet.assert_called_once_with(
+            "assets/weights/courtkeynet/CourtKeyNet.safetensors"
+        )
+        shuttlecourt.assert_called_once_with("weights/shttlecourtnet")
+        self.assertEqual(
+            backends,
+            ("courtkeynet", "shuttlecourt_seg", "monotrack", "opencv"),
+        )
+
+    def test_default_backend_order_never_adds_court_pose(self) -> None:
+        with (
+            patch(
+                "src.court.batch_court.resolve_courtkeynet_weights",
+                side_effect=FileNotFoundError,
+            ),
+            patch("src.court.batch_court.resolve_shuttlecourt_weights"),
+        ):
+            backends = default_batch_court_backends()
+
+        self.assertEqual(backends, ("shuttlecourt_seg", "monotrack", "opencv"))
+
     def test_falls_back_when_first_backend_raises(self) -> None:
         calls: list[str] = []
 
@@ -408,6 +438,47 @@ class BatchCourtPredictorTest(unittest.TestCase):
         self.assertEqual(detectors["monotrack"].predict_count, 3)
         self.assertEqual(detectors["opencv"].predict_count, 3)
 
+    def test_locked_fallback_upgrades_only_through_configured_authority(self) -> None:
+        invalid_pose = _prediction(valid=False, scheme="court_pose_coarse", confidence=0.58)
+        invalid_courtkeynet = _prediction(valid=False, scheme="courtkeynet")
+        detectors = {
+            "court_pose": _SequenceDetector(
+                [
+                    invalid_pose,
+                    invalid_pose,
+                    invalid_pose,
+                    _prediction(valid=True, scheme="court_pose_white_line"),
+                ]
+            ),
+            "courtkeynet": _SequenceDetector(
+                [
+                    invalid_courtkeynet,
+                    invalid_courtkeynet,
+                    invalid_courtkeynet,
+                    _prediction(valid=True, scheme="courtkeynet"),
+                ]
+            ),
+            "opencv": _FakeDetector(_prediction(valid=True, scheme="8")),
+        }
+        predictor = BatchCourtPredictor(
+            backends=("court_pose", "courtkeynet", "opencv"),
+            detector_factory=lambda backend: detectors[backend],
+            authoritative_backends=("courtkeynet",),
+            fallback_confirm_frames=3,
+            lock_confirmed_fallback_geometry=True,
+        )
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+
+        predictor.predict(frame, 0, 0, force=True)
+        predictor.predict(frame, 1, 40, force=True)
+        predictor.predict(frame, 2, 80, force=True)
+        upgraded = predictor.predict(frame, 3, 120, force=True)
+
+        self.assertEqual(upgraded.scheme, "courtkeynet")
+        self.assertEqual(predictor.active_backend, "courtkeynet")
+        self.assertEqual(detectors["court_pose"].predict_count, 3)
+        self.assertEqual(detectors["courtkeynet"].predict_count, 4)
+
     def test_cached_fallback_reuse_does_not_advance_confirmation(self) -> None:
         fresh = _prediction(valid=True, scheme="shuttlecourt_seg", confidence=0.94)
         cached = _prediction(valid=True, scheme="shuttlecourt_seg", confidence=0.94)
@@ -532,6 +603,38 @@ class BatchCourtPredictorTest(unittest.TestCase):
 
         self.assertFalse(is_trusted_automatic_court_prediction(weak))
         self.assertTrue(is_trusted_automatic_court_prediction(trusted))
+
+    def test_courtkeynet_trust_requires_completed_native_confirmation(self) -> None:
+        plausible_corners = [
+            [30.0, 30.0],
+            [130.0, 30.0],
+            [145.0, 110.0],
+            [15.0, 110.0],
+        ]
+        components = {
+            "courtkeynet_combined_confidence": 0.82,
+            "courtkeynet_confidence_threshold": 0.50,
+        }
+        unconfirmed = _prediction(
+            valid=True,
+            scheme="courtkeynet",
+            metrics={"components": components},
+            corners=plausible_corners,
+        )
+        confirmed = _prediction(
+            valid=True,
+            scheme="courtkeynet",
+            metrics={
+                "components": {
+                    **components,
+                    "courtkeynet_confirmation_complete": 1.0,
+                }
+            },
+            corners=plausible_corners,
+        )
+
+        self.assertFalse(is_trusted_automatic_court_prediction(unconfirmed))
+        self.assertTrue(is_trusted_automatic_court_prediction(confirmed))
 
     def test_shared_trust_gate_requires_outer_lines_and_plausible_court_geometry(self) -> None:
         plausible_corners = [[30.0, 30.0], [130.0, 30.0], [145.0, 110.0], [15.0, 110.0]]
