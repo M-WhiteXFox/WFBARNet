@@ -33,6 +33,7 @@ from src.models.bst_runtime import build_bst_model
 from src.models.bst_stroke_runtime import BSTStrokeRecognizer
 from src.models.pose_branch import PoseBranch
 from src.models.track_branch import TrackBranch
+from src.postprocess.fixed_lag_track import FixedLagTrackConfig, FixedLagTrackPostProcessor
 from src.postprocess.player_distance import PlayerDistanceAccumulator
 from src.postprocess.pose import CourtPoseTargetTracker
 from src.postprocess.rally_stats import RallyStatsAccumulator
@@ -567,6 +568,7 @@ class TrackNetPlaybackWorker(QThread):
 
         prev_frame = current_frame.copy()
         base_ms = current_ms
+        source_frames = 0
         processed_frames = 0
         dropped_source_frames = 0
         visible_frames = 0
@@ -576,7 +578,10 @@ class TrackNetPlaybackWorker(QThread):
         ema_infer_fps = 0.0
         last_pose = []
         previous_track_ms: int | None = None
-        track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=self._debug_csv_path is not None)
+        track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=True)
+        track_postprocessor = FixedLagTrackPostProcessor(
+            FixedLagTrackConfig(fps=fps, delay_ms=300 if self._track_enabled else 0)
+        )
         pose_tracker = CourtPoseTargetTracker(
             max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
             court_margin=POSE_COURT_MARGIN_CM,
@@ -612,72 +617,139 @@ class TrackNetPlaybackWorker(QThread):
         )
         debug_file, debug_writer = open_track_debug_csv(self._debug_csv_path)
         frame_log_file = open_frame_log_jsonl(self._frame_log_path)
+        draining = False
 
         try:
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wfb-playback-infer") as infer_executor:
                 while not self._stop_requested:
-                    loop_start = perf_counter()
-                    frame_id = int(round((current_ms / 1000.0) * fps)) if fps > 0 else processed_frames
-                    court_prediction = None
-                    if self._court_service is not None:
-                        self._court_service.submit_frame(current_frame, frame_id, current_ms)
-                        court_prediction = self._court_service.latest_prediction()
-
-                    pose_due = self._pose_enabled and processed_frames % self._pose_stride == 0
-                    run_parallel = parallel_inference and pose_due
-                    if run_parallel:
-                        track_future = infer_executor.submit(
-                            self._track_branch.infer_candidate_results,
-                            [prev_frame, current_frame, next_frame],
-                        )
-                        pose_future = infer_executor.submit(
-                            self._pose_branch.infer,
-                            current_frame,
-                            court_prediction=court_prediction,
-                        )
-                        candidates = track_future.result()
-                        detections = pose_future.result()
+                    if draining:
+                        lagged_frame = track_postprocessor.flush_one()
+                        if lagged_frame is None:
+                            break
+                        source_final_pass = track_postprocessor.pending_count == 0
                     else:
-                        if self._track_enabled:
-                            candidates = self._track_branch.infer_candidate_results([prev_frame, current_frame, next_frame])
+                        lagged_frame = None
+                    if not draining:
+                        loop_start = perf_counter()
+                        frame_id = int(round((current_ms / 1000.0) * fps)) if fps > 0 else source_frames
+                        court_prediction = None
+                        if self._court_service is not None:
+                            self._court_service.submit_frame(current_frame, frame_id, current_ms)
+                            court_prediction = self._court_service.latest_prediction()
+
+                        pose_due = self._pose_enabled and source_frames % self._pose_stride == 0
+                        run_parallel = parallel_inference and pose_due
+                        if run_parallel:
+                            track_future = infer_executor.submit(
+                                self._track_branch.infer_candidate_results,
+                                [prev_frame, current_frame, next_frame],
+                            )
+                            pose_future = infer_executor.submit(
+                                self._pose_branch.infer,
+                                current_frame,
+                                court_prediction=court_prediction,
+                            )
+                            candidates = track_future.result()
+                            detections = pose_future.result()
                         else:
-                            candidates = []
-                        detections = (
-                            self._pose_branch.infer(current_frame, court_prediction=court_prediction)
-                            if pose_due
-                            else []
-                        )
+                            if self._track_enabled:
+                                candidates = self._track_branch.infer_candidate_results(
+                                    [prev_frame, current_frame, next_frame]
+                                )
+                            else:
+                                candidates = []
+                            detections = (
+                                self._pose_branch.infer(current_frame, court_prediction=court_prediction)
+                                if pose_due
+                                else []
+                            )
 
-                    if self._pose_enabled:
-                        last_pose = pose_tracker.update(
-                            detections,
-                            court_prediction,
-                            frame_shape=current_frame.shape,
-                        )
-                        pose_frames += int(bool(last_pose))
-                    else:
-                        pose_tracker.reset()
-                        last_pose = []
+                        if self._pose_enabled:
+                            last_pose = pose_tracker.update(
+                                detections,
+                                court_prediction,
+                                frame_shape=current_frame.shape,
+                            )
+                        else:
+                            pose_tracker.reset()
+                            last_pose = []
 
-                    if self._track_enabled:
-                        track_dt = frame_step_seconds(current_ms, previous_track_ms, fps)
-                        if track_state_gap_exceeded(track_dt):
-                            track_filter.reset()
-                            track_dt = frame_step_seconds(current_ms, None, fps)
-                        track = track_filter.update_candidates(
-                            candidates,
-                            dt=track_dt,
-                            frame_shape=current_frame.shape,
-                            court_prediction=court_prediction,
-                            person_bboxes=pose_person_bboxes(last_pose),
-                        )
-                        previous_track_ms = current_ms
-                    else:
-                        track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
+                        if self._track_enabled:
+                            track_dt = frame_step_seconds(current_ms, previous_track_ms, fps)
+                            if track_state_gap_exceeded(track_dt):
+                                track_filter.reset()
+                                track_postprocessor.reset()
+                                track_dt = frame_step_seconds(current_ms, None, fps)
+                            track = track_filter.update_candidates(
+                                candidates,
+                                dt=track_dt,
+                                frame_shape=current_frame.shape,
+                                court_prediction=court_prediction,
+                                person_bboxes=pose_person_bboxes(last_pose),
+                            )
+                            previous_track_ms = current_ms
+                        else:
+                            track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
 
-                    infer_elapsed = max(perf_counter() - loop_start, 1e-6)
-                    infer_fps = 1.0 / infer_elapsed
-                    ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
+                        infer_elapsed = max(perf_counter() - loop_start, 1e-6)
+                        infer_fps = 1.0 / infer_elapsed
+                        ema_infer_fps = (
+                            infer_fps
+                            if ema_infer_fps == 0.0
+                            else (0.85 * ema_infer_fps + 0.15 * infer_fps)
+                        )
+                        source_frames += 1
+                        track_debug = track_filter.last_debug_record() if self._track_enabled else None
+                        lagged_frame = track_postprocessor.push(
+                            track,
+                            candidates=candidates,
+                            debug_record=track_debug,
+                            payload={
+                                "frame": current_frame,
+                                "frame_id": frame_id,
+                                "position_ms": current_ms,
+                                "pose": last_pose,
+                                "court": court_prediction,
+                                "infer_fps": ema_infer_fps,
+                            },
+                        )
+                        track_filter.debug_records.clear()
+                        source_final_pass = final_pass
+
+                    if lagged_frame is None:
+                        if source_final_pass:
+                            draining = True
+                            continue
+                        prev_frame = current_frame
+                        current_frame = next_frame
+                        current_ms = next_ms
+                        ok, incoming_frame, incoming_ms = self._read_frame(cap, source_frames + 1, fps)
+                        if ok:
+                            next_frame = incoming_frame
+                            next_ms = incoming_ms
+                        else:
+                            next_frame = current_frame.copy()
+                            next_ms = current_ms + frame_interval_ms
+                            final_pass = True
+                        continue
+
+                    source_current_frame = current_frame
+                    source_current_ms = current_ms
+                    source_next_frame = next_frame
+                    source_next_ms = next_ms
+                    source_last_pose = last_pose
+                    source_court_prediction = court_prediction
+                    output = lagged_frame.payload
+                    current_frame = output["frame"]
+                    frame_id = int(output["frame_id"])
+                    current_ms = int(output["position_ms"])
+                    last_pose = output["pose"]
+                    court_prediction = output["court"]
+                    ema_infer_fps = float(output["infer_fps"])
+                    track = lagged_frame.track
+                    track_debug = lagged_frame.debug_record
+                    final_pass = bool(draining and source_final_pass)
+                    pose_frames += int(bool(last_pose))
 
                     frame_result = FrameResult(frame_id=frame_id, pose=last_pose, track=track)
                     trajectory_event = event_detector.update(
@@ -747,7 +819,6 @@ class TrackNetPlaybackWorker(QThread):
                     visible_frames += int(bool(track.visible))
                     score_sum += float(track.score)
                     avg_score = score_sum / max(processed_frames, 1)
-                    track_debug = track_filter.last_debug_record()
                     player_points = project_player_points_to_court(last_pose, court_prediction)
                     player_projections = [player_points[index] for index in sorted(player_points)]
                     if player_points:
@@ -772,7 +843,6 @@ class TrackNetPlaybackWorker(QThread):
                         rally_stats.add_bst_prediction(prediction)
                     rally_record = rally_stats.export_record()
                     write_track_debug_row(debug_writer, track_debug)
-                    track_filter.debug_records.clear()
                     if should_emit:
                         payload = {
                             "image": image,
@@ -810,14 +880,26 @@ class TrackNetPlaybackWorker(QThread):
                             while next_display_ms <= current_ms:
                                 next_display_ms += display_interval_ms
 
+                    current_frame = source_current_frame
+                    current_ms = source_current_ms
+                    next_frame = source_next_frame
+                    next_ms = source_next_ms
+                    last_pose = source_last_pose
+                    court_prediction = source_court_prediction
+                    final_pass = source_final_pass
+                    if draining:
+                        if track_postprocessor.pending_count <= 0:
+                            break
+                        continue
                     if final_pass:
-                        break
+                        draining = True
+                        continue
 
                     prev_frame = current_frame
                     current_frame = next_frame
                     current_ms = next_ms
 
-                    ok, incoming_frame, incoming_ms = self._read_frame(cap, processed_frames + 1, fps)
+                    ok, incoming_frame, incoming_ms = self._read_frame(cap, source_frames + 1, fps)
                     if ok:
                         next_frame = incoming_frame
                         next_ms = incoming_ms
@@ -836,7 +918,7 @@ class TrackNetPlaybackWorker(QThread):
 
                         ok, incoming_frame, incoming_ms = self._read_frame(
                             cap,
-                            processed_frames + dropped_source_frames + 1,
+                            source_frames + dropped_source_frames + 1,
                             fps,
                         )
                         if ok:
@@ -959,6 +1041,7 @@ class CameraInferenceWorker(QThread):
         prev_frame = first_frame.copy()
         current_frame = first_frame
         next_frame = second_frame
+        source_frames = 0
         processed_frames = 0
         visible_frames = 0
         pose_frames = 0
@@ -966,7 +1049,10 @@ class CameraInferenceWorker(QThread):
         ema_infer_fps = 0.0
         last_pose = []
         previous_track_ms: int | None = None
-        track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=self._debug_csv_path is not None)
+        track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=True)
+        track_postprocessor = FixedLagTrackPostProcessor(
+            FixedLagTrackConfig(fps=fps, delay_ms=300 if self._track_enabled else 0)
+        )
         pose_tracker = CourtPoseTargetTracker(
             max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
             court_margin=POSE_COURT_MARGIN_CM,
@@ -1005,14 +1091,14 @@ class CameraInferenceWorker(QThread):
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wfb-camera-infer") as infer_executor:
                 while not self._stop_requested:
                     loop_start = perf_counter()
-                    current_frame_id = processed_frames
+                    current_frame_id = source_frames
                     position_ms = clock.elapsed()
                     court_prediction = None
                     if self._court_service is not None:
                         self._court_service.submit_frame(current_frame, current_frame_id, position_ms)
                         court_prediction = self._court_service.latest_prediction()
 
-                    pose_due = self._pose_enabled and processed_frames % self._pose_stride == 0
+                    pose_due = self._pose_enabled and source_frames % self._pose_stride == 0
                     run_parallel = parallel_inference and pose_due
                     if run_parallel:
                         track_future = infer_executor.submit(
@@ -1043,7 +1129,6 @@ class CameraInferenceWorker(QThread):
                             court_prediction,
                             frame_shape=current_frame.shape,
                         )
-                        pose_frames += int(bool(last_pose))
                     else:
                         pose_tracker.reset()
                         last_pose = []
@@ -1052,6 +1137,7 @@ class CameraInferenceWorker(QThread):
                         track_dt = frame_step_seconds(position_ms, previous_track_ms, fps)
                         if track_state_gap_exceeded(track_dt):
                             track_filter.reset()
+                            track_postprocessor.reset()
                             track_dt = frame_step_seconds(position_ms, None, fps)
                         track = track_filter.update_candidates(
                             candidates,
@@ -1068,11 +1154,50 @@ class CameraInferenceWorker(QThread):
                     infer_fps = 1.0 / infer_elapsed
                     ema_infer_fps = infer_fps if ema_infer_fps == 0.0 else (0.85 * ema_infer_fps + 0.15 * infer_fps)
 
+                    source_frames += 1
+                    track_debug = track_filter.last_debug_record() if self._track_enabled else None
+                    lagged_frame = track_postprocessor.push(
+                        track,
+                        candidates=candidates,
+                        debug_record=track_debug,
+                        payload={
+                            "frame": current_frame,
+                            "frame_id": current_frame_id,
+                            "position_ms": position_ms,
+                            "pose": last_pose,
+                            "court": court_prediction,
+                            "infer_fps": ema_infer_fps,
+                        },
+                    )
+                    track_filter.debug_records.clear()
+                    if lagged_frame is None:
+                        prev_frame = current_frame
+                        current_frame = next_frame
+                        ok, incoming_frame = cap.read()
+                        if not ok or incoming_frame is None:
+                            break
+                        next_frame = incoming_frame
+                        continue
+
+                    source_current_frame = current_frame
+                    source_next_frame = next_frame
+                    source_last_pose = last_pose
+                    source_court_prediction = court_prediction
+                    output = lagged_frame.payload
+                    current_frame = output["frame"]
+                    current_frame_id = int(output["frame_id"])
+                    position_ms = int(output["position_ms"])
+                    last_pose = output["pose"]
+                    court_prediction = output["court"]
+                    ema_infer_fps = float(output["infer_fps"])
+                    track = lagged_frame.track
+                    track_debug = lagged_frame.debug_record
+
                     processed_frames += 1
+                    pose_frames += int(bool(last_pose))
                     visible_frames += int(bool(track.visible))
                     score_sum += float(track.score)
                     avg_score = score_sum / max(processed_frames, 1)
-                    track_debug = track_filter.last_debug_record()
                     player_points = project_player_points_to_court(last_pose, court_prediction)
                     player_projections = [player_points[index] for index in sorted(player_points)]
                     if player_points:
@@ -1093,7 +1218,6 @@ class CameraInferenceWorker(QThread):
                         else False,
                     )
                     write_track_debug_row(debug_writer, track_debug)
-                    track_filter.debug_records.clear()
                     frame_result = FrameResult(frame_id=current_frame_id, pose=last_pose, track=track)
                     trajectory_event = event_detector.update(
                         frame_result,
@@ -1193,6 +1317,10 @@ class CameraInferenceWorker(QThread):
                         while next_display_ms <= position_ms:
                             next_display_ms += display_interval_ms
 
+                    current_frame = source_current_frame
+                    next_frame = source_next_frame
+                    last_pose = source_last_pose
+                    court_prediction = source_court_prediction
                     prev_frame = current_frame
                     current_frame = next_frame
                     ok, incoming_frame = cap.read()
@@ -1369,6 +1497,7 @@ class BatchInferenceWorker(QThread):
             next_ms = current_ms + frame_interval_ms
 
         prev_frame = current_frame.copy()
+        source_frames = 0
         processed_frames = 0
         visible_frames = 0
         pose_frames = 0
@@ -1376,7 +1505,10 @@ class BatchInferenceWorker(QThread):
         final_pass = False
         last_pose = []
         previous_track_ms: int | None = None
-        track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=False)
+        track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=True)
+        track_postprocessor = FixedLagTrackPostProcessor(
+            FixedLagTrackConfig(fps=fps, delay_ms=300 if self._track_enabled else 0)
+        )
         pose_tracker = CourtPoseTargetTracker(
             max_missing_frames=max(self._pose_stride, int(round(fps * POSE_MAX_MISSING_SECONDS))),
             court_margin=POSE_COURT_MARGIN_CM,
@@ -1413,17 +1545,75 @@ class BatchInferenceWorker(QThread):
         )
         progress_every = max(1, int(round(fps)))
 
+        def consume_lagged_frame(lagged_frame: Any) -> None:
+            nonlocal processed_frames, visible_frames, pose_frames, score_sum, bst_recognizer
+            output = lagged_frame.payload
+            track = lagged_frame.track
+            frame_id = int(output["frame_id"])
+            timestamp_ms = int(output["position_ms"])
+            pose = output["pose"]
+            court_prediction = output["court"]
+            frame_shape = output["frame_shape"]
+
+            processed_frames += 1
+            visible_frames += int(bool(track.visible))
+            pose_frames += int(bool(pose))
+            score_sum += float(track.score)
+            player_points = project_player_points_to_court(pose, court_prediction)
+            if player_points:
+                distance_accumulator.update(player_points)
+            else:
+                distance_accumulator.reset_tracking_points()
+            ball_visual_intersection = project_ball_visual_intersection(track, court_prediction)
+            rally_stats.update_frame(
+                timestamp_ms=timestamp_ms,
+                player_points=player_points,
+                ball_visible=bool(track.visible),
+                ball_xy=track.ball_xy,
+                ball_court_xy=ball_visual_intersection,
+                ball_score=float(track.score),
+                court_valid=bool(prediction_value(court_prediction, "valid", False)),
+            )
+
+            frame_result = FrameResult(frame_id=frame_id, pose=pose, track=track)
+            trajectory_event = event_detector.update(
+                frame_result,
+                timestamp_ms=timestamp_ms,
+                frame_shape=frame_shape,
+                court_prediction=court_prediction,
+            )
+            hit_event = (
+                trajectory_event
+                if isinstance(trajectory_event, dict) and trajectory_event.get("event_type") == "hit"
+                else None
+            )
+            rally_stats.add_trajectory_event(trajectory_event)
+
+            if bst_recognizer is not None:
+                try:
+                    bst_prediction = bst_recognizer.update(
+                        frame_result,
+                        hit_event=hit_event,
+                        court_prediction=court_prediction,
+                    )
+                except Exception as exc:
+                    pending_bst_errors.append(str(exc))
+                    bst_recognizer = None
+                else:
+                    if bst_prediction is not None:
+                        rally_stats.add_bst_prediction(bst_prediction)
+
         try:
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wfb-batch-infer") as infer_executor:
                 while not self._stop_requested:
-                    frame_id = int(round((current_ms / 1000.0) * fps)) if fps > 0 else processed_frames
+                    frame_id = int(round((current_ms / 1000.0) * fps)) if fps > 0 else source_frames
                     court_prediction = court_predictor.predict(
                         current_frame,
                         frame_id,
                         current_ms,
-                        force=processed_frames == 0,
+                        force=source_frames == 0,
                     )
-                    pose_due = self._pose_enabled and processed_frames % self._pose_stride == 0
+                    pose_due = self._pose_enabled and source_frames % self._pose_stride == 0
                     run_parallel = parallel_inference and pose_due
                     if run_parallel:
                         track_future = infer_executor.submit(
@@ -1455,7 +1645,6 @@ class BatchInferenceWorker(QThread):
                             court_prediction,
                             frame_shape=current_frame.shape,
                         )
-                        pose_frames += int(bool(last_pose))
                     else:
                         pose_tracker.reset()
                         last_pose = []
@@ -1464,6 +1653,7 @@ class BatchInferenceWorker(QThread):
                         track_dt = frame_step_seconds(current_ms, previous_track_ms, fps)
                         if track_state_gap_exceeded(track_dt):
                             track_filter.reset()
+                            track_postprocessor.reset()
                             track_dt = frame_step_seconds(current_ms, None, fps)
                         track = track_filter.update_candidates(
                             candidates,
@@ -1476,56 +1666,27 @@ class BatchInferenceWorker(QThread):
                     else:
                         track = TrackResult(ball_xy=[-1.0, -1.0], visible=0, score=0.0)
 
-                    processed_frames += 1
-                    visible_frames += int(bool(track.visible))
-                    score_sum += float(track.score)
-                    player_points = project_player_points_to_court(last_pose, court_prediction)
-                    if player_points:
-                        distance_accumulator.update(player_points)
-                    else:
-                        distance_accumulator.reset_tracking_points()
-                    ball_visual_intersection = project_ball_visual_intersection(track, court_prediction)
-                    rally_stats.update_frame(
-                        timestamp_ms=current_ms,
-                        player_points=player_points,
-                        ball_visible=bool(track.visible),
-                        ball_xy=track.ball_xy,
-                        ball_court_xy=ball_visual_intersection,
-                        ball_score=float(track.score),
-                        court_valid=bool(prediction_value(court_prediction, "valid", False)),
+                    source_frames += 1
+                    track_debug = track_filter.last_debug_record() if self._track_enabled else None
+                    lagged_frame = track_postprocessor.push(
+                        track,
+                        candidates=candidates,
+                        debug_record=track_debug,
+                        payload={
+                            "frame_id": frame_id,
+                            "position_ms": current_ms,
+                            "pose": last_pose,
+                            "court": court_prediction,
+                            "frame_shape": current_frame.shape,
+                        },
                     )
+                    track_filter.debug_records.clear()
+                    if lagged_frame is not None:
+                        consume_lagged_frame(lagged_frame)
 
-                    frame_result = FrameResult(frame_id=frame_id, pose=last_pose, track=track)
-                    trajectory_event = event_detector.update(
-                        frame_result,
-                        timestamp_ms=current_ms,
-                        frame_shape=current_frame.shape,
-                        court_prediction=court_prediction,
-                    )
-                    hit_event = (
-                        trajectory_event
-                        if isinstance(trajectory_event, dict) and trajectory_event.get("event_type") == "hit"
-                        else None
-                    )
-                    rally_stats.add_trajectory_event(trajectory_event)
-
-                    if bst_recognizer is not None:
-                        try:
-                            bst_prediction = bst_recognizer.update(
-                                frame_result,
-                                hit_event=hit_event,
-                                court_prediction=court_prediction,
-                            )
-                        except Exception as exc:
-                            pending_bst_errors.append(str(exc))
-                            bst_recognizer = None
-                        else:
-                            if bst_prediction is not None:
-                                rally_stats.add_bst_prediction(bst_prediction)
-
-                    if processed_frames % progress_every == 0 or final_pass:
+                    if source_frames % progress_every == 0 or final_pass:
                         local_progress = (
-                            min(1.0, processed_frames / frame_count)
+                            min(1.0, source_frames / frame_count)
                             if frame_count > 0
                             else 0.0
                         )
@@ -1537,7 +1698,7 @@ class BatchInferenceWorker(QThread):
                                 "video_name": video_path.name,
                                 "local_progress": local_progress,
                                 "overall_progress": (index + local_progress) / max(1, total),
-                                "processed_frames": processed_frames,
+                                "processed_frames": source_frames,
                             }
                         )
 
@@ -1547,7 +1708,7 @@ class BatchInferenceWorker(QThread):
                     prev_frame = current_frame
                     current_frame = next_frame
                     current_ms = next_ms
-                    ok, incoming_frame, incoming_ms = self._read_frame(cap, processed_frames + 1, fps)
+                    ok, incoming_frame, incoming_ms = self._read_frame(cap, source_frames + 1, fps)
                     if ok:
                         next_frame = incoming_frame
                         next_ms = incoming_ms
@@ -1555,6 +1716,9 @@ class BatchInferenceWorker(QThread):
                         next_frame = current_frame.copy()
                         next_ms = current_ms + frame_interval_ms
                         final_pass = True
+                if not self._stop_requested:
+                    for lagged_frame in track_postprocessor.flush():
+                        consume_lagged_frame(lagged_frame)
         finally:
             cap.release()
 

@@ -8,6 +8,8 @@
   "pose_weight": "assets/weights/pose/yolo26s-pose.pt",
   "pose_bbox_mode": "whole_image",
   "track_weight": "assets/weights/track/model_best.pt",
+  "track_score_thr": 0.35,
+  "track_postprocess_route": "auto",
   "save_json": true,
   "save_csv": true,
   "save_npy": true,

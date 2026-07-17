@@ -26,6 +26,7 @@ from src.postprocess.track_filter import BallTrackFilter, BallTrackFilterConfig 
 
 Point = tuple[float, float]
 MEASURED_ACTIONS = {"accept", "bootstrap_accept", "relock_accept"}
+DEFAULT_DELAY_MS = (0, 40, 80, 100, 160, 240, 400, 600, 800, 1000)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -46,6 +47,13 @@ def _parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         metavar="DATASET:START:END",
+    )
+    parser.add_argument(
+        "--delay-ms",
+        action="append",
+        type=int,
+        default=[],
+        help="Fixed output delay to evaluate in milliseconds; may be repeated.",
     )
     return parser.parse_args()
 
@@ -146,8 +154,12 @@ def _is_reliable_measurement(row: dict[str, Any], min_score: float = 0.50) -> bo
     )
 
 
-def apply_hit_aware_short_gap(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def apply_hit_aware_short_gap(
+    rows: list[dict[str, Any]],
+    max_gap_frames: int = 2,
+) -> list[dict[str, Any]]:
     repaired = copy.deepcopy(rows)
+    gap_limit = max(0, int(max_gap_frames))
     index = 1
     while index < len(repaired) - 1:
         if repaired[index]["point"] is not None:
@@ -160,24 +172,37 @@ def apply_hit_aware_short_gap(rows: list[dict[str, Any]]) -> list[dict[str, Any]
         gap_length = end - start + 1
         left_index = start - 1
         right_index = end + 1
-        if gap_length > 2 or right_index >= len(repaired):
+        if gap_length > gap_limit or right_index >= len(repaired):
             continue
         left = repaired[left_index]
         right = repaired[right_index]
-        if not (_is_reliable_measurement(left, 0.55) and _is_reliable_measurement(right, 0.55)):
+        low_motion_single_gap = (
+            gap_length == 1
+            and _is_reliable_measurement(left, 0.45)
+            and _is_reliable_measurement(right, 0.45)
+            and left["point"] is not None
+            and right["point"] is not None
+            and _distance(left["point"], right["point"]) <= 12.0
+        )
+        if not low_motion_single_gap and not (
+            _is_reliable_measurement(left, 0.55)
+            and _is_reliable_measurement(right, 0.55)
+        ):
             continue
         if any("ground_bounce" in repaired[pos]["reason"] for pos in range(start, right_index + 1)):
             continue
-        if left_index < 1 or not _is_reliable_measurement(repaired[left_index - 1], 0.50):
-            continue
-        before = repaired[left_index - 1]["point"]
         left_point = left["point"]
         right_point = right["point"]
-        assert before is not None and left_point is not None and right_point is not None
-        incoming = _vector(before, left_point)
+        assert left_point is not None and right_point is not None
         crossing = _vector(left_point, right_point, gap_length + 1)
-        if math.degrees(math.acos(_cosine(incoming, crossing))) >= 100.0:
-            continue
+        if not low_motion_single_gap:
+            if left_index < 1 or not _is_reliable_measurement(repaired[left_index - 1], 0.50):
+                continue
+            before = repaired[left_index - 1]["point"]
+            assert before is not None
+            incoming = _vector(before, left_point)
+            if math.degrees(math.acos(_cosine(incoming, crossing))) >= 100.0:
+                continue
         if math.hypot(*crossing) > 80.0:
             continue
         for offset, pos in enumerate(range(start, right_index), start=1):
@@ -191,8 +216,12 @@ def apply_hit_aware_short_gap(rows: list[dict[str, Any]]) -> list[dict[str, Any]
     return repaired
 
 
-def apply_occlusion_relock(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def apply_occlusion_relock(
+    rows: list[dict[str, Any]],
+    max_gap_frames: int = 3,
+) -> list[dict[str, Any]]:
     repaired = copy.deepcopy(rows)
+    gap_limit = max(0, int(max_gap_frames))
     index = 0
     while index < len(repaired):
         if repaired[index]["point"] is not None:
@@ -202,7 +231,7 @@ def apply_occlusion_relock(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         while index < len(repaired) and repaired[index]["point"] is None:
             index += 1
         end = index - 1
-        if end - start + 1 > 3 or index >= len(repaired):
+        if end - start + 1 > gap_limit or index >= len(repaired):
             continue
         context_start = max(0, start - 6)
         context_reasons = {row["reason"] for row in repaired[context_start:start]}
@@ -272,10 +301,16 @@ def _last_two_reliable(rows: list[dict[str, Any]], before: int) -> tuple[int, Po
     return None
 
 
-def apply_fixed_lag_branch_recovery(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def apply_fixed_lag_branch_recovery(
+    rows: list[dict[str, Any]],
+    max_future_frames: int = 5,
+) -> list[dict[str, Any]]:
     repaired = copy.deepcopy(rows)
+    future_limit = max(0, int(max_future_frames))
+    if future_limit < 3:
+        return repaired
     index = 2
-    while index < len(repaired) - 3:
+    while index < len(repaired) - 1:
         current = repaired[index]
         history = _last_two_reliable(repaired, index)
         if current["point"] is None or history is None:
@@ -308,7 +343,10 @@ def apply_fixed_lag_branch_recovery(rows: list[dict[str, Any]]) -> list[dict[str
         previous_index = last_index
         chain_velocity = _vector(previous_point, chosen["point"], first_future - previous_index)
         rejoin_index: int | None = None
-        for pos in range(first_future + 1, min(len(repaired), index + 6)):
+        for pos in range(
+            first_future + 1,
+            min(len(repaired), index + future_limit + 1),
+        ):
             predicted_chain = _add(chain[-1][1]["point"], chain_velocity)
             baseline_point = repaired[pos]["point"]
             if baseline_point is not None and _distance(baseline_point, predicted_chain) <= 15.0:
@@ -575,6 +613,9 @@ def _write_report(path: Path, summary: dict[str, Any], threshold: float) -> None
 
 def main() -> None:
     args = _parse_args()
+    delay_values_ms = sorted(set(args.delay_ms or DEFAULT_DELAY_MS))
+    if any(value < 0 or value > 1000 for value in delay_values_ms):
+        raise ValueError("--delay-ms must be between 0 and 1000")
     active_ranges: dict[str, tuple[int, int]] = {}
     for value in args.active_range:
         name, start, end = value.split(":", maxsplit=2)
@@ -586,6 +627,7 @@ def main() -> None:
     for name in args.datasets:
         if name not in active_ranges:
             raise ValueError(f"Missing --active-range for dataset {name}")
+        fps = float(cache_meta["datasets"][name]["fps"])
         baseline = replay_baseline(
             name,
             dataset_dir=args.dataset_dir,
@@ -604,12 +646,33 @@ def main() -> None:
             "fixed_lag_branch": fixed_lag,
             "combined": combined,
         }
+        delay_frames: dict[str, int] = {}
+        for delay_ms in delay_values_ms:
+            variant_name = f"delay_{delay_ms}ms"
+            lag_frames = max(0, int(round(fps * delay_ms / 1000.0)))
+            delay_frames[variant_name] = lag_frames
+            if lag_frames == 0:
+                variants[variant_name] = copy.deepcopy(baseline)
+                continue
+            delayed = apply_fixed_lag_branch_recovery(
+                baseline,
+                max_future_frames=lag_frames,
+            )
+            delayed = apply_hit_aware_short_gap(
+                delayed,
+                max_gap_frames=lag_frames,
+            )
+            variants[variant_name] = apply_occlusion_relock(
+                delayed,
+                max_gap_frames=lag_frames,
+            )
         width = float(cache_meta["datasets"][name]["width"])
         paper_threshold = 4.0 * width / 512.0
         summary = {
             "active_range": active_ranges[name],
             "project_threshold_px": float(args.distance_threshold),
             "paper_scaled_threshold_px": paper_threshold,
+            "delay_frames": delay_frames,
             "oracle": _oracle(baseline, float(args.distance_threshold)),
             "variants": {
                 variant: _summarize_variant(rows, float(args.distance_threshold), paper_threshold)

@@ -10,8 +10,8 @@ import cv2
 import numpy as np
 
 from src.models.track_branch import TrackBranch
+from src.postprocess.adaptive_track import AUTO_TRACK_ROUTE, AdaptiveTrackPostProcessor
 from src.postprocess.track_filter import TrackFilterAlgorithm
-from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
 from src.utils.exporters import export_csv, export_json, export_npy, export_track_debug_csv
 from src.utils.structures import FrameResult, TrackResult
 from src.utils.visualize import TrackTrailRenderer
@@ -34,6 +34,7 @@ class TrackNetRealtimeRunner:
     save_video: bool = True
     window_name: str = "TrackNet Realtime"
     max_frames: Optional[int] = None
+    postprocess_route: str = AUTO_TRACK_ROUTE
 
     def run(
         self,
@@ -90,8 +91,36 @@ class TrackNetRealtimeRunner:
         frame_id = 0
         ema_fps = 0.0
         tick_frequency = cv2.getTickFrequency()
-        track_filter = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=True)
+        track_postprocessor = AdaptiveTrackPostProcessor(
+            fps=fps,
+            route=self.postprocess_route,
+            reliable_context=False,
+        )
         trail_renderer = TrackTrailRenderer(fps=fps, history_seconds=0.5)
+        lagged_debug_records: list[dict[str, object]] = []
+
+        def consume_lagged_frame(lagged_frame) -> bool:
+            result = FrameResult(
+                frame_id=int(lagged_frame.payload["frame_id"]),
+                pose=[],
+                track=lagged_frame.track,
+            )
+            results.append(result)
+            if lagged_frame.debug_record is not None:
+                lagged_debug_records.append(lagged_frame.debug_record)
+            vis_frame = self._draw_overlay(
+                lagged_frame.payload["frame"].copy(),
+                result,
+                ema_fps,
+                trail_renderer,
+            )
+            if writer is not None:
+                writer.write(vis_frame)
+            if not self.display:
+                return False
+            cv2.imshow(self.window_name, vis_frame)
+            key = cv2.waitKey(1) & 0xFF
+            return key in (27, ord("q"))
 
         while True:
             start_tick = cv2.getTickCount()
@@ -99,21 +128,17 @@ class TrackNetRealtimeRunner:
             candidates = self.track_branch.infer_candidate_results([prev_frame, curr_frame, next_frame])
             track_dt = _frame_step_seconds(curr_capture_time, previous_track_time, fps)
             if track_dt > TRACK_STATE_RESET_GAP_SECONDS:
-                _reset_filter_state_preserving_debug(track_filter)
+                track_postprocessor.reset()
                 track_dt = 1.0 / fps
-            track = track_filter.update_candidates(candidates, dt=track_dt, frame_shape=curr_frame.shape)
             previous_track_time = curr_capture_time
-            result = FrameResult(frame_id=frame_id, pose=[], track=track)
-            results.append(result)
-
-            vis_frame = self._draw_overlay(curr_frame.copy(), result, ema_fps, trail_renderer)
-            if writer is not None:
-                writer.write(vis_frame)
-            if self.display:
-                cv2.imshow(self.window_name, vis_frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q")):
-                    break
+            lagged_frames = track_postprocessor.push(
+                candidates,
+                dt=track_dt,
+                frame_shape=curr_frame.shape,
+                payload={"frame_id": frame_id, "frame": curr_frame},
+            )
+            if any(consume_lagged_frame(frame) for frame in lagged_frames):
+                break
 
             end_tick = cv2.getTickCount()
             elapsed = max((end_tick - start_tick) / tick_frequency, 1e-6)
@@ -136,21 +161,20 @@ class TrackNetRealtimeRunner:
                 final_candidates = self.track_branch.infer_candidate_results([prev_frame, curr_frame, next_frame])
                 final_dt = _frame_step_seconds(curr_capture_time, previous_track_time, fps)
                 if final_dt > TRACK_STATE_RESET_GAP_SECONDS:
-                    _reset_filter_state_preserving_debug(track_filter)
+                    track_postprocessor.reset()
                     final_dt = 1.0 / fps
-                final_track = track_filter.update_candidates(
+                final_lagged_frames = track_postprocessor.push(
                     final_candidates,
                     dt=final_dt,
                     frame_shape=curr_frame.shape,
+                    payload={"frame_id": frame_id, "frame": curr_frame},
                 )
-                final_result = FrameResult(frame_id=frame_id, pose=[], track=final_track)
-                results.append(final_result)
-                final_vis = self._draw_overlay(curr_frame.copy(), final_result, ema_fps, trail_renderer)
-                if writer is not None:
-                    writer.write(final_vis)
-                if self.display:
-                    cv2.imshow(self.window_name, final_vis)
-                    cv2.waitKey(1)
+                for final_lagged_frame in final_lagged_frames:
+                    if consume_lagged_frame(final_lagged_frame):
+                        break
+                for pending_frame in track_postprocessor.flush():
+                    if consume_lagged_frame(pending_frame):
+                        break
                 break
             next_frame = incoming
             next_capture_time = incoming_capture_time
@@ -168,7 +192,7 @@ class TrackNetRealtimeRunner:
             export_csv(results, self.output_dir / "tracknet_realtime_results.csv")
         if save_npy:
             export_npy(results, self.output_dir / "tracknet_realtime_results.npy")
-        export_track_debug_csv(track_filter.debug_records, self.output_dir / "tracknet_realtime_debug.csv")
+        export_track_debug_csv(lagged_debug_records, self.output_dir / "tracknet_realtime_debug.csv")
 
         return results
 

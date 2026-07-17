@@ -61,6 +61,35 @@ class LiteratureTrajectoryMethodsTests(unittest.TestCase):
 
         self.assertIsNone(repaired[2]["point"])
 
+    def test_single_low_motion_gap_allows_small_apex_reversal(self) -> None:
+        rows = [
+            _row(0, (0.0, 0.0)),
+            _row(1, (10.0, 0.0), score=0.70),
+            _row(2, None, action="reject"),
+            _row(3, (8.0, 0.0), score=0.46),
+        ]
+
+        repaired = apply_hit_aware_short_gap(rows, max_gap_frames=1)
+
+        self.assertEqual(repaired[2]["point"], (9.0, 0.0))
+
+    def test_short_gap_respects_available_future_window(self) -> None:
+        rows = [
+            _row(0, (0.0, 0.0)),
+            _row(1, (10.0, 0.0)),
+            _row(2, None, action="reject"),
+            _row(3, None, action="reject"),
+            _row(4, None, action="reject"),
+            _row(5, (50.0, 0.0)),
+        ]
+
+        insufficient = apply_hit_aware_short_gap(rows, max_gap_frames=2)
+        repaired = apply_hit_aware_short_gap(rows, max_gap_frames=3)
+
+        self.assertIsNone(insufficient[2]["point"])
+        self.assertEqual(repaired[2]["point"], (20.0, 0.0))
+        self.assertEqual(repaired[4]["point"], (40.0, 0.0))
+
     def test_occlusion_relock_uses_consistent_high_score_chain(self) -> None:
         rows = [
             _row(0, (0.0, 0.0), reason="person_occlusion_prediction"),
@@ -101,8 +130,10 @@ class LiteratureTrajectoryMethodsTests(unittest.TestCase):
             _row(6, (30.0, 0.0), candidates=[(30.0, 0.0, 0.9)]),
         ]
 
-        repaired = apply_fixed_lag_branch_recovery(rows)
+        insufficient = apply_fixed_lag_branch_recovery(rows, max_future_frames=2)
+        repaired = apply_fixed_lag_branch_recovery(rows, max_future_frames=3)
 
+        self.assertEqual(insufficient[3]["point"], (15.0, 45.0))
         self.assertEqual(repaired[3]["point"], (15.0, 0.0))
         self.assertEqual(repaired[4]["point"], (20.0, 0.0))
         self.assertEqual(repaired[5]["point"], (25.0, 0.0))

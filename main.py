@@ -9,6 +9,7 @@ from typing import Optional
 
 from src.models.pose_branch import PoseBranch
 from src.models.track_branch import TrackBranch
+from src.postprocess.adaptive_track import TRACK_ROUTES
 from src.runners.pose_video_runner import PoseVideoRunner
 from src.runners.tracknet_realtime_runner import TrackNetRealtimeRunner
 from src.runners.track_video_runner import TrackVideoRunner
@@ -41,7 +42,8 @@ class RuntimeConfig:
     max_persons: int = 2
     track_weight: str = str(PROJECT_ROOT / "assets" / "weights" / "track" / "model_best.pt")
     track_input_size: tuple[int, int] = (512, 288)
-    track_score_thr: float = 0.5
+    track_score_thr: float = 0.35
+    track_postprocess_route: str = "auto"
     track_max_frames: Optional[int] = None
     realtime_display: bool = True
     realtime_save_video: bool = True
@@ -72,6 +74,10 @@ def runtime_config_from_mapping(data: dict[str, object]) -> RuntimeConfig:
             known[key] = (int(value[0]), int(value[1]))
 
     config = RuntimeConfig(**known)
+    if config.track_postprocess_route not in TRACK_ROUTES:
+        raise ValueError(
+            f"Unknown track_postprocess_route: {config.track_postprocess_route!r}"
+        )
     config.extra.update(extra)
     return config
 
@@ -93,6 +99,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default=None, help="Inference device: auto, cpu, cuda, cuda:0, ...")
     parser.add_argument("--pose-weight", default=None, help="YOLO/MMPose pose checkpoint path.")
     parser.add_argument("--track-weight", default=None, help="TrackNet checkpoint or TensorRT engine path.")
+    parser.add_argument(
+        "--track-postprocess-route",
+        default=None,
+        choices=sorted(TRACK_ROUTES),
+        help="Measured-track route: auto, candidate_graph, or contextual.",
+    )
     parser.add_argument("--no-vis", action="store_true", help="Disable visualization video export.")
     return parser.parse_args(argv)
 
@@ -107,6 +119,7 @@ def build_runtime_config_from_args(argv: list[str] | None = None) -> RuntimeConf
         "device": args.device,
         "pose_weight": args.pose_weight,
         "track_weight": args.track_weight,
+        "track_postprocess_route": args.track_postprocess_route,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -148,6 +161,7 @@ def build_runner(config: RuntimeConfig) -> UnifiedRunner:
         output_dir=Path(config.output_dir),
         device=device,
         execution_mode=config.execution_mode,
+        postprocess_route=config.track_postprocess_route,
     )
 
 
@@ -166,6 +180,7 @@ def build_track_realtime_runner(config: RuntimeConfig) -> TrackNetRealtimeRunner
         save_video=config.realtime_save_video,
         window_name=config.realtime_window_name,
         max_frames=config.realtime_max_frames,
+        postprocess_route=config.track_postprocess_route,
     )
 
 
@@ -200,6 +215,7 @@ def build_track_runner(config: RuntimeConfig) -> TrackVideoRunner:
     return TrackVideoRunner(
         track_branch=track_branch,
         output_dir=Path(config.output_dir),
+        postprocess_route=config.track_postprocess_route,
     )
 
 

@@ -108,6 +108,7 @@ python main.py --config configs/default_infer.json --source .\demo.mp4 --pipelin
 - `--source`：输入视频路径或摄像头编号；为空时进入桌面界面。
 - `--output-dir`：输出目录。
 - `--device`：运行设备，可使用 `auto` 让程序自动选择。
+- `--track-postprocess-route`：轨迹测量路线；`auto` 在无上下文流程使用候选图，在统一流程保留人物上下文后处理。
 - `--no-vis`：不导出可视化视频，只保留数据结果。
 
 多数用户建议优先使用桌面界面；命令行更适合批量处理或自动化流程。
@@ -150,7 +151,7 @@ WFBARNet/
 
 - [TrackNetV3](https://github.com/qaz812345/TrackNetV3)：羽毛球轨迹识别。
 - [Ultralytics](https://github.com/ultralytics/ultralytics)：YOLO 姿态识别。
-- [CourtKeyNet](https://github.com/adithyanraj03/CourtKeyNet)：原生球场关键点架构与权重格式；本项目固定源提交为 `f852db65b5d435db16f3c624d2d51dc78b903705`，按 MIT License 使用并保留上游归属。
+- [CourtKeyNet](https://github.com/adithyanraj03/CourtKeyNet)：原生球场关键点架构与权重格式。
 - [TrackNetV3 INT8 Optimization](https://github.com/nickluo/TrackNetV3)：TrackNetV3 INT8 优化。
 - [BST Badminton Stroke Type Transformer](https://github.com/Va6lue/BST-Badminton-Stroke-type-Transformer)：击球动作类型识别。
 

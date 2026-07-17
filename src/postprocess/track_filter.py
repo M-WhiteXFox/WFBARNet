@@ -66,6 +66,7 @@ class BallTrackFilterConfig:
     impact_relock_min_angle_deg: float = 94.0
     impact_relock_max_prediction_error_px: float = 260.0
     impact_relock_max_prediction_error_per_missed_px: float = 28.0
+    impact_relock_immediate_player_padding_px: float = 96.0
     close_gate_confidence: float = 0.50
     close_gate_px: float = 72.0
     inertia_relax_confidence: float = 0.65
@@ -153,6 +154,8 @@ class BallTrackFilterConfig:
     static_hotspot_memory_frames: int = 90
     static_hotspot_suppression_frames: int = 45
     static_hotspot_tracking_speed_px_per_sec: float = 50.0
+    static_hotspot_tracked_claim_confidence: float = 0.65
+    static_hotspot_tracked_claim_person_padding_px: float = 48.0
     static_hotspot_edge_band_ratio: float = 0.07
     static_hotspot_edge_max_motion_px: float = 32.0
     bootstrap_static_max_x_span_px: float = 3.0
@@ -162,12 +165,16 @@ class BallTrackFilterConfig:
     literature_short_gap_min_real_points: int = 3
     literature_short_gap_top_band_ratio: float = 0.06
     literature_branch_guard_enabled: bool = True
-    literature_branch_guard_min_confidence: float = 0.80
+    literature_branch_guard_min_confidence: float = 0.75
     literature_branch_guard_max_speed_px_per_sec: float = 260.0
     literature_branch_guard_min_prediction_error_px: float = 32.0
     literature_branch_guard_min_downward_jump_px: float = 28.0
     literature_branch_recovery_frames: int = 3
     literature_branch_recovery_distance_scale_px: float = 4.0
+    literature_recovery_soft_enabled: bool = True
+    literature_recovery_soft_min_confidence: float = 0.23
+    literature_recovery_soft_max_missed_frames: int = 2
+    literature_recovery_soft_max_prediction_error_px: float = 52.0
     literature_occlusion_reset_enabled: bool = True
     literature_occlusion_reset_confidence: float = 0.85
     literature_occlusion_reset_max_prediction_error_px: float = 480.0
@@ -349,7 +356,12 @@ class BallTrackFilter:
         raw_measurement = self._raw_measurement(track, frame_size)
         measurement = self._measurement(track, frame_size, court_filter=court_filter)
         soft_measurement = False
-        if measurement is None and self._can_use_soft_measurement(track, frame_size, court_filter):
+        if measurement is None and self._can_use_soft_measurement(
+            track,
+            frame_size,
+            court_filter,
+            step_dt,
+        ):
             measurement = self._raw_measurement(track, frame_size)
             soft_measurement = measurement is not None
 
@@ -473,7 +485,12 @@ class BallTrackFilter:
             result = self._accept(track, measurement, step_dt, frame_size)
         else:
             relock = self._update_candidate(measurement, float(track.score), step_dt)
-            impact_relock = self._should_impact_relock(measurement, float(track.score), step_dt)
+            impact_relock = self._should_impact_relock(
+                measurement,
+                float(track.score),
+                step_dt,
+                normalized_person_bboxes,
+            )
             fast_relock = self._should_fast_relock(float(track.score))
             if (relock and self._should_relock()) or impact_relock or fast_relock:
                 self._drop_lock()
@@ -540,6 +557,7 @@ class BallTrackFilter:
             tracks,
             frame_size,
             court_filter,
+            normalized_person_bboxes,
             step_dt,
             candidate_frame_index,
             target_time_seconds,
@@ -627,6 +645,21 @@ class BallTrackFilter:
                 best_track = candidate
                 best_index = index
 
+        branch_alternative_index = self._literature_branch_alternative_index(
+            tracks,
+            best_index,
+            predicted,
+            dt,
+            frame_size,
+            court_filter,
+            target_time_seconds,
+        )
+        selected_rank = f"{best_rank:.4f}"
+        if branch_alternative_index is not None:
+            best_index = branch_alternative_index
+            best_track = tracks[best_index]
+            selected_rank = "literature_near_prediction"
+
         self._pending_candidate_debug = self._candidate_debug(
             tracks,
             dt,
@@ -634,10 +667,68 @@ class BallTrackFilter:
             court_filter,
             person_bboxes,
             selected_index=best_index,
-            selected_rank=f"{best_rank:.4f}",
+            selected_rank=selected_rank,
             target_time_seconds=target_time_seconds,
         )
         return best_track
+
+    def _literature_branch_alternative_index(
+        self,
+        tracks: Sequence[TrackResult],
+        selected_index: int,
+        predicted: Point,
+        dt: float,
+        frame_size: FrameSize | None,
+        court_filter: _CourtFilter | None,
+        target_time_seconds: float,
+    ) -> int | None:
+        if not self.config.literature_branch_guard_enabled:
+            return None
+        if self._last_point is None or selected_index < 0 or selected_index >= len(tracks):
+            return None
+        min_points = max(3, int(self.config.literature_short_gap_min_real_points))
+        if self._real_detections_since_relock < min_points:
+            return None
+        if _length(self._velocity) > float(self.config.literature_branch_guard_max_speed_px_per_sec):
+            return None
+
+        selected = tracks[selected_index]
+        selected_measurement = self._measurement(selected, frame_size, court_filter=court_filter)
+        if selected_measurement is None:
+            return None
+        if float(selected.score) < float(self.config.literature_branch_guard_min_confidence):
+            return None
+        if selected_measurement[1] - self._last_point[1] < float(
+            self.config.literature_branch_guard_min_downward_jump_px
+        ):
+            return None
+        distance_threshold = max(
+            0.0,
+            float(self.config.literature_branch_guard_min_prediction_error_px),
+        )
+        if _distance(selected_measurement, predicted) < distance_threshold:
+            return None
+
+        alternatives: list[tuple[float, int]] = []
+        for index, candidate in enumerate(tracks):
+            if index == selected_index or float(candidate.score) < self.config.min_confidence:
+                continue
+            measurement = self._measurement(candidate, frame_size, court_filter=court_filter)
+            if measurement is None:
+                continue
+            distance = _distance(measurement, predicted)
+            if distance >= distance_threshold:
+                continue
+            if not self._passes_gate(
+                measurement,
+                float(candidate.score),
+                dt,
+                frame_size,
+                target_time_seconds=target_time_seconds,
+            ):
+                continue
+            alternatives.append((distance, index))
+        return min(alternatives)[1] if alternatives else None
 
     def _candidate_rank(
         self,
@@ -653,7 +744,13 @@ class BallTrackFilter:
     ) -> float:
         measurement = self._measurement(track, frame_size, court_filter=court_filter)
         soft_measurement = False
-        if measurement is None and self._can_use_soft_measurement(track, frame_size, court_filter):
+        if measurement is None and self._can_use_soft_measurement(
+            track,
+            frame_size,
+            court_filter,
+            dt,
+            target_time_seconds=target_time_seconds,
+        ):
             measurement = self._raw_measurement(track, frame_size)
             soft_measurement = measurement is not None
         if measurement is None:
@@ -760,18 +857,46 @@ class BallTrackFilter:
         track: TrackResult,
         frame_size: FrameSize | None,
         court_filter: _CourtFilter | None,
+        dt: float,
+        *,
+        target_time_seconds: float | None = None,
     ) -> bool:
         if not self._locked or self._last_point is None:
             return False
         score = float(track.score)
-        if score < self.config.soft_min_confidence or score >= self.config.min_confidence:
+        if score >= self.config.min_confidence:
+            return False
+        recovery_soft = score < self.config.soft_min_confidence
+        if recovery_soft and not self._can_use_recovery_soft_measurement(score):
             return False
         measurement = self._raw_measurement(track, frame_size)
         if measurement is None:
             return False
+        if recovery_soft:
+            predicted = self._predict(dt, target_time_seconds=target_time_seconds)
+            if _distance(measurement, predicted) > float(
+                self.config.literature_recovery_soft_max_prediction_error_px
+            ):
+                return False
         if court_filter is not None and not self._point_inside_court_region(measurement, court_filter, frame_size):
             return False
         return True
+
+    def _can_use_recovery_soft_measurement(self, score: float) -> bool:
+        if not self.config.literature_recovery_soft_enabled:
+            return False
+        if score < float(self.config.literature_recovery_soft_min_confidence):
+            return False
+        max_missed = max(1, int(self.config.literature_recovery_soft_max_missed_frames))
+        if self._missed_frames < 1 or self._missed_frames > max_missed:
+            return False
+        if self._coast_frames:
+            return False
+        min_points = max(3, int(self.config.literature_short_gap_min_real_points))
+        return (
+            len(self._history) >= min_points
+            and _length(self._velocity) >= float(self.config.inertia_min_speed_px_per_sec)
+        )
 
     def _normalize_person_bboxes(
         self,
@@ -837,9 +962,16 @@ class BallTrackFilter:
                 return True
         return False
 
-    def _point_inside_person_bbox(self, point: Point, person_bboxes: Sequence[PersonBBox]) -> bool:
+    def _point_inside_person_bbox(
+        self,
+        point: Point,
+        person_bboxes: Sequence[PersonBBox],
+        *,
+        padding_px: float | None = None,
+    ) -> bool:
+        padding = self.config.person_occlusion_padding_px if padding_px is None else padding_px
         for bbox in person_bboxes:
-            if _point_inside_rect(point, bbox, padding=self.config.person_occlusion_padding_px):
+            if _point_inside_rect(point, bbox, padding=max(0.0, float(padding))):
                 return True
         return False
 
@@ -1416,6 +1548,7 @@ class BallTrackFilter:
         tracks: Sequence[TrackResult],
         frame_size: FrameSize | None,
         court_filter: _CourtFilter | None,
+        person_bboxes: Sequence[PersonBBox],
         dt: float,
         frame_index: int,
         target_time_seconds: float,
@@ -1435,6 +1568,8 @@ class BallTrackFilter:
             measurement = self._measurement(track, frame_size, court_filter=court_filter)
             if measurement is not None and self._point_matches_static_hotspot(
                 measurement,
+                float(track.score),
+                person_bboxes,
                 dt,
                 frame_index,
                 frame_size,
@@ -1488,6 +1623,8 @@ class BallTrackFilter:
     def _point_matches_static_hotspot(
         self,
         point: Point,
+        score: float,
+        person_bboxes: Sequence[PersonBBox],
         dt: float,
         frame_index: int,
         frame_size: FrameSize | None,
@@ -1503,6 +1640,22 @@ class BallTrackFilter:
                 continue
             if _distance(point, hotspot.point) > radius:
                 continue
+            if (
+                self._locked
+                and self._last_point is not None
+                and self._missed_frames == 0
+                and score >= float(self.config.static_hotspot_tracked_claim_confidence)
+                and _distance(point, self._last_point) <= radius
+                and (
+                    not person_bboxes
+                    or self._point_inside_person_bbox(
+                        point,
+                        person_bboxes,
+                        padding_px=self.config.static_hotspot_tracked_claim_person_padding_px,
+                    )
+                )
+            ):
+                return False
             if self._moving_track_can_claim_static_point(point, dt, target_time_seconds):
                 return False
             return True
@@ -1711,13 +1864,24 @@ class BallTrackFilter:
             return True
         return self._missed_frames >= self.config.relock_after_missed_frames
 
-    def _should_impact_relock(self, measurement: Point, score: float, dt: float) -> bool:
+    def _should_impact_relock(
+        self,
+        measurement: Point,
+        score: float,
+        dt: float,
+        person_bboxes: Sequence[PersonBBox],
+    ) -> bool:
         if self._candidate is None or self._last_point is None:
             return False
         if score < self.config.impact_relock_confidence:
             return False
         if self._missed_frames < self.config.impact_relock_min_missed_frames:
-            return False
+            if self._missed_frames != 0 or not self._point_inside_person_bbox(
+                measurement,
+                person_bboxes,
+                padding_px=self.config.impact_relock_immediate_player_padding_px,
+            ):
+                return False
         if self._candidate.count < self.config.impact_relock_confirm_frames:
             return False
         if self._candidate.score < self.config.impact_relock_confidence:
@@ -2178,7 +2342,13 @@ class BallTrackFilter:
         )
         for index, track in enumerate(tracks):
             measurement = self._measurement(track, frame_size, court_filter=court_filter)
-            if measurement is None and self._can_use_soft_measurement(track, frame_size, court_filter):
+            if measurement is None and self._can_use_soft_measurement(
+                track,
+                frame_size,
+                court_filter,
+                dt,
+                target_time_seconds=target_time_seconds,
+            ):
                 measurement = self._raw_measurement(track, frame_size)
             distance = _distance(measurement, predicted) if measurement is not None and predicted is not None else -1.0
             gate = (
@@ -2503,7 +2673,21 @@ def _eval_quadratic(coefficients: tuple[float, float, float], t: float) -> float
 
 
 def filter_track_results(tracks: list[TrackResult], *, fps: float = 25.0) -> list[TrackResult]:
+    from src.postprocess.fixed_lag_track import FixedLagTrackConfig, FixedLagTrackPostProcessor
     from src.postprocess.tracknet_v3_filter import create_tracknet_v3_ball_track_filter
 
-    tracker = create_tracknet_v3_ball_track_filter(fps=fps)
-    return [tracker.update(track) for track in tracks]
+    tracker = create_tracknet_v3_ball_track_filter(fps=fps, debug_enabled=True)
+    postprocessor = FixedLagTrackPostProcessor(FixedLagTrackConfig(fps=fps))
+    filtered: list[TrackResult] = []
+    for track in tracks:
+        causal = tracker.update(track)
+        lagged = postprocessor.push(
+            causal,
+            candidates=[track],
+            debug_record=tracker.last_debug_record(),
+        )
+        tracker.debug_records.clear()
+        if lagged is not None:
+            filtered.append(lagged.track)
+    filtered.extend(frame.track for frame in postprocessor.flush())
+    return filtered

@@ -9,6 +9,10 @@ from main import build_runtime_config_from_args, runtime_config_from_mapping
 
 
 class RuntimeConfigCliTest(unittest.TestCase):
+    def test_invalid_postprocess_route_in_config_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            runtime_config_from_mapping({"track_postprocess_route": "unknown"})
+
     def test_unknown_config_fields_are_kept_in_extra(self) -> None:
         config = runtime_config_from_mapping(
             {
@@ -48,6 +52,8 @@ class RuntimeConfigCliTest(unittest.TestCase):
                     "pose_only",
                     "--output-dir",
                     "outputs/from_cli",
+                    "--track-postprocess-route",
+                    "contextual",
                     "--no-vis",
                 ]
             )
@@ -55,6 +61,7 @@ class RuntimeConfigCliTest(unittest.TestCase):
         self.assertEqual(config.source, "from_cli.mp4")
         self.assertEqual(config.pipeline, "pose_only")
         self.assertEqual(config.output_dir, "outputs/from_cli")
+        self.assertEqual(config.track_postprocess_route, "contextual")
         self.assertFalse(config.save_vis)
 
 

@@ -72,6 +72,8 @@ TRACK_DEBUG_FIELDS = [
     "frame_w",
     "frame_h",
     "dt",
+    "fixed_lag_frames",
+    "fixed_lag_source",
     "source_frame_offset",
     "inpaint_mask",
     "candidates",
