@@ -131,6 +131,18 @@ python main.py --config configs/default_infer.json --source .\demo.mp4 --pipelin
 
 不同场馆的机位、光照和遮挡差异很大，内部发球线、邻场线、墙面和顶棚亮线也可能形成稳定的假四边形。系统会跨帧、跨后端重试，并在某个备用后端未通过验证时清掉它的错误状态，下一采样帧重新检测。绿色结果已经通过白线与透视拓扑验证并用于分析，黄色虚线只是可编辑的自动草稿。如果画面没有完整球场、外侧双打线长期被遮挡，或属于模型从未见过的极端机位，仍需拖动草稿角点或重新点选四角；要让更多新场馆直接达到测量级精度，仍需补充以白色双打外线为目标的跨场馆标注并重新训练。
 
+## 测试
+
+在 `WFBARNet` Conda 环境中运行默认生产回归；该命令同时收集核心测试和 `datatool` 测试：
+
+```powershell
+python -m unittest discover -v
+```
+
+已安装可选 `pytest` 时也可运行 `python -m pytest -q`；两种入口都收集核心测试和 `datatool` 测试。
+
+离线算法实验和外部视频/GPU 验收不进入默认通过数，分别位于 `experimental_tests/` 和 `integration_tests/`，按各目录 README 显式运行。
+
 ## 项目结构
 
 ```text
@@ -140,6 +152,8 @@ WFBARNet/
 ├─ configs/                 # 运行配置
 ├─ src/                     # 核心分析代码
 ├─ tests/                   # 测试用例
+├─ experimental_tests/      # 离线算法与未接入运行链路的实验测试
+├─ integration_tests/       # 需要外部视频、权重或 GPU 的验收测试
 ├─ tools/                   # 演示、导出和辅助脚本
 ├─ outputs/                 # 默认输出目录
 └─ main.py                  # 启动入口

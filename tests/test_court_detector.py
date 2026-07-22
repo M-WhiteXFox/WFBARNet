@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -613,28 +612,6 @@ class OpenCVCourtLineDetectorTest(unittest.TestCase):
             result.metrics.get("components", {}).get("singles_min_support", 0.0),
             0.15,
         )
-
-    def test_monotrack_detector_finds_real_video_frame(self) -> None:
-        video_path = Path(__file__).resolve().parents[1] / "videos" / "set1" / "3fd67078ae9b133dc5bfbca410631643.mp4"
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise AssertionError(f"failed to open test video: {video_path}")
-
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        mid_frame = max(0, frame_count // 2)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame)
-        ok, frame = cap.read()
-        cap.release()
-        if not ok or frame is None:
-            raise AssertionError("failed to read middle frame from test video")
-
-        detector = MonoTrackCourtLineDetector()
-        result = detector.predict(frame, frame_id=mid_frame, timestamp_ms=0, force=True)
-
-        self.assertTrue(result.valid, result.to_dict())
-        self.assertEqual(result.scheme, "monotrack")
-        self.assertGreater(result.confidence, 0.9)
-        self.assertEqual(result.metrics.get("components", {}).get("monotrack_three_family"), 1.0)
 
     def test_cached_overlay_matches_direct_drawing(self) -> None:
         prediction = CourtLinePrediction(

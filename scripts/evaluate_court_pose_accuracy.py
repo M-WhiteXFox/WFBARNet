@@ -10,7 +10,6 @@ import statistics
 import sys
 import time
 from typing import Any
-import unittest
 
 import cv2
 import numpy as np
@@ -176,48 +175,6 @@ def _predict_refined_sample(
         timestamp_ms=timestamp_ms,
         force=True,
     )
-
-
-class _ProtocolTestDetector:
-    def __init__(self) -> None:
-        self.reset_count = 0
-        self.predict_count = 0
-
-    def reset(self) -> None:
-        self.reset_count += 1
-
-    def predict(
-        self,
-        frame: np.ndarray,
-        frame_id: int,
-        timestamp_ms: int,
-        *,
-        force: bool = False,
-    ) -> object:
-        self.predict_count += 1
-        return object()
-
-
-class CourtPoseEvaluationProtocolTest(unittest.TestCase):
-    def test_refined_evaluation_resets_detector_for_each_cold_start_sample(self) -> None:
-        detector = _ProtocolTestDetector()
-        frame = np.zeros((12, 16, 3), dtype=np.uint8)
-
-        _predict_refined_sample(detector, frame, frame_id=10, timestamp_ms=400, stateful=False)
-        _predict_refined_sample(detector, frame, frame_id=20, timestamp_ms=800, stateful=False)
-
-        self.assertEqual(detector.reset_count, 2)
-        self.assertEqual(detector.predict_count, 2)
-
-    def test_refined_evaluation_can_explicitly_preserve_state(self) -> None:
-        detector = _ProtocolTestDetector()
-        frame = np.zeros((12, 16, 3), dtype=np.uint8)
-
-        _predict_refined_sample(detector, frame, frame_id=10, timestamp_ms=400, stateful=True)
-        _predict_refined_sample(detector, frame, frame_id=20, timestamp_ms=800, stateful=True)
-
-        self.assertEqual(detector.reset_count, 0)
-        self.assertEqual(detector.predict_count, 2)
 
 
 def evaluate_court_pose(config: EvaluationConfig) -> dict[str, object]:
@@ -474,35 +431,6 @@ def assert_quality(report: dict[str, object]) -> None:
 
 def _default_frame_logs() -> tuple[Path, ...]:
     return tuple(sorted((REPO_ROOT / "outputs" / "pyqt_debug").glob(DEFAULT_LOG_GLOB)))
-
-
-@unittest.skipUnless(
-    os.environ.get("WFBARNET_RUN_COURT_POSE_ACCURACY") == "1",
-    "set WFBARNET_RUN_COURT_POSE_ACCURACY=1 to run the external GPU/model integration test",
-)
-class CourtPoseModelAccuracyTest(unittest.TestCase):
-    def test_external_model_on_project_video(self) -> None:
-        weights = Path(os.environ.get("COURT_POSE_WEIGHTS", str(DEFAULT_WEIGHTS)))
-        video = Path(os.environ.get("COURT_POSE_VIDEO", str(DEFAULT_VIDEO)))
-        output_dir = Path(os.environ.get("COURT_POSE_OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR)))
-        samples = int(os.environ.get("COURT_POSE_SAMPLES", "24"))
-        device = os.environ.get("COURT_POSE_DEVICE", "0")
-        refine_white_lines = os.environ.get("COURT_POSE_REFINE_WHITE_LINES") == "1"
-        stateful = os.environ.get("COURT_POSE_STATEFUL") == "1"
-        report = evaluate_court_pose(
-            EvaluationConfig(
-                weights=weights,
-                video=video,
-                frame_logs=_default_frame_logs(),
-                output_dir=output_dir,
-                samples=samples,
-                device=device,
-                refine_white_lines=refine_white_lines,
-                stateful=stateful,
-            )
-        )
-        print(json.dumps(report["metrics"], ensure_ascii=False, indent=2))
-        assert_quality(report)
 
 
 def _parse_args() -> argparse.Namespace:

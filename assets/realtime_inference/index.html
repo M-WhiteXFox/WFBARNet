@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#061015" />
+    <title>实时推理 - WFBARNet</title>
+    <link rel="preload" href="./media/badminton-analysis-reference.png" as="image" />
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <svg class="icon-sprite" aria-hidden="true">
+      <symbol id="icon-menu" viewBox="0 0 24 24">
+        <path d="M4 6h16M4 12h16M4 18h16" />
+      </symbol>
+      <symbol id="icon-activity" viewBox="0 0 24 24">
+        <path d="M3 12h4l3-8 4 16 3-8h4" />
+      </symbol>
+      <symbol id="icon-route" viewBox="0 0 24 24">
+        <circle cx="6" cy="19" r="2" />
+        <circle cx="18" cy="5" r="2" />
+        <path d="M8 19h3a4 4 0 0 0 4-4V9a4 4 0 0 1 4-4" />
+      </symbol>
+      <symbol id="icon-court" viewBox="0 0 24 24">
+        <rect x="3" y="3" width="18" height="18" rx="1" />
+        <path d="M3 12h18M8 3v18M16 3v18" />
+      </symbol>
+      <symbol id="icon-crosshair" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8" />
+        <circle cx="12" cy="12" r="2" />
+        <path d="M12 2v4M12 18v4M2 12h4M18 12h4" />
+      </symbol>
+      <symbol id="icon-waypoints" viewBox="0 0 24 24">
+        <circle cx="6" cy="18" r="2" />
+        <circle cx="18" cy="6" r="2" />
+        <path d="M7.5 16.5 16.5 7.5M8 6H5a2 2 0 0 0-2 2v3M16 18h3a2 2 0 0 0 2-2v-3" />
+      </symbol>
+      <symbol id="icon-settings" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="3" />
+        <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.08V21h-4v-.08A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.08-.4H3v-4h.08A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.08V3h4v.08A1.7 1.7 0 0 0 15.4 4a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.12.37.35.7.66.93.3.24.68.37 1.06.37H21v4h-.08a1.7 1.7 0 0 0-1.52.7Z" />
+      </symbol>
+      <symbol id="icon-expand" viewBox="0 0 24 24">
+        <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" />
+      </symbol>
+      <symbol id="icon-record" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" />
+        <circle cx="12" cy="12" r="4" fill="currentColor" stroke="none" />
+      </symbol>
+      <symbol id="icon-panel" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="16" rx="2" />
+        <path d="M15 4v16M7 9h4M7 13h4" />
+      </symbol>
+      <symbol id="icon-pause" viewBox="0 0 24 24">
+        <rect x="6" y="4" width="4" height="16" rx="1" fill="currentColor" stroke="none" />
+        <rect x="14" y="4" width="4" height="16" rx="1" fill="currentColor" stroke="none" />
+      </symbol>
+      <symbol id="icon-play" viewBox="0 0 24 24">
+        <path d="m7 4 13 8-13 8Z" fill="currentColor" stroke="none" />
+      </symbol>
+      <symbol id="icon-replay" viewBox="0 0 24 24">
+        <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+        <path d="M3 3v5h5M12 8v5l3 2" />
+      </symbol>
+      <symbol id="icon-bookmark" viewBox="0 0 24 24">
+        <path d="M6 4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18l-6-4-6 4Z" />
+      </symbol>
+      <symbol id="icon-target" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="8" />
+        <circle cx="12" cy="12" r="3" />
+        <path d="M12 2v4M12 18v4M2 12h4M18 12h4" />
+      </symbol>
+      <symbol id="icon-timer" viewBox="0 0 24 24">
+        <circle cx="12" cy="13" r="8" />
+        <path d="M12 9v4l2 2M9 2h6M12 2v3" />
+      </symbol>
+      <symbol id="icon-x-circle" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" />
+        <path d="m9 9 6 6M15 9l-6 6" />
+      </symbol>
+      <symbol id="icon-person" viewBox="0 0 24 24">
+        <circle cx="12" cy="4" r="2" />
+        <path d="m10 7-2 6 4 2 2-4 3 3M9 13l-2 7M12 15l3 5M14 8l3-2" />
+      </symbol>
+      <symbol id="icon-lob" viewBox="0 0 24 24">
+        <path d="M5 18h14L12 6Z" />
+        <path d="M9 14h6M10.5 11h3" />
+      </symbol>
+      <symbol id="icon-chevron-left" viewBox="0 0 24 24">
+        <path d="m15 18-6-6 6-6" />
+      </symbol>
+    </svg>
+
+    <div class="inference-app" id="inferenceApp">
+      <header class="topbar">
+        <div class="brand-cluster">
+          <button class="icon-button menu-button" id="menuButton" type="button" aria-label="收起工具栏" aria-pressed="false">
+            <svg class="icon" aria-hidden="true"><use href="#icon-menu" /></svg>
+          </button>
+          <div class="page-title">
+            <span>实时推理</span>
+            <small>WFBARNet</small>
+          </div>
+        </div>
+
+        <dl class="telemetry" aria-label="推理状态">
+          <div class="telemetry-item connection-status">
+            <dt><span class="status-light" aria-hidden="true"></span>摄像头已连接</dt>
+          </div>
+          <div class="telemetry-item">
+            <dt>输入</dt>
+            <dd>1080P · 60 FPS</dd>
+          </div>
+          <div class="telemetry-item inference-rate">
+            <dt>推理</dt>
+            <dd>32 FPS</dd>
+          </div>
+          <div class="telemetry-item latency">
+            <dt>延迟</dt>
+            <dd>48 ms</dd>
+          </div>
+        </dl>
+
+        <div class="topbar-actions">
+          <button class="icon-button insight-toggle" id="insightToggle" type="button" aria-controls="insightPanel" aria-expanded="false" aria-label="打开动作面板">
+            <svg class="icon" aria-hidden="true"><use href="#icon-panel" /></svg>
+          </button>
+          <button class="record-button" id="recordButton" type="button" aria-label="停止录制" aria-pressed="true">
+            <svg class="icon" aria-hidden="true"><use href="#icon-record" /></svg>
+          </button>
+          <button class="stop-button" id="stopInference" type="button">
+            <span class="stop-square" aria-hidden="true"></span>
+            <span class="stop-label">停止推理</span>
+          </button>
+        </div>
+      </header>
+
+      <nav class="toolrail" aria-label="分析工具">
+        <button class="tool-button is-active" type="button" data-tool="动作识别" aria-label="动作识别" aria-pressed="true" data-tooltip="动作识别">
+          <svg class="icon" aria-hidden="true"><use href="#icon-person" /></svg>
+        </button>
+        <button class="tool-button" type="button" data-tool="轨迹分析" aria-label="轨迹分析" aria-pressed="false" data-tooltip="轨迹分析">
+          <svg class="icon" aria-hidden="true"><use href="#icon-route" /></svg>
+        </button>
+        <button class="tool-button" type="button" data-tool="球场映射" aria-label="球场映射" aria-pressed="false" data-tooltip="球场映射">
+          <svg class="icon" aria-hidden="true"><use href="#icon-court" /></svg>
+        </button>
+        <button class="tool-button" type="button" data-tool="击球定位" aria-label="击球定位" aria-pressed="false" data-tooltip="击球定位">
+          <svg class="icon" aria-hidden="true"><use href="#icon-crosshair" /></svg>
+        </button>
+        <button class="tool-button" type="button" data-tool="落点追踪" aria-label="落点追踪" aria-pressed="false" data-tooltip="落点追踪">
+          <svg class="icon" aria-hidden="true"><use href="#icon-waypoints" /></svg>
+        </button>
+        <span class="toolrail-spacer" aria-hidden="true"></span>
+        <button class="tool-button" type="button" data-tool="推理设置" aria-label="推理设置" aria-pressed="false" data-tooltip="推理设置">
+          <svg class="icon" aria-hidden="true"><use href="#icon-settings" /></svg>
+        </button>
+        <button class="tool-button" id="fullscreenButton" type="button" aria-label="全屏显示" data-tooltip="全屏显示">
+          <svg class="icon" aria-hidden="true"><use href="#icon-expand" /></svg>
+        </button>
+      </nav>
+
+      <main class="analysis-stage" aria-label="实时羽毛球分析画面">
+        <div class="scene-crop">
+          <div class="scene-window">
+            <img class="scene-source" src="./media/badminton-analysis-reference.png" alt="羽毛球运动员杀球时的姿态骨架与飞行轨迹分析画面" />
+          </div>
+        </div>
+        <div class="stage-edge" aria-hidden="true"></div>
+        <div class="paused-overlay" id="pausedOverlay" role="status" aria-live="polite">
+          <span class="paused-icon"><svg class="icon" aria-hidden="true"><use href="#icon-pause" /></svg></span>
+          <strong>推理已暂停</strong>
+          <small>画面流保持连接</small>
+        </div>
+      </main>
+
+      <aside class="insight-panel" id="insightPanel" aria-label="动作诊断">
+        <div class="panel-handle" aria-hidden="true"></div>
+        <div class="panel-heading">
+          <span>当前动作</span>
+          <button class="icon-button panel-close" id="panelClose" type="button" aria-label="关闭动作面板">
+            <svg class="icon" aria-hidden="true"><use href="#icon-chevron-left" /></svg>
+          </button>
+        </div>
+
+        <section class="current-action" aria-labelledby="currentActionName">
+          <div class="confidence-ring" aria-label="动作置信度 93%">
+            <svg class="action-figure" aria-hidden="true"><use href="#icon-person" /></svg>
+            <span class="ring-dot" aria-hidden="true"></span>
+          </div>
+          <div class="action-reading">
+            <h2 id="currentActionName">杀球</h2>
+            <p>置信度 <strong>93%</strong></p>
+            <output class="speed-reading">142 <small>km/h</small></output>
+          </div>
+        </section>
+
+        <div class="diagnostic-list" aria-label="动作诊断">
+          <div class="diagnostic-item">
+            <span class="diagnostic-icon is-danger"><svg class="icon" aria-hidden="true"><use href="#icon-target" /></svg></span>
+            <span>击球点偏低</span>
+          </div>
+          <div class="diagnostic-item">
+            <span class="diagnostic-icon is-warning"><svg class="icon" aria-hidden="true"><use href="#icon-timer" /></svg></span>
+            <span>回位慢 <strong>0.4 s</strong></span>
+          </div>
+        </div>
+
+        <section class="recent-events" aria-labelledby="recentEventsTitle">
+          <h2 id="recentEventsTitle">最近事件</h2>
+          <ol class="event-list">
+            <li><button type="button" data-seek="27"><time datetime="PT27S">00:27</time><span class="event-dot error"></span><svg class="event-icon error" aria-hidden="true"><use href="#icon-x-circle" /></svg><span>失误</span></button></li>
+            <li><button type="button" data-seek="25"><time datetime="PT25S">00:25</time><span class="event-dot smash"></span><svg class="event-icon smash" aria-hidden="true"><use href="#icon-person" /></svg><span>杀球</span></button></li>
+            <li><button type="button" data-seek="20"><time datetime="PT20S">00:20</time><span class="event-dot lob"></span><svg class="event-icon lob" aria-hidden="true"><use href="#icon-lob" /></svg><span>高远球</span></button></li>
+            <li><button type="button" data-seek="16"><time datetime="PT16S">00:16</time><span class="event-dot smash"></span><svg class="event-icon smash" aria-hidden="true"><use href="#icon-person" /></svg><span>发球</span></button></li>
+            <li><button type="button" data-seek="12"><time datetime="PT12S">00:12</time><span class="event-dot lob"></span><svg class="event-icon lob" aria-hidden="true"><use href="#icon-lob" /></svg><span>高远球</span></button></li>
+            <li><button type="button" data-seek="8"><time datetime="PT8S">00:08</time><span class="event-dot error"></span><svg class="event-icon error" aria-hidden="true"><use href="#icon-x-circle" /></svg><span>失误</span></button></li>
+          </ol>
+        </section>
+      </aside>
+
+      <section class="timeline-panel" aria-label="视频事件时间线">
+        <div class="timeline-ruler" aria-hidden="true">
+          <span style="--position: 0%">00:00</span>
+          <span style="--position: 16.667%">00:05</span>
+          <span style="--position: 33.333%">00:10</span>
+          <span style="--position: 50%">00:15</span>
+          <span style="--position: 66.667%">00:20</span>
+          <span style="--position: 83.333%">00:25</span>
+          <span style="--position: 100%">00:30</span>
+        </div>
+
+        <div class="event-track" aria-label="关键事件">
+          <button class="timeline-event serve" type="button" style="--position: 4%" data-seek="1.2" aria-label="跳转到 1.2 秒，发球">
+            <span class="event-pin"><svg class="icon" aria-hidden="true"><use href="#icon-person" /></svg></span><span class="event-name">发球</span>
+          </button>
+          <button class="timeline-event lob" type="button" style="--position: 23%" data-seek="6.9" aria-label="跳转到 6.9 秒，高远球">
+            <span class="event-pin"><svg class="icon" aria-hidden="true"><use href="#icon-lob" /></svg></span><span class="event-name">高远球</span>
+          </button>
+          <button class="timeline-event smash" type="button" style="--position: 38%" data-seek="11.4" aria-label="跳转到 11.4 秒，杀球">
+            <span class="event-pin"><svg class="icon" aria-hidden="true"><use href="#icon-person" /></svg></span><span class="event-name">杀球</span>
+          </button>
+          <button class="timeline-event lob" type="button" style="--position: 54%" data-seek="16.2" aria-label="跳转到 16.2 秒，高远球">
+            <span class="event-pin"><svg class="icon" aria-hidden="true"><use href="#icon-lob" /></svg></span><span class="event-name">高远球</span>
+          </button>
+          <button class="timeline-event smash" type="button" style="--position: 70%" data-seek="21" aria-label="跳转到 21 秒，杀球">
+            <span class="event-pin"><svg class="icon" aria-hidden="true"><use href="#icon-person" /></svg></span><span class="event-name">杀球</span>
+          </button>
+          <button class="timeline-event error" type="button" style="--position: 87%" data-seek="26.1" aria-label="跳转到 26.1 秒，失误">
+            <span class="event-pin"><svg class="icon" aria-hidden="true"><use href="#icon-x-circle" /></svg></span><span class="event-name">失误</span>
+          </button>
+        </div>
+
+        <label class="scrubber-label" for="timelineScrubber">视频进度</label>
+        <input class="timeline-scrubber" id="timelineScrubber" type="range" min="0" max="30" step="0.05" value="21" aria-valuetext="21 秒，共 30 秒" />
+
+        <div class="playback-controls">
+          <button class="play-button" id="playButton" type="button" aria-label="播放" aria-pressed="false">
+            <svg class="icon play-state-icon" aria-hidden="true"><use href="#icon-play" /></svg>
+          </button>
+          <button class="command-button" id="replayButton" type="button">
+            <svg class="icon" aria-hidden="true"><use href="#icon-replay" /></svg>
+            <span>回看 5 秒</span>
+          </button>
+          <button class="command-button" id="bookmarkButton" type="button" aria-pressed="false">
+            <svg class="icon" aria-hidden="true"><use href="#icon-bookmark" /></svg>
+            <span>标记片段</span>
+          </button>
+          <output class="time-readout" aria-live="off"><strong id="currentTime">00:21</strong><span>/</span><span>00:30</span></output>
+        </div>
+      </section>
+
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    </div>
+  </body>
+</html>

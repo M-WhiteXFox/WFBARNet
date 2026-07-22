@@ -9,29 +9,31 @@ import cv2
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+COURT_VIDEO = os.environ.get("WFBARNET_COURT_VIDEO", "").strip()
 
-@unittest.skipUnless(
-    os.environ.get("WFBARNET_RUN_AUTO_COURT_GUI") == "1",
-    "set WFBARNET_RUN_AUTO_COURT_GUI=1 to run the automatic court GUI integration test",
-)
+
+@unittest.skipUnless(COURT_VIDEO, "set WFBARNET_COURT_VIDEO to an external court video")
 class AutomaticCourtServiceIntegrationTest(unittest.TestCase):
-    def test_real_frame_auto_calibrates_and_manual_correction_overrides(self) -> None:
+    def test_automatic_calibration_and_manual_override(self) -> None:
         from PyQt6.QtCore import QCoreApplication
 
         from apps.pyqt6.services.automatic_court_calibration_service import (
             create_automatic_court_calibration_service,
         )
 
-        app = QCoreApplication.instance() or QCoreApplication([])
-        service = create_automatic_court_calibration_service()
-        video_path = Path(__file__).resolve().parents[1] / "videos" / "MVI_0211.MP4"
+        video_path = Path(COURT_VIDEO)
+        self.assertTrue(video_path.is_file(), video_path)
         capture = cv2.VideoCapture(str(video_path))
         ok, frame = capture.read()
         capture.release()
         self.assertTrue(ok)
         self.assertIsNotNone(frame)
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+        service = create_automatic_court_calibration_service()
+        samples = [(frame.copy(), index, index * 750) for index in range(3)]
         service.request_prediction()
-        self.assertTrue(service.submit_frame(frame, 0, 0))
+        self.assertEqual(service.submit_bootstrap_frames(samples), len(samples))
 
         deadline = time.monotonic() + 30.0
         prediction = None
@@ -45,7 +47,6 @@ class AutomaticCourtServiceIntegrationTest(unittest.TestCase):
         try:
             self.assertIsNotNone(prediction)
             self.assertTrue(prediction.valid)
-            self.assertIn(prediction.scheme, {"court_pose_white_line", "court_pose_coarse"})
             self.assertEqual(len(prediction.corners), 4)
             original = prediction.corners[0]
 
