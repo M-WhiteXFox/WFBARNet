@@ -1,128 +1,156 @@
-/* ============================================================
- *  STATUS & LABELS  —  状态标签、徽章、chip
- * ============================================================ */
-
-/* --- 标题 / 副标题 --- */
 QLabel#titleLabel {
-    font-size: 22px;
+    font-size: 25px;
+    font-weight: 700;
+    color: #171A1F;
+}
+
+QLabel#productLabel {
+    font-size: 20px;
     font-weight: 600;
-    color: #1F1F1F;
+    color: #20242A;
 }
 
-QLabel#subtitleLabel {
-    color: #605E5C;
+QLabel#statusDot {
+    background-color: #89939C;
+    border: none;
+    border-radius: 4px;
 }
 
-/* --- 区块标题 --- */
+QLabel#statusDot[state="loading"],
+QLabel#statusDot[state="success"] {
+    background-color: #0B8F4D;
+}
+
+QLabel#statusDot[state="warning"],
+QLabel#statusDot[state="stopped"] {
+    background-color: #F59E0B;
+}
+
+QLabel#statusDot[state="error"] {
+    background-color: #EF4444;
+}
+
+QLabel#statusLabel {
+    color: #30363D;
+    font-weight: 600;
+}
+
+QLabel#statusLabel[state="error"] { color: #B4232E; }
+QLabel#statusLabel[state="warning"],
+QLabel#statusLabel[state="stopped"] { color: #8A5700; }
+
 QLabel#sectionTitle {
-    font-size: 17px;
-    font-weight: 600;
-    color: #323130;
+    font-size: 16px;
+    font-weight: 650;
+    color: #20242A;
 }
 
-/* --- 辅助文字 --- */
-QLabel#hintText,
-QLabel#poseInfo {
-    color: #605E5C;
-}
-
-/* --- 指标卡 --- */
-QLabel#metricTitle {
-    color: #605E5C;
+QLabel#metricTitle,
+QLabel#styleLabel,
+QLabel#overlayLabel {
+    color: #626A73;
     font-size: 12px;
     font-weight: 500;
 }
 
 QLabel#metricValue {
-    color: #2B579A;
-    font-size: 24px;
+    color: #087F45;
+    font-size: 15px;
+    font-weight: 700;
+}
+
+QLabel#actionIcon {
+    color: #FFFFFF;
+    background-color: #F04444;
+    border-radius: 7px;
+    font-size: 25px;
+    font-weight: 700;
+}
+
+QLabel#currentActionName {
+    color: #15191E;
+    font-size: 25px;
+    font-weight: 700;
+}
+
+QLabel#rallyStateText {
+    color: #6B737C;
+    font-size: 12px;
+}
+
+QLabel#confidenceValue {
+    color: #20242A;
+    font-size: 14px;
+    font-weight: 700;
+}
+
+QLabel#diagnosticIcon {
+    color: #FFFFFF;
+    background-color: #EF4444;
+    border-radius: 15px;
+    font-size: 18px;
+    font-weight: 700;
+}
+
+QLabel#diagnosticText {
+    color: #30363D;
     font-weight: 600;
 }
 
-/* --- 信息 chip / badge（默认 info 蓝） --- */
-QLabel#modeChip,
-QLabel#pipelineChip,
-QLabel#videoState,
 QLabel#sectionNote,
-QLabel#videoStatus {
-    background-color: #F2F2F2;
-    color: #2B579A;
-    border: 1px solid #525252;
-    border-radius: 2px;
-    padding: 4px 10px;
+QLabel#hintText,
+QLabel#poseInfo {
+    color: #69727C;
     font-size: 12px;
-    font-weight: 500;
-}
-
-/* loaded / playing → 成功绿 */
-QLabel#videoState[state="loaded"],
-QLabel#videoStatus[state="loaded"],
-QLabel#videoStatus[state="playing"] {
-    background-color: #EAF4EA;
-    color: #107C41;
-    border-color: #B7D7B0;
-}
-
-/* stopped → 警告黄 */
-QLabel#videoStatus[state="stopped"] {
-    background-color: #FFF4CE;
-    color: #9B5C00;
-    border-color: #F2D98B;
-}
-
-/* error → 错误红 */
-QLabel#videoStatus[state="error"] {
-    background-color: #FDE7E9;
-    color: #A4262C;
-    border-color: #F1B0B7;
-}
-
-/* --- 系统状态标签 --- */
-QLabel#statusLabel {
-    color: #323130;
-    font-weight: 600;
-}
-
-QLabel#statusLabel[state="loading"] { color: #9B5C00; }
-QLabel#statusLabel[state="success"] { color: #107C41; }
-QLabel#statusLabel[state="stopped"] { color: #9B5C00; }
-QLabel#statusLabel[state="warning"] { color: #9B5C00; }
-QLabel#statusLabel[state="error"]   { color: #A4262C; }
-
-/* --- 样式选择器标签 --- */
-QLabel#styleLabel {
-    color: #605E5C;
-    font-size: 12px;
-    font-weight: 400;
 }
 
 QLabel#distanceValue {
-    color: #323130;
+    color: #30363D;
     font-weight: 600;
 }
 
+QLabel#analysisBadge,
+QLabel#runtimeBadge {
+    color: #FFFFFF;
+    background-color: rgba(12, 132, 73, 225);
+    border: none;
+    border-radius: 5px;
+    padding: 5px 12px;
+    font-size: 13px;
+    font-weight: 650;
+}
+
+QLabel#runtimeBadge {
+    background-color: rgba(15, 128, 175, 225);
+}
+
+QLabel#analysisBadge[state="error"] {
+    background-color: rgba(220, 52, 64, 235);
+}
+
+QLabel#analysisBadge[state="stopped"],
+QLabel#analysisBadge[state="warning"] {
+    background-color: rgba(194, 111, 0, 235);
+}
+
 QFrame#statusBanner {
-    background-color: #EAF2F8;
-    border: 1px solid #8AB4D6;
-    border-radius: 2px;
+    background-color: #EFF7F3;
+    border: none;
+    border-bottom: 1px solid #B9DAC8;
+    border-radius: 0px;
 }
 
 QFrame#statusBanner[state="warning"] {
-    background-color: #FFF4CE;
-    border-color: #E0B84F;
+    background-color: #FFF8E8;
+    border-bottom-color: #E7C66C;
 }
 
 QFrame#statusBanner[state="error"] {
-    background-color: #FDE7E9;
-    border-color: #D96C75;
-}
-
-QFrame#statusBanner[state="success"] {
-    background-color: #EAF4EA;
-    border-color: #77B879;
+    background-color: #FFF1F2;
+    border-bottom-color: #E7A3A8;
 }
 
 QLabel#statusBannerLabel {
-    color: #1F1F1F;
+    color: #20242A;
     font-weight: 500;
 }

@@ -1,44 +1,40 @@
-/* ============================================================
- *  TABS  —  QTabWidget / QTabBar
- * ============================================================ */
-
 QTabWidget#mainTabs::pane {
-    border: 1px solid #D2D0CE;
-    border-radius: 2px;
+    border: none;
+    border-radius: 0px;
     top: -1px;
     background-color: #FFFFFF;
 }
 
 QTabWidget#mainTabs::tab-bar {
-    left: 0px;
+    alignment: center;
 }
 
-QTabBar::tab {
-    background: #F3F3F3;
-    color: #323130;
-    padding: 8px 16px;
-    margin-right: 2px;
-    border-top-left-radius: 2px;
-    border-top-right-radius: 2px;
-    border: 1px solid #D2D0CE;
-    border-bottom: none;
+QTabWidget#mainTabs QTabBar::tab {
+    min-width: 84px;
+    min-height: 38px;
+    background: transparent;
+    color: #535B64;
+    padding: 5px 12px;
+    margin: 0px 4px;
+    border: none;
+    border-bottom: 3px solid transparent;
+    font-size: 14px;
 }
 
-QTabBar::tab:selected {
-    background: #FFFFFF;
-    color: #217346;
-    font-weight: 600;
-    border-top: 2px solid #217346;
+QTabWidget#mainTabs QTabBar::tab:selected {
+    color: #087F45;
+    border-bottom-color: #0B8F4D;
+    font-weight: 700;
 }
 
-QTabBar::tab:hover:!selected {
-    background: #F8F8F8;
-    color: #1F1F1F;
+QTabWidget#mainTabs QTabBar::tab:hover:!selected {
+    color: #20242A;
+    background-color: #F4F7F6;
 }
 
 QTabWidget#secondaryTabs::pane {
     border: none;
-    border-top: 1px solid #D9D9D9;
+    border-top: 1px solid #E2E6E9;
     background-color: #FFFFFF;
 }
 
@@ -47,12 +43,12 @@ QTabWidget#secondaryTabs QTabBar::tab {
     border: none;
     border-bottom: 2px solid transparent;
     border-radius: 0px;
-    padding: 7px 12px;
-    color: #605E5C;
+    padding: 8px 12px;
+    color: #626A73;
 }
 
 QTabWidget#secondaryTabs QTabBar::tab:selected {
-    color: #217346;
-    border-bottom-color: #217346;
-    font-weight: 600;
+    color: #087F45;
+    border-bottom-color: #0B8F4D;
+    font-weight: 650;
 }

@@ -1,59 +1,99 @@
-/* ============================================================
- *  LAYOUT  —  卡片、容器框架
- * ============================================================ */
-
-/* --- 通用卡片 --- */
-QFrame#headerCard,
-QFrame#previewCard,
-QFrame#analyticsCard,
-QFrame#metricCard,
-QFrame#emptyStateCard {
+QFrame#headerCard {
     background-color: #FFFFFF;
-    border: 1px solid #D2D0CE;
-    border-radius: 2px;
+    border: none;
+    border-bottom: 1px solid #E3E7EA;
+    border-radius: 0px;
+    min-height: 56px;
 }
 
-/* previewCard 底部与 videoPlayerCard 无缝衔接 */
-/* headerCard 顶部品牌色强调线 */
-QFrame#headerCard {
-    background-color: #F8F8F8;
-    border-top: 3px solid #217346;
+QFrame#modeNavigation {
+    background-color: #FFFFFF;
+    border: none;
+    border-bottom: 1px solid #DDE2E6;
+}
+
+QFrame#workspaceBand {
+    background-color: #F5F7F8;
+    border: none;
+    padding-top: 4px;
+}
+
+QFrame#previewCard,
+QFrame#analyticsCard {
+    background-color: #FFFFFF;
+    border: 1px solid #D8DDE2;
+    border-radius: 6px;
 }
 
 QFrame#analyticsCard {
-    background-color: transparent;
+    margin-left: 6px;
+}
+
+QFrame#metricsStrip,
+QFrame#currentActionCard,
+QFrame#diagnosticCard,
+QFrame#emptyStateCard {
+    background-color: #FFFFFF;
+    border: 1px solid #DDE2E6;
+    border-radius: 6px;
+}
+
+QFrame#metricsStrip {
+    min-height: 82px;
+    max-height: 94px;
+}
+
+QFrame#metricCell {
+    background: transparent;
+    border: none;
+}
+
+QFrame#metricSeparator {
+    background-color: #E3E7EA;
+    border: none;
+    max-width: 1px;
+    margin-top: 12px;
+    margin-bottom: 12px;
+}
+
+QFrame#currentActionCard {
+    min-height: 78px;
+}
+
+QFrame#diagnosticCard {
+    min-height: 44px;
+    background-color: #FAFBFC;
+}
+
+QFrame#diagnosticCard[state="warning"] {
+    background-color: #FFF7F7;
+    border-color: #F5C2C4;
+}
+
+QFrame#diagnosticCard[state="success"] {
+    background-color: #F2FBF6;
+    border-color: #B7DFC8;
+}
+
+QFrame#videoPlayerCard {
+    background-color: #07100E;
     border: none;
     border-radius: 0px;
 }
 
-QFrame#metricCard {
-    min-height: 80px;
-}
-
-/* --- 视频播放器容器 --- */
-QFrame#videoPlayerCard {
-    background-color: #FFFFFF;
-    border: 1px solid #D2D0CE;
-    border-radius: 2px;
-}
-
 QFrame#videoControlsBar {
-    background-color: #F7F7F7;
-    border: 1px solid #D2D0CE;
-    border-radius: 2px;
-    padding: 6px;
-}
-
-QWidget#timelineBar {
-    background: transparent;
+    background-color: #FFFFFF;
     border: none;
-    padding: 0px;
+    border-bottom: 1px solid #E3E7EA;
+    border-radius: 0px;
 }
 
+QWidget#timelineBar,
 QFrame#videoTimelineCard {
-    background: transparent;
+    background-color: #FFFFFF;
     border: none;
-    padding: 0px;
+    border-top: 1px solid #E3E7EA;
+    border-radius: 0px;
 }
 
 QSplitter#bodySplitter::handle {
@@ -63,5 +103,5 @@ QSplitter#bodySplitter::handle {
 
 QSplitter#bodySplitter::handle:hover,
 QSplitter#bodySplitter::handle:pressed {
-    background: #A9D4B6;
+    background: #A6D7BC;
 }

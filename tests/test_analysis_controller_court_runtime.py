@@ -2,17 +2,24 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from threading import Event, Thread
+from time import perf_counter, sleep
+from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 if importlib.util.find_spec("PyQt6") is None:
     raise unittest.SkipTest("PyQt6 is not installed in this test environment.")
 
+from PyQt6.QtCore import QElapsedTimer, QEventLoop, QTimer
 from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import QApplication
 
-from apps.pyqt6.controllers.analysis_controller_runtime import MainController
+import apps.pyqt6.controllers.analysis_controller_runtime as controller_module
+from apps.pyqt6.controllers.analysis_controller_runtime import MainController, TrackNetPlaybackWorker
 from apps.pyqt6.views.components.video_player_panel_runtime import CourtLineOverlayWidget
 
 
@@ -46,6 +53,8 @@ class _CourtService:
 class _VideoPlayer:
     def __init__(self) -> None:
         self.displayed_court = None
+        self.pause_count = 0
+        self.play_count = 0
 
     def clear_video(self) -> None:
         return
@@ -59,6 +68,12 @@ class _VideoPlayer:
     def stop(self) -> None:
         return
 
+    def pause(self) -> None:
+        self.pause_count += 1
+
+    def play(self, *, start_ms: int | None = None) -> None:
+        self.play_count += 1
+
 
 class _View:
     def __init__(self) -> None:
@@ -66,8 +81,11 @@ class _View:
         self.shown_court = None
         self.logs: list[str] = []
         self.progress_busy: tuple[bool, str] = (False, "")
+        self.progress_history: list[tuple[bool, str]] = []
+        self.model_loading_states: list[bool] = []
         self.system_status: tuple[str, str] = ("", "")
         self.status_notices: list[tuple[str, str]] = []
+        self.primary_action_states: list[str] = []
 
     def show_video_frame(self, image, position_ms, duration_ms, court, *args) -> None:
         self.shown_court = court
@@ -104,6 +122,13 @@ class _View:
 
     def set_progress_busy(self, busy: bool, text: str = "") -> None:
         self.progress_busy = (busy, text)
+        self.progress_history.append((busy, text))
+
+    def set_model_loading_controls(self, loading: bool) -> None:
+        self.model_loading_states.append(bool(loading))
+
+    def set_primary_action_state(self, state: str) -> None:
+        self.primary_action_states.append(state)
 
 
 def _bare_controller(service: _CourtService, view: _View | None = None) -> MainController:
@@ -115,7 +140,16 @@ def _bare_controller(service: _CourtService, view: _View | None = None) -> MainC
     controller._display_fps_ema = 0.0
     controller._last_court_log_frame = -1
     controller._pending_video_start_ms = None
+    controller._pending_seek_ms = None
     controller._court_bootstrap_exhausted = False
+    controller._model_load_worker = None
+    controller._model_load_continuation = None
+    controller._playback_worker = None
+    controller._camera_worker = None
+    controller._batch_worker = None
+    controller._video_meta = {}
+    controller._video_paused = False
+    controller._analysis_busy = False
     controller._log_track_debug_event = lambda payload: None
     controller._append_trajectory_event = lambda payload: None
     controller._append_bst_predictions = lambda payload: None
@@ -136,6 +170,254 @@ class AnalysisControllerCourtRuntimeTest(unittest.TestCase):
             ("success", "系统状态：视频分析完成"),
         )
 
+    def test_primary_action_dispatches_start_stop_and_resume(self) -> None:
+        controller = _bare_controller(_CourtService(None))
+        actions: list[str] = []
+        controller.handle_analyze = lambda: actions.append("start")
+        controller.handle_force_stop = lambda: actions.append("stop")
+        controller.handle_resume = lambda: actions.append("resume")
+        controller._is_inference_running = lambda: False
+
+        controller.handle_primary_action()
+        controller._is_inference_running = lambda: True
+        controller.handle_primary_action()
+        controller._video_paused = True
+        controller.handle_primary_action()
+
+        self.assertEqual(actions, ["start", "stop", "resume"])
+
+    def test_video_stop_pauses_current_worker_without_ending_analysis(self) -> None:
+        controller = _bare_controller(_CourtService(None))
+        pause_requests: list[bool] = []
+        worker = SimpleNamespace(
+            isRunning=lambda: True,
+            request_pause=lambda: pause_requests.append(True),
+        )
+        controller._playback_worker = worker
+        controller._auto_report_after_stop = True
+        controller._video_meta = {"position_ms": 4250}
+        paused_states: list[bool] = []
+        controller._set_paused_state = lambda: paused_states.append(True)
+
+        controller.handle_force_stop()
+
+        self.assertEqual(pause_requests, [True])
+        self.assertEqual(controller.view.video_player.pause_count, 1)
+        self.assertEqual(paused_states, [True])
+        self.assertTrue(controller._video_paused)
+        self.assertFalse(controller._auto_report_after_stop)
+        self.assertIn("4.25s", controller.view.logs[-1])
+
+    def test_resume_wakes_same_worker_and_keeps_current_position(self) -> None:
+        controller = _bare_controller(_CourtService(None))
+        resume_requests: list[bool] = []
+        worker = SimpleNamespace(
+            isRunning=lambda: True,
+            request_resume=lambda: resume_requests.append(True),
+        )
+        controller._playback_worker = worker
+        controller._video_paused = True
+        controller._video_meta = {"position_ms": 4250, "duration_ms": 10_000}
+        running_states: list[bool] = []
+        controller._set_running_state = lambda: running_states.append(True)
+
+        controller.handle_resume()
+
+        self.assertIs(controller._playback_worker, worker)
+        self.assertEqual(resume_requests, [True])
+        self.assertEqual(controller.view.video_player.play_count, 1)
+        self.assertEqual(running_states, [True])
+        self.assertFalse(controller._video_paused)
+        self.assertEqual(controller._video_meta["position_ms"], 4250)
+
+    def test_worker_pause_is_excluded_from_playback_clock(self) -> None:
+        worker = TrackNetPlaybackWorker(
+            "unused.mp4",
+            None,
+            None,
+            track_enabled=False,
+            pose_enabled=False,
+        )
+        worker.request_pause()
+        started = Event()
+        results: list[bool] = []
+
+        def wait_for_target() -> None:
+            clock = QElapsedTimer()
+            clock.start()
+            started.set()
+            results.append(worker._sleep_until(30, clock))
+
+        thread = Thread(target=wait_for_target)
+        started_at = perf_counter()
+        thread.start()
+        self.assertTrue(started.wait(1.0))
+        sleep(0.05)
+        self.assertTrue(thread.is_alive())
+        worker.request_resume()
+        thread.join(1.0)
+        elapsed = perf_counter() - started_at
+        if thread.is_alive():
+            worker.request_stop()
+            thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results, [True])
+        self.assertGreaterEqual(elapsed, 0.065)
+
+    def test_model_load_runs_off_gui_thread_and_continues_once(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        controller = MainController.__new__(MainController)
+        controller.view = _View()
+        controller._track_model_enabled = True
+        controller._pose_model_enabled = False
+        controller._track_branch = None
+        controller._pose_branch = None
+        controller._track_model_path = str(Path(__file__).resolve())
+        controller._pose_model_path = str(Path(__file__).resolve())
+        controller._default_bst_model_path = Path(__file__).resolve()
+        controller._bst_device = "cpu"
+        controller._bst_model = None
+        controller._bst_model_checked = False
+        controller._model_load_worker = None
+        controller._model_load_continuation = None
+        running_states: list[bool] = []
+        idle_states: list[bool] = []
+        controller._set_running_state = lambda: running_states.append(True)
+        controller._set_idle_state = lambda: idle_states.append(True)
+
+        branch = SimpleNamespace(device="cpu", backend_name="test")
+        event_loop = QEventLoop()
+        ticks: list[float] = []
+        continued: list[bool] = []
+        timer = QTimer()
+        timer.setInterval(10)
+        timer.timeout.connect(lambda: ticks.append(perf_counter()))
+        timer.start()
+
+        def slow_track_factory(_model_path: str):
+            sleep(0.20)
+            return branch
+
+        def continuation() -> None:
+            continued.append(True)
+            event_loop.quit()
+
+        with patch.object(
+            controller_module,
+            "_create_runtime_track_branch",
+            side_effect=slow_track_factory,
+        ):
+            started_at = perf_counter()
+            self.assertFalse(controller._ensure_models_ready(continuation))
+            returned_after = perf_counter() - started_at
+            QTimer.singleShot(2000, event_loop.quit)
+            event_loop.exec()
+
+        timer.stop()
+        self.assertLess(returned_after, 0.10)
+        self.assertGreaterEqual(len(ticks), 5)
+        self.assertEqual(continued, [True])
+        self.assertIs(controller._track_branch, branch)
+        self.assertIsNone(controller._model_load_worker)
+        self.assertEqual(running_states, [True])
+        self.assertEqual(idle_states, [True])
+        self.assertEqual(controller.view.model_loading_states, [True, False])
+        self.assertTrue(controller._ensure_models_ready())
+
+    def test_model_load_failure_restores_idle_without_continuation(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        controller = MainController.__new__(MainController)
+        controller.view = _View()
+        controller._track_model_enabled = True
+        controller._pose_model_enabled = False
+        controller._track_branch = None
+        controller._pose_branch = None
+        controller._track_model_path = str(Path(__file__).resolve())
+        controller._pose_model_path = str(Path(__file__).resolve())
+        controller._default_bst_model_path = Path(__file__).resolve()
+        controller._bst_device = "cpu"
+        controller._bst_model = None
+        controller._bst_model_checked = False
+        controller._model_load_worker = None
+        controller._model_load_continuation = None
+        idle_states: list[bool] = []
+        controller._set_running_state = lambda: None
+        controller._set_idle_state = lambda: idle_states.append(True)
+        continued: list[bool] = []
+        event_loop = QEventLoop()
+
+        def fail_track_factory(_model_path: str):
+            sleep(0.05)
+            raise RuntimeError("load failed")
+
+        with patch.object(
+            controller_module,
+            "_create_runtime_track_branch",
+            side_effect=fail_track_factory,
+        ):
+            self.assertFalse(controller._ensure_models_ready(lambda: continued.append(True)))
+            worker = controller._model_load_worker
+            self.assertIsNotNone(worker)
+            worker.finished.connect(event_loop.quit)
+            QTimer.singleShot(2000, event_loop.quit)
+            event_loop.exec()
+            app.processEvents()
+
+        self.assertEqual(continued, [])
+        self.assertEqual(idle_states, [True])
+        self.assertIsNone(controller._track_branch)
+        self.assertEqual(controller.view.system_status[0], "error")
+        self.assertTrue(controller.view.status_notices)
+
+    def test_model_load_cancel_prevents_continuation_and_restores_idle(self) -> None:
+        app = QApplication.instance() or QApplication([])
+        controller = MainController.__new__(MainController)
+        controller.view = _View()
+        controller._track_model_enabled = True
+        controller._pose_model_enabled = False
+        controller._track_branch = None
+        controller._pose_branch = None
+        controller._track_model_path = str(Path(__file__).resolve())
+        controller._pose_model_path = str(Path(__file__).resolve())
+        controller._default_bst_model_path = Path(__file__).resolve()
+        controller._bst_device = "cpu"
+        controller._bst_model = None
+        controller._bst_model_checked = False
+        controller._model_load_worker = None
+        controller._model_load_continuation = None
+        controller._set_running_state = lambda: None
+        idle_states: list[bool] = []
+        controller._set_idle_state = lambda: idle_states.append(True)
+        continued: list[bool] = []
+        event_loop = QEventLoop()
+
+        def slow_track_factory(_model_path: str):
+            sleep(0.15)
+            return SimpleNamespace(device="cpu", backend_name="test")
+
+        with patch.object(
+            controller_module,
+            "_create_runtime_track_branch",
+            side_effect=slow_track_factory,
+        ):
+            self.assertFalse(controller._ensure_models_ready(lambda: continued.append(True)))
+            worker = controller._model_load_worker
+            self.assertIsNotNone(worker)
+            worker.finished.connect(event_loop.quit)
+            QTimer.singleShot(10, controller._request_model_load_cancel)
+            QTimer.singleShot(2000, event_loop.quit)
+            event_loop.exec()
+            app.processEvents()
+
+        self.assertEqual(continued, [])
+        self.assertEqual(idle_states, [True])
+        self.assertIsNone(controller._track_branch)
+        self.assertIsNone(controller._model_load_worker)
+        self.assertEqual(controller.view.model_loading_states, [True, False])
+        self.assertEqual(controller.view.system_status[0], "stopped")
+        self.assertTrue(any("已取消本次模型加载" in line for line in controller.view.logs))
+
     def test_court_waiting_state_shows_busy_indicator(self) -> None:
         controller = _bare_controller(_CourtService(None))
         running_states: list[bool] = []
@@ -146,7 +428,7 @@ class AnalysisControllerCourtRuntimeTest(unittest.TestCase):
         self.assertEqual(running_states, [True])
         self.assertEqual(
             controller.view.progress_busy,
-            (True, "正在识别可信球场线..."),
+            (True, "正在识别球场线"),
         )
 
     def test_video_analysis_waits_for_trusted_court_before_starting_playback(self) -> None:
@@ -156,7 +438,7 @@ class AnalysisControllerCourtRuntimeTest(unittest.TestCase):
         controller._selected_video_path = "match.mp4"
         controller._video_meta = {"position_ms": 1250}
         controller._pending_seek_ms = None
-        controller._ensure_models_ready = lambda: True
+        controller._ensure_models_ready = lambda _continuation=None: True
         waiting_states: list[bool] = []
         controller._set_court_waiting_state = lambda: waiting_states.append(True)
         starts: list[dict] = []
@@ -231,7 +513,7 @@ class AnalysisControllerCourtRuntimeTest(unittest.TestCase):
         controller._selected_video_path = "match.mp4"
         controller._video_meta = {"position_ms": 0}
         controller._pending_seek_ms = None
-        controller._ensure_models_ready = lambda: True
+        controller._ensure_models_ready = lambda _continuation=None: True
         waiting_states: list[bool] = []
         controller._set_court_waiting_state = lambda: waiting_states.append(True)
         starts: list[dict] = []
@@ -250,9 +532,18 @@ class AnalysisControllerCourtRuntimeTest(unittest.TestCase):
         controller = _bare_controller(service)
         image = QImage(2, 2, QImage.Format.Format_RGB32)
 
-        controller._on_frame_ready({"image": image, "court": None})
+        controller._on_frame_ready(
+            {
+                "image": image,
+                "court": None,
+                "frame_id": 38,
+                "position_ms": 1250,
+            }
+        )
 
         self.assertIs(controller.view.shown_court, latest)
+        self.assertEqual(controller._video_meta["position_ms"], 1250)
+        self.assertEqual(controller._video_meta["frame_id"], 38)
 
     def test_camera_frame_without_court_payload_reuses_latest_service_prediction(self) -> None:
         latest = {"valid": True, "scheme": "court_pose_white_line", "frame_id": 8}

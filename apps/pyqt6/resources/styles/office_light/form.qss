@@ -1,27 +1,36 @@
-/* ============================================================
- *  FORM  —  QLineEdit / QComboBox / QProgressBar / QTextEdit
- * ============================================================ */
+QFrame#headerFlowSlot {
+    background-color: transparent;
+    border: none;
+    min-height: 36px;
+    max-height: 36px;
+}
 
-/* --- 分析进度状态条 --- */
 QFrame#analysisProgressNotice {
-    background-color: #F3F8F5;
-    border: 1px solid #B7D6C4;
-    border-radius: 4px;
+    background-color: #F1F8F4;
+    border: 1px solid #B9DAC8;
+    border-radius: 6px;
 }
 
 QLabel#analysisProgressDot {
-    background-color: #217346;
+    background-color: #0B8F4D;
     border: none;
     border-radius: 4px;
 }
 
 QLabel#analysisProgressLabel {
-    color: #1F1F1F;
+    color: #20242A;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+QLabel#analysisProgressContext {
+    color: #607068;
+    font-size: 12px;
     font-weight: 500;
 }
 
 QProgressBar#topProgress {
-    background-color: #D5E8DC;
+    background-color: #CAE4D6;
     border: none;
     border-radius: 2px;
     min-height: 4px;
@@ -29,74 +38,70 @@ QProgressBar#topProgress {
 }
 
 QProgressBar#topProgress::chunk {
-    background-color: #217346;
+    background-color: #0B8F4D;
     border-radius: 2px;
 }
 
+QProgressBar#confidenceProgress {
+    background-color: #E7EBEE;
+    border: none;
+    border-radius: 5px;
+}
+
+QProgressBar#confidenceProgress::chunk {
+    background-color: #0B8F4D;
+    border-radius: 5px;
+}
+
 QProgressBar {
-    background-color: #E6E6E6;
-    border: 1px solid #BDBDBD;
-    border-radius: 8px;
+    background-color: #E7EBEE;
+    border: none;
+    border-radius: 5px;
     text-align: center;
-    color: #323130;
+    color: #30363D;
     font-weight: 600;
 }
 
 QProgressBar::chunk {
-    background-color: #217346;
-    border-radius: 7px;
+    background-color: #0B8F4D;
+    border-radius: 5px;
 }
 
-/* --- 文本输入框 --- */
-QLineEdit#videoPathEdit,
+QLineEdit#videoPathEdit {
+    background-color: transparent;
+    border: none;
+    color: #20242A;
+    padding: 6px 8px;
+}
+
 QLineEdit#modelPathEdit,
-QLineEdit#logSearchEdit {
-    background-color: #FFFFFF;
-    border: 1px solid #A19F9D;
-    border-radius: 2px;
-    color: #1F1F1F;
-    padding: 6px 10px;
-}
-
-QLineEdit#videoPathEdit:focus,
-QLineEdit#modelPathEdit:focus,
-QLineEdit#logSearchEdit:focus { border-color: #217346; }
-
+QLineEdit#logSearchEdit,
 QComboBox#cameraDeviceCombo,
 QComboBox#modelPathEdit,
 QComboBox#logFilterCombo {
     background-color: #FFFFFF;
-    border: 1px solid #A19F9D;
-    border-radius: 2px;
-    color: #1F1F1F;
-    padding: 6px 10px;
+    border: 1px solid #B8C0C7;
+    border-radius: 5px;
+    color: #20242A;
+    padding: 6px 9px;
 }
 
+QLineEdit#modelPathEdit:focus,
+QLineEdit#logSearchEdit:focus,
 QComboBox#cameraDeviceCombo:focus,
 QComboBox#modelPathEdit:focus,
-QComboBox#logFilterCombo:focus { border-color: #217346; }
+QComboBox#logFilterCombo:focus {
+    border-color: #0B8F4D;
+}
 
-/* --- 主题切换按钮 --- */
 QToolButton#styleBtn {
-    background-color: #F7F7F7;
-    border: 1px solid #A19F9D;
-    border-radius: 2px;
-    color: #1F1F1F;
+    min-width: 150px;
+    background-color: #FFFFFF;
+    border: 1px solid #B8C0C7;
+    border-radius: 5px;
+    color: #20242A;
     padding: 0px 12px;
-    font-size: 13px;
-    font-weight: 600;
     text-align: left;
-}
-
-QToolButton#styleBtn:hover {
-    background-color: #F3F3F3;
-    border-color: #A19F9D;
-}
-
-QToolButton#styleBtn:pressed,
-QToolButton#styleBtn[popupMode="1"]:pressed {
-    background-color: #E8E8E8;
-    border-color: #A19F9D;
 }
 
 QToolButton#styleBtn::menu-indicator {
@@ -106,33 +111,25 @@ QToolButton#styleBtn::menu-indicator {
 
 QMenu#styleMenu {
     background-color: #FFFFFF;
-    border: 1px solid #A19F9D;
-    border-radius: 2px;
-    padding: 2px;
+    border: 1px solid #B8C0C7;
+    padding: 3px;
 }
 
 QMenu#styleMenu::item {
     padding: 8px 14px;
-    border-radius: 2px;
-    color: #1F1F1F;
-    font-size: 13px;
-}
-
-QMenu#styleMenu::item:hover {
-    background-color: #F3F3F3;
+    color: #20242A;
 }
 
 QMenu#styleMenu::item:selected {
-    background-color: #EAF4EA;
-    color: #217346;
+    background-color: #EAF6EF;
+    color: #087F45;
 }
 
-/* --- 日志控制台 --- */
 QTextEdit#logConsole {
-    background-color: #FFFFFF;
-    color: #323130;
-    border: 1px solid #525252;
-    border-radius: 2px;
-    padding: 8px;
-    font-family: Consolas, Monaco, "Courier New", monospace;
+    background-color: #111820;
+    color: #DCE5EA;
+    border: none;
+    border-radius: 5px;
+    padding: 9px;
+    font-family: Consolas, "Courier New", monospace;
 }

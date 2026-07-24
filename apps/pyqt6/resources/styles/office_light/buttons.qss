@@ -1,133 +1,160 @@
-/* ============================================================
- *  BUTTONS  —  QPushButton 全部变体
- * ============================================================ */
-
-/* --- 默认按钮 --- */
-QPushButton {
-    min-height: 32px;
-    border-radius: 2px;
-    padding: 4px 12px;
+QPushButton,
+QToolButton {
+    min-height: 34px;
+    border-radius: 6px;
+    padding: 3px 14px;
     font-size: 13px;
     font-weight: 600;
-    border: 1px solid #525252;
+    border: 1px solid #C9CFD5;
     background-color: #FFFFFF;
-    color: #217346;
+    color: #30363D;
 }
 
-QPushButton:hover    { background-color: #EAF4EA; border-color: #525252; }
-QPushButton:pressed  { background-color: #DDEEDD; border-color: #525252; }
-QPushButton:disabled { background-color: #F0F0F0; color: #A19F9D; border-color: #525252; }
-
-/* --- 上传按钮（白底） --- */
-QPushButton#btnUpload {
-    background-color: #FFFFFF;
-    color: #217346;
+QPushButton:hover,
+QToolButton:hover {
+    background-color: #F2F5F6;
+    border-color: #9EA7AF;
 }
 
-/* --- 小尺寸按钮组（header 区域） --- */
-QPushButton#btnAnalyze,
-QPushButton#btnReset,
-QPushButton#btnSelectVideo,
-QPushButton#btnForceStop,
-QPushButton#btnFullscreen,
-QPushButton#btnPreviewMode,
-QPushButton#btnCameraMode,
-QPushButton#btnBatchMode,
-QPushButton#btnRefreshCameras {
-    min-height: 20px;
-    padding-top: 4px;
-    padding-bottom: 4px;
+QPushButton:pressed,
+QToolButton:pressed {
+    background-color: #E8ECEF;
+}
+
+QPushButton:disabled,
+QToolButton:disabled {
+    background-color: #F2F4F5;
+    color: #9BA3AA;
+    border-color: #E0E4E7;
+}
+
+QPushButton#btnAnalyze {
+    min-width: 104px;
+    background-color: #0B8F4D;
+    color: #FFFFFF;
+    border-color: #0B8F4D;
+}
+
+QPushButton#btnAnalyze:hover {
+    background-color: #087F45;
+    border-color: #087F45;
+}
+
+QPushButton#btnAnalyze[actionState="running"] {
+    background-color: #E23B43;
+    border-color: #E23B43;
+}
+
+QPushButton#btnAnalyze[actionState="running"]:hover {
+    background-color: #C92F38;
+    border-color: #C92F38;
+}
+
+QPushButton#btnForceStop {
+    min-width: 112px;
+    background-color: #F04444;
+    color: #FFFFFF;
+    border-color: #F04444;
+}
+
+QPushButton#btnForceStop:hover {
+    background-color: #D9363E;
+    border-color: #D9363E;
+}
+
+QPushButton#btnRedetectCourt {
+    min-width: 106px;
+    background-color: #FFFFFF;
+    color: #30363D;
+}
+
+QToolButton#btnSettings {
+    min-width: 40px;
+    max-width: 40px;
+    min-height: 40px;
+    max-height: 40px;
+    padding: 0px;
+    background: transparent;
+    border: none;
+}
+
+QToolButton#btnSettings:hover {
+    background-color: #EEF2F3;
 }
 
 QPushButton#btnPreviewMode,
 QPushButton#btnCameraMode,
 QPushButton#btnBatchMode {
-    min-width: 88px;
-    color: #323130;
-    background-color: #F3F3F3;
-    border-color: #525252;
-    border-bottom: none;
-    border-top-left-radius: 2px;
-    border-top-right-radius: 2px;
-    border-bottom-left-radius: 0px;
-    border-bottom-right-radius: 0px;
-    padding: 8px 16px;
-    font-weight: 500;
+    min-width: 104px;
+    min-height: 36px;
+    border: none;
+    border-radius: 5px 5px 0px 0px;
+    padding: 4px 18px;
+    background: transparent;
+    color: #4D545C;
+    font-size: 14px;
+}
+
+QPushButton#btnPreviewMode:hover,
+QPushButton#btnCameraMode:hover,
+QPushButton#btnBatchMode:hover {
+    background-color: #F0F4F2;
+    color: #17653D;
 }
 
 QPushButton#btnPreviewMode:checked,
 QPushButton#btnCameraMode:checked,
 QPushButton#btnBatchMode:checked {
-    color: #217346;
-    background-color: #FFFFFF;
-    border-color: #525252;
-    border-top: 2px solid #217346;
-    font-weight: 600;
-}
-
-QPushButton#btnPreviewMode:hover:!checked,
-QPushButton#btnCameraMode:hover:!checked,
-QPushButton#btnBatchMode:hover:!checked {
-    color: #1F1F1F;
-    background-color: #F8F8F8;
-}
-
-QPushButton#btnRefreshCameras {
-    min-width: 72px;
-    color: #217346;
-    background-color: #FFFFFF;
-}
-
-/* --- 开始分析（主色调） --- */
-QPushButton#btnAnalyze {
-    min-width: 68px;
-    background-color: #217346;
+    background-color: #0B8F4D;
     color: #FFFFFF;
-    border-color: #217346;
 }
 
-QPushButton#btnAnalyze:hover    { background-color: #1B5E20; border-color: #1B5E20; }
-QPushButton#btnAnalyze:pressed  { background-color: #144A17; border-color: #144A17; }
-QPushButton#btnAnalyze:disabled { background-color: #525252; color: #A19F9D; border-color: #525252; }
-
-/* --- 重置（危险色调） --- */
-QPushButton#btnReset {
-    min-width: 56px;
-    color: #217346;
-    background-color: #FFFFFF;
-    border-color: #525252;
+QPushButton#overlaySegment {
+    min-width: 34px;
+    min-height: 30px;
+    max-height: 30px;
+    padding: 0px 9px;
+    border-radius: 3px;
+    color: #3D444C;
+    font-weight: 500;
 }
 
-QPushButton#btnReset:hover   { background-color: #EAF4EA; border-color: #525252; }
-QPushButton#btnReset:pressed { background-color: #DDEEDD; border-color: #525252; }
+QPushButton#overlaySegment:checked {
+    color: #FFFFFF;
+    background-color: #0B8F4D;
+    border-color: #0B8F4D;
+}
 
-/* --- 选择视频（白底） --- */
 QPushButton#btnSelectVideo {
-    min-width: 60px;
-    background-color: #FFFFFF;
-    color: #217346;
+    min-width: 86px;
+    color: #146B40;
+    border-color: #54A97A;
 }
 
 QPushButton#btnFullscreen {
-    min-width: 72px;
-    color: #217346;
-    background-color: #FFFFFF;
-    border-color: #525252;
+    min-width: 38px;
+    max-width: 38px;
+    min-height: 34px;
+    padding: 0px;
+    border: none;
+    background: transparent;
 }
 
-QPushButton#btnFullscreen:checked {
+QPushButton#btnFullscreen:hover {
+    background-color: #EEF2F3;
+}
+
+QToolButton#btnReplay,
+QToolButton#btnMarkClip {
+    min-height: 30px;
+    max-height: 30px;
+    padding: 0px 10px;
+    font-weight: 500;
+}
+
+QPushButton#btnApplyModelSettings,
+QPushButton#btnApplyReportApiSettings {
+    background-color: #0B8F4D;
     color: #FFFFFF;
-    background-color: #217346;
-    border-color: #217346;
+    border-color: #0B8F4D;
 }
-
-/* --- 强制停止（危险色调） --- */
-QPushButton#btnForceStop {
-    min-width: 76px;
-    color: #217346;
-    background-color: #FFFFFF;
-    border-color: #525252;
-}
-
-QPushButton#btnForceStop:hover   { background-color: #EAF4EA; border-color: #525252; }
-QPushButton#btnForceStop:pressed { background-color: #DDEEDD; border-color: #525252; }

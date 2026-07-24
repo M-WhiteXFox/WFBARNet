@@ -9,9 +9,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from PyQt6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QSize, Qt, QUrl, pyqtProperty, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QLinearGradient, QPainter, QPalette, QPen, QTextCursor
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QIcon, QLinearGradient, QPainter, QPalette, QPen, QPixmap, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QFrame,
     QFileDialog,
     QGridLayout,
@@ -28,6 +29,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QSplitter,
+    QStyle,
     QTextBrowser,
     QTabWidget,
     QTableWidget,
@@ -53,6 +55,31 @@ from apps.pyqt6.views.components.video_player_panel_runtime import (
 )
 from apps.pyqt6.views.heatmap_renderer import HeatmapRenderer, HeatmapRenderConfig
 from src.utils.report_generation import copy_tabler_report_assets
+
+
+def _create_settings_icon() -> QIcon:
+    pixmap = QPixmap(24, 24)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pen = QPen(QColor("#252A31"), 2.0)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    for start, end in (
+        ((12, 1), (12, 5)),
+        ((12, 19), (12, 23)),
+        ((1, 12), (5, 12)),
+        ((19, 12), (23, 12)),
+        ((4, 4), (7, 7)),
+        ((17, 17), (20, 20)),
+        ((4, 20), (7, 17)),
+        ((17, 7), (20, 4)),
+    ):
+        painter.drawLine(start[0], start[1], end[0], end[1])
+    painter.drawEllipse(QRectF(5.5, 5.5, 13.0, 13.0))
+    painter.drawEllipse(QRectF(9.5, 9.5, 5.0, 5.0))
+    painter.end()
+    return QIcon(pixmap)
 
 
 class ToggleSwitch(QCheckBox):
@@ -874,14 +901,16 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("羽毛球动作识别分析平台")
-        self.resize(1360, 860)
+        self.setWindowTitle("WFBARNet - 羽毛球智能分析")
+        self.resize(1540, 940)
         self.setMinimumSize(1024, 680)
         self._video_fullscreen = False
         self._video_fullscreen_previous_state = Qt.WindowState.WindowNoState
-        self._normal_root_margins = (16, 16, 16, 16)
+        self._normal_root_margins = (0, 0, 0, 0)
         self._analytics_opacity_effect: QGraphicsOpacityEffect | None = None
         self._analytics_panel_overlay = False
+        self._current_input_mode = "video"
+        self._primary_action_state = "start"
 
         self.central_widget = QWidget()
         self.central_widget.setObjectName("appRoot")
@@ -889,7 +918,7 @@ class MainWindow(QMainWindow):
 
         self.root_layout = QVBoxLayout(self.central_widget)
         self.root_layout.setContentsMargins(*self._normal_root_margins)
-        self.root_layout.setSpacing(12)
+        self.root_layout.setSpacing(0)
 
         self._build_header()
         self._build_status_banner()
@@ -899,28 +928,83 @@ class MainWindow(QMainWindow):
         self.header_card = QFrame()
         self.header_card.setObjectName("headerCard")
         header_layout = QHBoxLayout(self.header_card)
-        header_layout.setContentsMargins(18, 12, 18, 12)
-        header_layout.setSpacing(16)
+        header_layout.setContentsMargins(24, 12, 20, 12)
+        header_layout.setSpacing(14)
 
-        brand_col = QVBoxLayout()
-        brand_col.setSpacing(4)
+        brand_row = QHBoxLayout()
+        brand_row.setSpacing(18)
 
-        self.title_label = QLabel("WFBARNet 羽毛球分析")
+        self.title_label = QLabel("WFBARNet")
         self.title_label.setObjectName("titleLabel")
+        self.product_label = QLabel("羽毛球智能分析")
+        self.product_label.setObjectName("productLabel")
+        brand_row.addWidget(self.title_label)
+        brand_row.addWidget(self.product_label)
 
-        brand_col.addWidget(self.title_label)
+        self.header_flow_slot = QFrame(self.header_card)
+        self.header_flow_slot.setObjectName("headerFlowSlot")
+        self.header_flow_slot.setMinimumWidth(220)
+        self.header_flow_slot.setMaximumWidth(460)
+        self.header_flow_slot.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        header_flow_layout = QHBoxLayout(self.header_flow_slot)
+        header_flow_layout.setContentsMargins(0, 0, 0, 0)
+        header_flow_layout.setSpacing(0)
 
-        self.status_label = QLabel("系统状态：待机中")
+        self.progress_notice = QFrame(self.header_flow_slot)
+        self.progress_notice.setObjectName("analysisProgressNotice")
+        self.progress_notice.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.progress_notice.setVisible(False)
+        progress_notice_layout = QHBoxLayout(self.progress_notice)
+        progress_notice_layout.setContentsMargins(12, 7, 12, 7)
+        progress_notice_layout.setSpacing(8)
+
+        self.progress_status_dot = QLabel(self.progress_notice)
+        self.progress_status_dot.setObjectName("analysisProgressDot")
+        self.progress_status_dot.setFixedSize(8, 8)
+        self.progress_status_dot.setAccessibleName("分析任务正在进行")
+
+        self.progress_context_label = QLabel("当前流程", self.progress_notice)
+        self.progress_context_label.setObjectName("analysisProgressContext")
+
+        self.progress_label = QLabel("正在准备分析任务", self.progress_notice)
+        self.progress_label.setObjectName("analysisProgressLabel")
+        self.progress_label.setMinimumWidth(0)
+        self.progress_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+
+        self.progress_bar = QProgressBar(self.progress_notice)
+        self.progress_bar.setObjectName("topProgress")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedSize(112, 4)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setAccessibleName("分析任务进度")
+
+        progress_notice_layout.addWidget(self.progress_status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        progress_notice_layout.addWidget(self.progress_context_label, 0)
+        progress_notice_layout.addWidget(self.progress_label, 1)
+        progress_notice_layout.addWidget(self.progress_bar, 0, Qt.AlignmentFlag.AlignVCenter)
+        header_flow_layout.addWidget(self.progress_notice)
+
+        self.status_dot = QLabel()
+        self.status_dot.setObjectName("statusDot")
+        self.status_dot.setProperty("state", "idle")
+        self.status_dot.setFixedSize(9, 9)
+        self.status_dot.setAccessibleName("系统运行状态")
+
+        self.status_label = QLabel("待机中")
         self.status_label.setObjectName("statusLabel")
         self.status_label.setProperty("state", "idle")
         self.status_label.setAccessibleName("系统状态")
-        brand_col.addWidget(self.status_label)
-
-        actions_col = QVBoxLayout()
-        actions_col.setSpacing(8)
-
-        button_row = QHBoxLayout()
-        button_row.setSpacing(8)
+        self.status_label.setMinimumWidth(72)
 
         self.style_label = QLabel("主题")
         self.style_label.setObjectName("styleLabel")
@@ -936,21 +1020,34 @@ class MainWindow(QMainWindow):
         self._style_menu.setObjectName("styleMenu")
         self.style_btn.setMenu(self._style_menu)
 
-        self.btn_analyze = QPushButton("开始分析")
+        self.btn_analyze = QPushButton("开始推理")
         self.btn_analyze.setObjectName("btnAnalyze")
-        self.btn_reset = QPushButton("重置")
+        self.btn_analyze.setProperty("actionState", "start")
+        self.btn_analyze.setAccessibleName("开始推理")
+        self.btn_reset = QPushButton("重置工作区")
         self.btn_reset.setObjectName("btnReset")
 
-        button_row.addWidget(self.style_label)
-        button_row.addWidget(self.style_btn)
-        button_row.addSpacing(4)
-        button_row.addWidget(self.btn_analyze)
-        button_row.addWidget(self.btn_reset)
+        self.btn_settings = QToolButton()
+        self.btn_settings.setObjectName("btnSettings")
+        self.btn_settings.setIcon(_create_settings_icon())
+        self.btn_settings.setIconSize(QSize(22, 22))
+        self.btn_settings.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.btn_settings.setFixedSize(40, 40)
+        self.btn_settings.setToolTip("设置")
+        self.btn_settings.setAccessibleName("打开设置")
+        self.btn_settings.clicked.connect(self._show_settings_tab)
 
-        actions_col.addLayout(button_row)
+        self.header_action_row = QHBoxLayout()
+        self.header_action_row.setSpacing(10)
+        self.header_action_row.addWidget(self.status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.header_action_row.addWidget(self.status_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.header_action_row.addSpacing(10)
+        self.header_action_row.addWidget(self.btn_analyze)
+        self.header_action_row.addWidget(self.btn_settings)
 
-        header_layout.addLayout(brand_col, stretch=1)
-        header_layout.addLayout(actions_col, stretch=0)
+        header_layout.addLayout(brand_row, stretch=0)
+        header_layout.addWidget(self.header_flow_slot, stretch=1)
+        header_layout.addLayout(self.header_action_row, stretch=0)
         self.root_layout.addWidget(self.header_card)
 
     def _build_status_banner(self) -> None:
@@ -991,8 +1088,13 @@ class MainWindow(QMainWindow):
         self.style_btn.setText(f"{active_label}  ▾")
 
     def _build_body(self) -> None:
-        self.body_layout = QHBoxLayout()
+        self._build_mode_navigation()
+
+        self.workspace_band = QFrame()
+        self.workspace_band.setObjectName("workspaceBand")
+        self.body_layout = QHBoxLayout(self.workspace_band)
         body_layout = self.body_layout
+        body_layout.setContentsMargins(20, 0, 20, 18)
         body_layout.setSpacing(0)
 
         self.body_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1002,16 +1104,49 @@ class MainWindow(QMainWindow):
 
         self._build_preview_panel(self.body_splitter)
         self._build_analytics_panel(self.body_splitter)
-        self.body_splitter.setStretchFactor(0, 6)
-        self.body_splitter.setStretchFactor(1, 5)
-        self.body_splitter.setSizes([690, 570])
+        self.body_splitter.setStretchFactor(0, 2)
+        self.body_splitter.setStretchFactor(1, 1)
+        self.body_splitter.setSizes([960, 500])
 
         body_layout.addWidget(self.body_splitter)
-        self.root_layout.addLayout(body_layout, stretch=1)
+        self.root_layout.addWidget(self.workspace_band, stretch=1)
+
+    def _build_mode_navigation(self) -> None:
+        self.navigation_bar = QFrame()
+        self.navigation_bar.setObjectName("modeNavigation")
+        self.preview_mode_bar = self.navigation_bar
+        navigation_layout = QHBoxLayout(self.navigation_bar)
+        navigation_layout.setContentsMargins(20, 10, 20, 0)
+        navigation_layout.setSpacing(8)
+
+        self.btn_preview_mode = QPushButton("视频分析")
+        self.btn_preview_mode.setObjectName("btnPreviewMode")
+        self.btn_preview_mode.setCheckable(True)
+        self.btn_preview_mode.setChecked(True)
+        self.btn_preview_mode.setAccessibleName("切换到视频分析")
+
+        self.btn_camera_mode = QPushButton("实时推理")
+        self.btn_camera_mode.setObjectName("btnCameraMode")
+        self.btn_camera_mode.setCheckable(True)
+        self.btn_camera_mode.setAccessibleName("切换到实时推理")
+
+        self.btn_batch_mode = QPushButton("批量任务")
+        self.btn_batch_mode.setObjectName("btnBatchMode")
+        self.btn_batch_mode.setCheckable(True)
+        self.btn_batch_mode.setAccessibleName("切换到批量任务")
+
+        self.mode_button_group = QButtonGroup(self)
+        self.mode_button_group.setExclusive(True)
+        for button in (self.btn_preview_mode, self.btn_camera_mode, self.btn_batch_mode):
+            self.mode_button_group.addButton(button)
+            navigation_layout.addWidget(button)
+        navigation_layout.addStretch(1)
+        self.root_layout.addWidget(self.navigation_bar)
 
     def _build_preview_panel(self, body_splitter: QSplitter) -> None:
         self.preview_shell = QWidget()
         preview_shell = self.preview_shell
+        preview_shell.setMinimumWidth(600)
         preview_shell.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
@@ -1028,88 +1163,40 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Expanding,
         )
         preview_layout = QVBoxLayout(preview_panel)
-        preview_layout.setContentsMargins(18, 18, 18, 18)
-        preview_layout.setSpacing(14)
-
-        self.preview_mode_bar = QWidget()
-        preview_header = QHBoxLayout(self.preview_mode_bar)
-        preview_header.setContentsMargins(0, 0, 0, 0)
-        preview_header.setSpacing(2)
-
-        self.btn_preview_mode = QPushButton("视频预览")
-        self.btn_preview_mode.setObjectName("btnPreviewMode")
-        self.btn_preview_mode.setCheckable(True)
-        self.btn_preview_mode.setChecked(True)
-
-        self.btn_camera_mode = QPushButton("摄像头实时推理")
-        self.btn_camera_mode.setObjectName("btnCameraMode")
-        self.btn_camera_mode.setCheckable(True)
-
-        self.btn_batch_mode = QPushButton("批量推理")
-        self.btn_batch_mode.setObjectName("btnBatchMode")
-        self.btn_batch_mode.setCheckable(True)
-
-        preview_header.addWidget(self.btn_preview_mode)
-        preview_header.addWidget(self.btn_camera_mode)
-        preview_header.addWidget(self.btn_batch_mode)
-        preview_header.addStretch(1)
-
-        self.progress_notice = QFrame(preview_panel)
-        self.progress_notice.setObjectName("analysisProgressNotice")
-        self.progress_notice.setVisible(False)
-        progress_notice_layout = QHBoxLayout(self.progress_notice)
-        progress_notice_layout.setContentsMargins(14, 8, 14, 8)
-        progress_notice_layout.setSpacing(10)
-
-        self.progress_status_dot = QLabel(self.progress_notice)
-        self.progress_status_dot.setObjectName("analysisProgressDot")
-        self.progress_status_dot.setFixedSize(8, 8)
-        self.progress_status_dot.setAccessibleName("分析任务正在进行")
-
-        self.progress_label = QLabel("正在准备分析任务", self.progress_notice)
-        self.progress_label.setObjectName("analysisProgressLabel")
-        self.progress_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred,
-        )
-
-        self.progress_bar = QProgressBar(self.progress_notice)
-        self.progress_bar.setObjectName("topProgress")
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setFixedSize(132, 4)
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setAccessibleName("分析任务进度")
-
-        progress_notice_layout.addWidget(self.progress_status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
-        progress_notice_layout.addWidget(self.progress_label, 1)
-        progress_notice_layout.addWidget(self.progress_bar, 0, Qt.AlignmentFlag.AlignVCenter)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(0)
 
         self.video_player = VideoPlayerWidget()
         self.video_player.setMinimumHeight(360)
         self.video_player.fullscreenRequested.connect(self.toggle_video_fullscreen)
 
-        court_controls = QFrame()
-        court_controls.setObjectName("courtControlsBar")
-        court_controls_layout = QHBoxLayout(court_controls)
-        court_controls_layout.setContentsMargins(0, 0, 0, 0)
-        court_controls_layout.setSpacing(8)
-        court_controls_layout.addStretch(1)
+        self.video_player.btn_force_stop.setText("停止分析")
+        self.video_player.btn_force_stop.setVisible(False)
+        self.video_player.btn_force_stop.setAccessibleName("停止当前分析")
 
-        self.btn_redetect_court = QPushButton("重新标注球场")
+        self.btn_redetect_court = QPushButton("重新标定")
         self.btn_redetect_court.setObjectName("btnRedetectCourt")
         self.btn_redetect_court.setToolTip("自动标定完成后，可重新点击四角或直接拖动角点进行修正")
         self.btn_redetect_court.setEnabled(False)
         self.btn_redetect_court.clicked.connect(self.manualCourtCalibrationRequested.emit)
-        court_controls_layout.addWidget(self.btn_redetect_court)
+        self.header_action_row.insertWidget(
+            self.header_action_row.count() - 1,
+            self.video_player.btn_force_stop,
+        )
+        self.header_action_row.insertWidget(
+            self.header_action_row.count() - 1,
+            self.btn_redetect_court,
+        )
 
         video_controls = QFrame()
         video_controls.setObjectName("videoControlsBar")
         controls_layout = QHBoxLayout(video_controls)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.setSpacing(8)
+        controls_layout.setContentsMargins(14, 10, 12, 10)
+        controls_layout.setSpacing(9)
         controls_layout.addWidget(self.video_player.btn_select_video)
+        self.video_player.btn_select_video.setFixedWidth(116)
         controls_layout.addWidget(self.video_player.path_edit, stretch=1)
+        self.video_player.path_edit.setMinimumWidth(150)
         self.camera_device_combo = QComboBox()
         self.camera_device_combo.setObjectName("cameraDeviceCombo")
         self.camera_device_combo.setMinimumWidth(220)
@@ -1138,6 +1225,7 @@ class MainWindow(QMainWindow):
         self.btn_export_report = QPushButton("导出报告")
         self.btn_export_report.setObjectName("btnExportReport")
         self.btn_export_report.setEnabled(False)
+        self.btn_export_report.setVisible(False)
         self.btn_export_report.setToolTip("将当前回合数据导出为 HTML 训练报告")
 
         controls_layout.addWidget(self.camera_device_combo)
@@ -1147,8 +1235,39 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.batch_video_combo)
         controls_layout.addWidget(self.btn_export_batch)
         controls_layout.addWidget(self.btn_export_report)
+        controls_layout.addSpacing(4)
+
+        self.overlay_label = QLabel("叠加显示")
+        self.overlay_label.setObjectName("overlayLabel")
+        controls_layout.addWidget(self.overlay_label)
+        self.overlay_button_group = QButtonGroup(self)
+        self.overlay_button_group.setExclusive(True)
+        self.overlay_buttons: dict[str, QPushButton] = {}
+        for mode, label in (
+            ("off", "关"),
+            ("skeleton", "骨架"),
+            ("trajectory", "轨迹"),
+            ("landing", "落点"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("overlaySegment")
+            button.setCheckable(True)
+            button.setProperty("overlayMode", mode)
+            button.setAccessibleName(f"叠加显示：{label}")
+            button.setChecked(mode == "skeleton")
+            button.setFixedWidth(40 if mode == "off" else 52)
+            button.clicked.connect(lambda _checked=False, selected=mode: self._set_overlay_mode(selected))
+            self.overlay_button_group.addButton(button)
+            self.overlay_buttons[mode] = button
+            controls_layout.addWidget(button)
+
+        self.video_player.btn_fullscreen.setText("")
+        self.video_player.btn_fullscreen.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton)
+        )
+        self.video_player.btn_fullscreen.setIconSize(QSize(20, 20))
+        self.video_player.btn_fullscreen.setFixedWidth(38)
         controls_layout.addWidget(self.video_player.btn_fullscreen)
-        controls_layout.addWidget(self.video_player.btn_force_stop)
         self.btn_select_batch_folder.clicked.connect(self.batchFolderBrowseRequested.emit)
         self.batch_video_combo.currentIndexChanged.connect(self._emit_batch_rally_selection)
         self.btn_export_batch.clicked.connect(self.batchExportRequested.emit)
@@ -1162,16 +1281,14 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Fixed,
         )
         timeline_bar_layout = QVBoxLayout(timeline_bar)
+        timeline_bar_layout.setContentsMargins(0, 0, 0, 0)
         timeline_bar_layout.setSpacing(0)
         timeline_bar_layout.addWidget(self.video_timeline)
 
-        preview_layout.addWidget(self.progress_notice, 0)
-        preview_layout.addWidget(court_controls, 0)
         preview_layout.addWidget(video_controls, 0)
         preview_layout.addWidget(self.video_player, 1)
         preview_layout.addWidget(timeline_bar, 0)
 
-        preview_shell_layout.addWidget(self.preview_mode_bar, 0)
         preview_shell_layout.addWidget(preview_panel, stretch=1)
 
         body_splitter.addWidget(preview_shell)
@@ -1180,9 +1297,10 @@ class MainWindow(QMainWindow):
         self.analytics_panel = QFrame()
         analytics_panel = self.analytics_panel
         analytics_panel.setObjectName("analyticsCard")
+        analytics_panel.setMinimumWidth(360)
         analytics_layout = QHBoxLayout(analytics_panel)
         analytics_layout.setContentsMargins(0, 0, 0, 0)
-        analytics_layout.setSpacing(14)
+        analytics_layout.setSpacing(0)
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
@@ -1197,53 +1315,133 @@ class MainWindow(QMainWindow):
         self._build_settings_tab()
         self._build_log_tab()
 
+        settings_index = self.tabs.indexOf(self.settings_container)
+        if settings_index >= 0:
+            self.tabs.tabBar().setTabVisible(settings_index, False)
+
         analytics_layout.addWidget(self.tabs, stretch=1)
         body_splitter.addWidget(analytics_panel)
 
     def _build_overview_tab(self) -> None:
         tab_overview = QWidget()
+        tab_overview.setObjectName("overviewTab")
         overview_layout = QVBoxLayout(tab_overview)
-        overview_layout.setContentsMargins(12, 12, 12, 12)
-        overview_layout.setSpacing(12)
+        overview_layout.setContentsMargins(12, 10, 12, 12)
+        overview_layout.setSpacing(10)
 
-        metrics_grid = QGridLayout()
-        metrics_grid.setHorizontalSpacing(12)
-        metrics_grid.setVerticalSpacing(12)
-        card1, self.lbl_realtime_fps = self._create_metric_card("实时帧数", "0.0 FPS")
-        card2, self.lbl_rally_state = self._create_rally_state_card()
-        card3, self.lbl_valid_pose = self._create_metric_card("推理 FPS", "0.0 FPS")
-        card4, self.lbl_ball_speed = self._create_metric_card("当前球速", "-- km/h")
-        for index, card in enumerate((card1, card2, card3, card4)):
-            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            metrics_grid.addWidget(card, index // 2, index % 2)
-        metrics_grid.setColumnStretch(0, 1)
-        metrics_grid.setColumnStretch(1, 1)
+        self.metrics_strip = QFrame()
+        self.metrics_strip.setObjectName("metricsStrip")
+        metrics_layout = QHBoxLayout(self.metrics_strip)
+        metrics_layout.setContentsMargins(0, 0, 0, 0)
+        metrics_layout.setSpacing(0)
 
-        section_header = QHBoxLayout()
-        section_title = QLabel("动作时序识别结果")
-        section_title.setObjectName("sectionTitle")
-        section_note = QLabel("BST Model 输出")
-        section_note.setObjectName("sectionNote")
-        section_header.addWidget(section_title)
-        section_header.addStretch(1)
-        section_header.addWidget(section_note)
+        metric_specs = (
+            ("视频帧率", "0 FPS", "realtime"),
+            ("推理帧率", "0 FPS", "inference"),
+            ("延迟", "-- ms", "latency"),
+            ("球速", "-- km/h", "speed"),
+        )
+        metric_labels: dict[str, QLabel] = {}
+        for index, (title, value, key) in enumerate(metric_specs):
+            cell, value_label = self._create_metric_cell(title, value)
+            metrics_layout.addWidget(cell, 4 if key == "speed" else 3)
+            metric_labels[key] = value_label
+            if index < len(metric_specs) - 1:
+                separator = QFrame()
+                separator.setObjectName("metricSeparator")
+                separator.setFrameShape(QFrame.Shape.VLine)
+                metrics_layout.addWidget(separator)
+        self.lbl_realtime_fps = metric_labels["realtime"]
+        self.lbl_valid_pose = metric_labels["inference"]
+        self.lbl_latency = metric_labels["latency"]
+        self.lbl_ball_speed = metric_labels["speed"]
+
+        current_title = QLabel("当前动作")
+        current_title.setObjectName("sectionTitle")
+
+        self.current_action_card = QFrame()
+        self.current_action_card.setObjectName("currentActionCard")
+        current_layout = QHBoxLayout(self.current_action_card)
+        current_layout.setContentsMargins(14, 14, 14, 14)
+        current_layout.setSpacing(14)
+
+        self.action_icon_label = QLabel("—")
+        self.action_icon_label.setObjectName("actionIcon")
+        self.action_icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.action_icon_label.setFixedSize(64, 64)
+        self.action_icon_label.setAccessibleName("当前动作图标")
+
+        action_text_layout = QVBoxLayout()
+        action_text_layout.setSpacing(4)
+        self.current_action_label = QLabel("等待识别")
+        self.current_action_label.setObjectName("currentActionName")
+        self.lbl_rally_state = QLabel("未开始")
+        self.lbl_rally_state.setObjectName("rallyStateText")
+        action_text_layout.addWidget(self.current_action_label)
+        action_text_layout.addWidget(self.lbl_rally_state)
+
+        confidence_layout = QVBoxLayout()
+        confidence_layout.setSpacing(7)
+        confidence_header = QHBoxLayout()
+        confidence_title = QLabel("置信度")
+        confidence_title.setObjectName("metricTitle")
+        self.current_action_confidence = QLabel("--")
+        self.current_action_confidence.setObjectName("confidenceValue")
+        confidence_header.addWidget(confidence_title)
+        confidence_header.addStretch(1)
+        confidence_header.addWidget(self.current_action_confidence)
+        self.current_action_progress = QProgressBar()
+        self.current_action_progress.setObjectName("confidenceProgress")
+        self.current_action_progress.setRange(0, 100)
+        self.current_action_progress.setValue(0)
+        self.current_action_progress.setTextVisible(False)
+        self.current_action_progress.setFixedHeight(10)
+        confidence_layout.addLayout(confidence_header)
+        confidence_layout.addWidget(self.current_action_progress)
+
+        current_layout.addWidget(self.action_icon_label)
+        current_layout.addLayout(action_text_layout, 1)
+        current_layout.addLayout(confidence_layout, 1)
+
+        self.diagnostic_card = QFrame()
+        self.diagnostic_card.setObjectName("diagnosticCard")
+        diagnostic_layout = QHBoxLayout(self.diagnostic_card)
+        diagnostic_layout.setContentsMargins(14, 10, 14, 10)
+        diagnostic_layout.setSpacing(10)
+        diagnostic_icon = QLabel("!")
+        diagnostic_icon.setObjectName("diagnosticIcon")
+        diagnostic_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        diagnostic_icon.setFixedSize(30, 30)
+        self.diagnostic_label = QLabel("等待分析结果")
+        self.diagnostic_label.setObjectName("diagnosticText")
+        self.diagnostic_label.setWordWrap(True)
+        diagnostic_layout.addWidget(diagnostic_icon)
+        diagnostic_layout.addWidget(self.diagnostic_label, 1)
+
+        events_title = QLabel("动作事件")
+        events_title.setObjectName("sectionTitle")
 
         self.table_actions = QTableWidget(0, 4)
         self.table_actions.setObjectName("actionTable")
-        self.table_actions.setHorizontalHeaderLabels(["时间段", "动作类别", "置信度", "动作细节"])
+        self.table_actions.setHorizontalHeaderLabels(["时间", "动作", "置信度", "回看"])
         self.table_actions.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.table_actions.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_actions.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table_actions.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table_actions.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table_actions.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.table_actions.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table_actions.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table_actions.setAlternatingRowColors(True)
+        self.table_actions.setAlternatingRowColors(False)
         self.table_actions.verticalHeader().setVisible(False)
-        self.table_actions.setShowGrid(True)
+        self.table_actions.setShowGrid(False)
+        self.table_actions.verticalHeader().setDefaultSectionSize(48)
+        self.table_actions.cellClicked.connect(self._handle_action_table_click)
 
-        overview_layout.addLayout(metrics_grid)
-        overview_layout.addLayout(section_header)
-        overview_layout.addWidget(self.table_actions)
+        overview_layout.addWidget(self.metrics_strip)
+        overview_layout.addWidget(current_title)
+        overview_layout.addWidget(self.current_action_card)
+        overview_layout.addWidget(self.diagnostic_card)
+        overview_layout.addWidget(events_title)
+        overview_layout.addWidget(self.table_actions, 1)
         self.tabs.addTab(tab_overview, "概览")
 
     def _build_data_tab(self) -> None:
@@ -1553,6 +1751,8 @@ class MainWindow(QMainWindow):
         settings_frame_layout.addWidget(api_key_label, 6, 0)
         settings_frame_layout.addWidget(self.report_api_key_edit, 6, 1, 1, 2)
         settings_frame_layout.addWidget(self.btn_toggle_api_key, 6, 3)
+        settings_frame_layout.addWidget(self.style_label, 7, 0)
+        settings_frame_layout.addWidget(self.style_btn, 7, 1, 1, 3, Qt.AlignmentFlag.AlignLeft)
         settings_frame_layout.setColumnStretch(2, 1)
 
         self.pose_model_enabled.stateChanged.connect(self._emit_model_switches_changed)
@@ -1570,6 +1770,7 @@ class MainWindow(QMainWindow):
         self.btn_model_defaults.clicked.connect(self.modelSettingsDefaultsRequested.emit)
         self.btn_apply_model_settings.clicked.connect(self._emit_model_settings_apply)
         self.btn_apply_report_api_settings.clicked.connect(self._emit_report_api_settings_apply)
+        action_row.addWidget(self.btn_reset)
         action_row.addWidget(self.btn_model_defaults)
         action_row.addWidget(self.btn_apply_report_api_settings)
         action_row.addWidget(self.btn_apply_model_settings)
@@ -1582,33 +1783,18 @@ class MainWindow(QMainWindow):
         outer_layout.addWidget(self.settings_subtabs)
         self.tabs.addTab(tab_settings, "设置")
 
-    def _create_metric_card(self, title: str, value: str) -> tuple[QFrame, QLabel]:
+    def _create_metric_cell(self, title: str, value: str) -> tuple[QFrame, QLabel]:
         container = QFrame()
-        container.setObjectName("metricCard")
+        container.setObjectName("metricCell")
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
+        layout.setContentsMargins(6, 12, 6, 12)
+        layout.setSpacing(5)
 
         title_lbl = QLabel(title)
         title_lbl.setObjectName("metricTitle")
         value_lbl = QLabel(value)
         value_lbl.setObjectName("metricValue")
-
-        layout.addWidget(title_lbl)
-        layout.addWidget(value_lbl)
-        return container, value_lbl
-
-    def _create_rally_state_card(self) -> tuple[QFrame, QLabel]:
-        container = QFrame()
-        container.setObjectName("metricCard")
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(6)
-
-        title_lbl = QLabel("回合状态")
-        title_lbl.setObjectName("metricTitle")
-        value_lbl = QLabel("未开始")
-        value_lbl.setObjectName("metricValue")
+        value_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         layout.addWidget(title_lbl)
         layout.addWidget(value_lbl)
@@ -1619,6 +1805,18 @@ class MainWindow(QMainWindow):
         widget.style().polish(widget)
         widget.update()
 
+    def _show_settings_tab(self) -> None:
+        settings_index = self.tabs.indexOf(self.settings_container)
+        if settings_index >= 0:
+            self.tabs.setCurrentIndex(settings_index)
+
+    def _set_overlay_mode(self, mode: str) -> None:
+        selected = mode if mode in self.overlay_buttons else "off"
+        self._overlay_mode = selected
+        self.overlay_buttons[selected].setChecked(True)
+        self.video_player.court_overlay.setVisible(selected != "off")
+        self.video_player.setAccessibleDescription(f"当前叠加显示模式：{self.overlay_buttons[selected].text()}")
+
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Escape and self._video_fullscreen:
             self.set_video_fullscreen(False)
@@ -1628,7 +1826,26 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._update_responsive_layout()
         self._position_fullscreen_analytics_panel()
+
+    def _update_responsive_layout(self) -> None:
+        if not hasattr(self, "video_player"):
+            return
+        narrow = self.width() < 1200
+        self.product_label.setVisible(not narrow)
+        self.progress_bar.setFixedWidth(88 if narrow else 112)
+        is_video = self._current_input_mode == "video"
+        is_batch = self._current_input_mode == "batch"
+        self.video_player.path_edit.setVisible(is_video and not narrow)
+        self.batch_folder_edit.setVisible(is_batch and not narrow)
+        show_overlay = not is_batch and not (narrow and self.btn_export_report.isVisible())
+        self.overlay_label.setVisible(show_overlay and not narrow)
+        for button in self.overlay_buttons.values():
+            button.setVisible(show_overlay)
+        if narrow and is_video:
+            path = self.video_player.current_path()
+            self.video_player.btn_select_video.setToolTip(path or "选择视频文件")
 
     def toggle_video_fullscreen(self) -> None:
         self.set_video_fullscreen(not self._video_fullscreen)
@@ -1648,7 +1865,7 @@ class MainWindow(QMainWindow):
 
         margins = (6, 6, 6, 6) if enabled else self._normal_root_margins
         self.root_layout.setContentsMargins(*margins)
-        self.root_layout.setSpacing(8 if enabled else 12)
+        self.root_layout.setSpacing(8 if enabled else 0)
         self._set_analytics_panel_opacity(0.46 if enabled else 1.0)
         self.video_player.set_fullscreen_mode(enabled)
 
@@ -1673,13 +1890,13 @@ class MainWindow(QMainWindow):
 
     def _dock_analytics_panel(self) -> None:
         if not self._analytics_panel_overlay:
-            self.body_splitter.setStretchFactor(0, 6)
-            self.body_splitter.setStretchFactor(1, 5)
+            self.body_splitter.setStretchFactor(0, 2)
+            self.body_splitter.setStretchFactor(1, 1)
             return
         self.body_splitter.insertWidget(1, self.analytics_panel)
-        self.body_splitter.setStretchFactor(0, 6)
-        self.body_splitter.setStretchFactor(1, 5)
-        self.body_splitter.setSizes([690, 570])
+        self.body_splitter.setStretchFactor(0, 2)
+        self.body_splitter.setStretchFactor(1, 1)
+        self.body_splitter.setSizes([960, 500])
         self.analytics_panel.show()
         self._analytics_panel_overlay = False
 
@@ -1718,8 +1935,10 @@ class MainWindow(QMainWindow):
 
     def set_video_path(self, path: str) -> None:
         self.video_player.set_video_path(path)
+        self._update_responsive_layout()
 
     def set_input_mode(self, mode: str) -> None:
+        self._current_input_mode = mode
         is_camera = mode == "camera"
         is_batch = mode == "batch"
         self.btn_preview_mode.setChecked(not is_camera and not is_batch)
@@ -1733,13 +1952,33 @@ class MainWindow(QMainWindow):
         self.batch_folder_edit.setVisible(is_batch)
         self.batch_video_combo.setVisible(is_batch)
         self.btn_export_batch.setVisible(is_batch)
-        self.btn_export_report.setVisible(True)
+        self.btn_export_report.setVisible(self.btn_export_report.isEnabled())
         self.video_timeline.setVisible(not is_camera and not is_batch)
-        self.btn_analyze.setText("开始推理" if is_camera else "开始分析")
-        if is_batch:
-            self.btn_analyze.setText("开始批量分析")
+        self.set_primary_action_state("start")
         if is_camera:
             self.video_player.path_edit.clear()
+        self._update_responsive_layout()
+
+    def set_primary_action_state(self, state: str) -> None:
+        normalized_state = state if state in {"start", "running", "resume"} else "start"
+        self._primary_action_state = normalized_state
+        if normalized_state == "running":
+            text = "停止"
+            accessible_name = "停止当前推理"
+        elif normalized_state == "resume":
+            text = "继续推理"
+            accessible_name = "继续当前推理"
+        elif self._current_input_mode == "batch":
+            text = "开始批量分析"
+            accessible_name = "开始批量分析"
+        else:
+            text = "开始推理"
+            accessible_name = "开始推理"
+        self.btn_analyze.setText(text)
+        self.btn_analyze.setAccessibleName(accessible_name)
+        self.btn_analyze.setToolTip(accessible_name)
+        self.btn_analyze.setProperty("actionState", normalized_state)
+        self._refresh_widget(self.btn_analyze)
 
     def set_camera_devices(self, devices: list[tuple[int, str]]) -> None:
         self.camera_device_combo.blockSignals(True)
@@ -1782,7 +2021,10 @@ class MainWindow(QMainWindow):
         self.btn_export_batch.setEnabled(bool(enabled))
 
     def set_report_export_enabled(self, enabled: bool) -> None:
-        self.btn_export_report.setEnabled(bool(enabled))
+        is_enabled = bool(enabled)
+        self.btn_export_report.setEnabled(is_enabled)
+        self.btn_export_report.setVisible(is_enabled)
+        self._update_responsive_layout()
 
     def set_report_preview_file(self, path: str | Path) -> None:
         self.report_preview.load_report_file(Path(path))
@@ -1912,6 +2154,7 @@ class MainWindow(QMainWindow):
         player_projections=None,
     ) -> None:
         self.video_player.display_image(image, court=court)
+        self.video_player.sync_audio_position(position_ms)
         self.court_widget.set_ball_projection(ball_projection)
         self.court_widget.set_player_projections(player_projections)
         self.video_timeline.set_duration(duration_ms)
@@ -1919,7 +2162,7 @@ class MainWindow(QMainWindow):
 
     def set_manual_court_capture_enabled(self, enabled: bool) -> None:
         self.video_player.set_point_capture_enabled(enabled)
-        self.btn_redetect_court.setText("取消重新标注" if enabled else "重新标注球场")
+        self.btn_redetect_court.setText("取消标定" if enabled else "重新标定")
 
     def set_court_overlay(self, court: object | None) -> None:
         self.video_player.set_court_overlay(court)
@@ -1940,9 +2183,31 @@ class MainWindow(QMainWindow):
 
     def set_system_status(self, text: str, state: str = "idle") -> None:
         message = str(text).strip() or "系统状态：待机中"
-        self.status_label.setText(message)
+        display_text = message.removeprefix("系统状态：").split("|", 1)[0].strip()
+        self.status_label.setText(display_text or "待机中")
+        self.status_label.setToolTip(message)
         self.status_label.setAccessibleDescription(message)
         self.set_status_state(state)
+        self.status_dot.setProperty("state", state)
+        self._refresh_widget(self.status_dot)
+
+        is_running = state == "loading"
+        self.btn_analyze.setVisible(True)
+        if hasattr(self, "video_player"):
+            self.video_player.btn_force_stop.setVisible(False)
+            status_text = "分析中" if is_running else (display_text or "待机")
+            self.video_player.set_analysis_status(status_text, state)
+
+    def set_runtime_metrics(self, display_fps: float, infer_fps: float) -> None:
+        display_value = max(0.0, float(display_fps))
+        infer_value = max(0.0, float(infer_fps))
+        latency_ms = 1000.0 / infer_value if infer_value > 0.0 else 0.0
+        display_text = f"{display_value:.0f}" if display_value.is_integer() else f"{display_value:.1f}"
+        infer_text = f"{infer_value:.0f}" if infer_value.is_integer() else f"{infer_value:.1f}"
+        self.lbl_realtime_fps.setText(f"{display_text} FPS")
+        self.lbl_valid_pose.setText(f"{infer_text} FPS")
+        self.lbl_latency.setText(f"{latency_ms:.0f} ms" if latency_ms > 0.0 else "-- ms")
+        self.video_player.set_runtime_badges(display_value, latency_ms)
 
     def show_status_notice(self, message: str, state: str = "info") -> None:
         text = str(message).strip()
@@ -2031,9 +2296,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(value)
         visible = 0 < value < 100
         if visible:
-            progress_text = f"正在分析视频（{value}%）"
+            progress_text = f"视频分析 {value}%"
             self.progress_label.setText(progress_text)
-            self.progress_bar.setAccessibleDescription(progress_text)
+            self.progress_bar.setAccessibleDescription(f"当前流程：{progress_text}")
         self.progress_bar.setVisible(visible)
         self.progress_notice.setVisible(visible)
 
@@ -2042,13 +2307,20 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 0)
             progress_text = text.strip() or "正在准备分析任务"
             self.progress_label.setText(progress_text)
-            self.progress_bar.setAccessibleDescription(progress_text)
+            self.progress_bar.setAccessibleDescription(f"当前流程：{progress_text}")
             self.progress_bar.setVisible(True)
             self.progress_notice.setVisible(True)
             return
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setVisible(False)
         self.progress_notice.setVisible(False)
+
+    def set_model_loading_controls(self, loading: bool) -> None:
+        enabled = not bool(loading)
+        self.btn_preview_mode.setEnabled(enabled)
+        self.btn_camera_mode.setEnabled(enabled)
+        self.btn_batch_mode.setEnabled(enabled)
+        self.btn_reset.setEnabled(enabled)
 
     def set_rally_data(self, record: object | None) -> None:
         if not isinstance(record, dict):
@@ -2215,25 +2487,70 @@ class MainWindow(QMainWindow):
         return f"{seconds:.2f}s"
 
     def add_action_row(self, time_range: str, label: str, conf: float, detail: str) -> None:
+        confidence = max(0.0, min(float(conf), 1.0))
+        timestamp_ms = self._event_timestamp_ms(time_range)
         row = 0
         self.table_actions.insertRow(row)
 
         time_item = QTableWidgetItem(time_range)
         time_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        time_item.setData(Qt.ItemDataRole.UserRole, timestamp_ms)
         self.table_actions.setItem(row, 0, time_item)
 
         label_item = QTableWidgetItem(label)
         label_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.table_actions.setItem(row, 1, label_item)
 
-        conf_item = QTableWidgetItem(f"{conf * 100:.1f}%")
+        conf_item = QTableWidgetItem(f"{confidence * 100:.1f}%")
         conf_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self.table_actions.setItem(row, 2, conf_item)
 
-        self.table_actions.setItem(row, 3, QTableWidgetItem(detail))
+        replay_item = QTableWidgetItem("回看")
+        replay_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        replay_item.setToolTip(detail)
+        self.table_actions.setItem(row, 3, replay_item)
         self.table_actions.scrollToTop()
+
+        action_name = str(label).strip() or "未知动作"
+        self.current_action_label.setText(action_name)
+        self.action_icon_label.setText(action_name[:1])
+        self.current_action_confidence.setText(f"{confidence * 100:.0f}%")
+        self.current_action_progress.setValue(round(confidence * 100))
+        if confidence < 0.6:
+            self.diagnostic_label.setText("动作置信度偏低，建议回看确认")
+            self.diagnostic_card.setProperty("state", "warning")
+        else:
+            self.diagnostic_label.setText("动作识别稳定")
+            self.diagnostic_card.setProperty("state", "success")
+        self._refresh_widget(self.diagnostic_card)
+        self.video_timeline.add_event(timestamp_ms, action_name, confidence)
         self.stroke_pie_chart.increment(label)
         self._refresh_stroke_total()
+
+    def _handle_action_table_click(self, row: int, column: int) -> None:
+        if column != 3:
+            return
+        time_item = self.table_actions.item(row, 0)
+        if time_item is None:
+            return
+        timestamp_ms = int(time_item.data(Qt.ItemDataRole.UserRole) or 0)
+        self.video_timeline.request_seek(timestamp_ms)
+
+    @staticmethod
+    def _event_timestamp_ms(time_range: str) -> int:
+        value = str(time_range).split("-", 1)[0].strip()
+        if not value:
+            return 0
+        try:
+            if ":" in value:
+                parts = [float(part) for part in value.split(":")]
+                seconds = 0.0
+                for part in parts:
+                    seconds = seconds * 60.0 + part
+                return max(0, round(seconds * 1000.0))
+            return max(0, round(float(value.rstrip("sS")) * 1000.0))
+        except ValueError:
+            return 0
 
     def reset_analysis(self) -> None:
         self.progress_bar.setValue(0)
@@ -2242,10 +2559,17 @@ class MainWindow(QMainWindow):
         self._refresh_stroke_total()
         self.court_widget.clear_player_heatmap()
         self.set_player_distances(None)
-        self.lbl_realtime_fps.setText("0.0 FPS")
+        self.set_runtime_metrics(0.0, 0.0)
         self.lbl_rally_state.setText("未开始")
-        self.lbl_valid_pose.setText("0.0 FPS")
         self.lbl_ball_speed.setText("-- km/h")
+        self.current_action_label.setText("等待识别")
+        self.action_icon_label.setText("—")
+        self.current_action_confidence.setText("--")
+        self.current_action_progress.setValue(0)
+        self.diagnostic_label.setText("等待分析结果")
+        self.diagnostic_card.setProperty("state", "idle")
+        self._refresh_widget(self.diagnostic_card)
+        self.video_timeline.clear_events()
         self.set_rally_data(None)
         self.report_preview.load_template()
 

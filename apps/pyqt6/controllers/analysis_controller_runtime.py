@@ -9,9 +9,10 @@ import json
 import os
 from pathlib import Path
 import sys
+from threading import Condition, Event
 import traceback
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 import importlib.util
 
 import cv2
@@ -363,6 +364,136 @@ def _is_finite(value: float) -> bool:
     return value == value and value not in (float("inf"), float("-inf"))
 
 
+def _create_runtime_track_branch(model_weight: str) -> TrackBranch:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_path = Path(model_weight)
+    if model_path.suffix.lower() == ".engine":
+        if device != "cuda":
+            raise RuntimeError(
+                "TensorRT INT8 engine 需要 CUDA 版 PyTorch；当前环境未检测到可用 CUDA。"
+            )
+        if importlib.util.find_spec("tensorrt") is None:
+            raise RuntimeError(
+                "TensorRT INT8 engine 需要安装 tensorrt Python 包；当前环境未检测到 tensorrt。"
+            )
+    return TrackBranch(
+        model_weight=str(model_weight),
+        device=device,
+        input_size=(512, 288),
+        score_thr=0.35,
+    )
+
+
+def _create_runtime_pose_branch(model_weight: str) -> PoseBranch:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return PoseBranch(
+        backend="yolo26s-pose",
+        model_weight=str(model_weight),
+        device=device,
+        conf_thr=0.35,
+        max_persons=POSE_CANDIDATE_LIMIT,
+        yolo_imgsz=POSE_YOLO_IMGSZ,
+        yolo_crop_pose=True,
+        yolo_crop_imgsz=POSE_CROP_IMGSZ,
+        yolo_crop_padding=POSE_CROP_PADDING,
+        yolo_crop_min_box_conf=POSE_CROP_MIN_BOX_CONF,
+        yolo_max_pose_crops=POSE_MAX_CROPS,
+        yolo_court_filter=True,
+        yolo_court_required=False,
+        yolo_court_margin=POSE_COURT_MARGIN_CM,
+    )
+
+
+def _create_runtime_bst_model(weight_path: Path, device: str) -> Any:
+    model = build_bst_model(weight_path)
+    model.to(device)
+    model.eval()
+    return model
+
+
+class ModelLoadWorker(QThread):
+    stageChanged = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        track_model_path: str,
+        pose_model_path: str,
+        bst_model_path: Path,
+        bst_device: str,
+        load_track: bool,
+        load_pose: bool,
+        load_bst: bool,
+    ) -> None:
+        super().__init__()
+        self._track_model_path = str(track_model_path)
+        self._pose_model_path = str(pose_model_path)
+        self._bst_model_path = Path(bst_model_path)
+        self._bst_device = str(bst_device)
+        self._load_track = bool(load_track)
+        self._load_pose = bool(load_pose)
+        self._load_bst = bool(load_bst)
+        self._cancel_requested = Event()
+        self.result: dict[str, object] | None = None
+        self.error_message = ""
+        self.was_cancelled = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
+
+    def run(self) -> None:
+        result: dict[str, object] = {"logs": []}
+        try:
+            if self._load_track:
+                self.stageChanged.emit("加载轨迹模型")
+                track_path = Path(self._track_model_path)
+                if not track_path.is_file():
+                    raise FileNotFoundError(f"球轨迹模型文件不存在: {track_path}")
+                result["track_branch"] = _create_runtime_track_branch(str(track_path))
+                if self._stop_if_cancelled():
+                    return
+
+            if self._load_pose:
+                self.stageChanged.emit("加载姿态模型")
+                pose_path = Path(self._pose_model_path)
+                if not pose_path.is_file():
+                    raise FileNotFoundError(f"骨骼模型文件不存在: {pose_path}")
+                result["pose_branch"] = _create_runtime_pose_branch(str(pose_path))
+                if self._stop_if_cancelled():
+                    return
+
+            if self._load_bst:
+                self.stageChanged.emit("加载动作模型")
+                result["bst_checked"] = True
+                logs = result["logs"]
+                if not self._bst_model_path.is_file():
+                    logs.append(f"[BST] weight not found: {self._bst_model_path}")
+                    result["bst_model"] = None
+                else:
+                    try:
+                        result["bst_model"] = _create_runtime_bst_model(
+                            self._bst_model_path,
+                            self._bst_device,
+                        )
+                    except Exception as exc:
+                        logs.append(f"[BST] failed to load stroke model: {exc}")
+                        result["bst_model"] = None
+                if self._stop_if_cancelled():
+                    return
+        except Exception as exc:
+            self.error_message = str(exc)
+            return
+
+        self.result = result
+
+    def _stop_if_cancelled(self) -> bool:
+        if not self._cancel_requested.is_set():
+            return False
+        self.was_cancelled = True
+        self.result = None
+        return True
+
+
 class VideoProbeWorker(QThread):
     finished = pyqtSignal(str, object)
     failed = pyqtSignal(str)
@@ -482,9 +613,61 @@ class TrackNetPlaybackWorker(QThread):
         self._bst_model = bst_model
         self._bst_device = bst_device
         self._stop_requested = False
+        self._pause_requested = False
+        self._pause_condition = Condition()
+        self._pause_started_at: float | None = None
+        self._paused_elapsed_ms = 0.0
 
     def request_stop(self) -> None:
-        self._stop_requested = True
+        with self._pause_condition:
+            self._stop_requested = True
+            self._pause_requested = False
+            self._finish_active_pause_locked()
+            self._pause_condition.notify_all()
+
+    def request_pause(self) -> None:
+        with self._pause_condition:
+            if self._stop_requested or self._pause_requested:
+                return
+            self._pause_requested = True
+            self._pause_started_at = perf_counter()
+
+    def request_resume(self) -> None:
+        with self._pause_condition:
+            if not self._pause_requested:
+                return
+            self._pause_requested = False
+            self._finish_active_pause_locked()
+            self._pause_condition.notify_all()
+
+    def is_pause_requested(self) -> bool:
+        with self._pause_condition:
+            return self._pause_requested
+
+    def _finish_active_pause_locked(self) -> None:
+        if self._pause_started_at is None:
+            return
+        self._paused_elapsed_ms += max(
+            0.0,
+            (perf_counter() - self._pause_started_at) * 1000.0,
+        )
+        self._pause_started_at = None
+
+    def _wait_while_paused(self) -> bool:
+        with self._pause_condition:
+            while self._pause_requested and not self._stop_requested:
+                self._pause_condition.wait(timeout=0.1)
+            return not self._stop_requested
+
+    def _playback_elapsed_ms(self, clock: QElapsedTimer) -> float:
+        with self._pause_condition:
+            paused_elapsed_ms = self._paused_elapsed_ms
+            if self._pause_started_at is not None:
+                paused_elapsed_ms += max(
+                    0.0,
+                    (perf_counter() - self._pause_started_at) * 1000.0,
+                )
+        return max(0.0, float(clock.elapsed()) - paused_elapsed_ms)
 
     def _pipeline_label(self) -> str:
         names = []
@@ -523,7 +706,9 @@ class TrackNetPlaybackWorker(QThread):
 
     def _sleep_until(self, target_ms: int, clock: QElapsedTimer) -> bool:
         while not self._stop_requested:
-            remaining = target_ms - clock.elapsed()
+            if not self._wait_while_paused():
+                return False
+            remaining = target_ms - self._playback_elapsed_ms(clock)
             if remaining <= 0:
                 return True
             if remaining > 8:
@@ -622,6 +807,8 @@ class TrackNetPlaybackWorker(QThread):
         try:
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wfb-playback-infer") as infer_executor:
                 while not self._stop_requested:
+                    if not self._wait_while_paused():
+                        break
                     if draining:
                         lagged_frame = track_postprocessor.flush_one()
                         if lagged_frame is None:
@@ -814,6 +1001,8 @@ class TrackNetPlaybackWorker(QThread):
                     target_ms = max(0, current_ms - base_ms)
                     if not self._sleep_until(target_ms, clock):
                         break
+                    if not self._wait_while_paused():
+                        break
 
                     processed_frames += 1
                     visible_frames += int(bool(track.visible))
@@ -908,7 +1097,7 @@ class TrackNetPlaybackWorker(QThread):
                         next_ms = current_ms + frame_interval_ms
                         final_pass = True
 
-                    lag_ms = clock.elapsed() - max(0, current_ms - base_ms)
+                    lag_ms = self._playback_elapsed_ms(clock) - max(0, current_ms - base_ms)
                     max_lag_ms = frame_interval_ms * PLAYBACK_LAG_TOLERANCE_FRAMES
                     while not final_pass and lag_ms > max_lag_ms:
                         prev_frame = current_frame
@@ -1852,6 +2041,8 @@ class MainController:
         self._camera_worker: CameraInferenceWorker | None = None
         self._batch_worker: BatchInferenceWorker | None = None
         self._report_worker: ReportGenerationWorker | None = None
+        self._model_load_worker: ModelLoadWorker | None = None
+        self._model_load_continuation: Callable[[], None] | None = None
         self._batch_results: dict[str, dict[str, Any]] = {}
         self._batch_order: list[str] = []
         self._current_rally_record: dict[str, Any] | None = None
@@ -1864,6 +2055,7 @@ class MainController:
         self._court_source_key: tuple[str, str] | None = None
         self._pending_seek_ms: int | None = None
         self._pending_video_start_ms: int | None = None
+        self._video_paused = False
         self._last_display_frame_time: float | None = None
         self._last_metrics_update_time: float | None = None
         self._display_fps_ema = 0.0
@@ -2235,114 +2427,135 @@ class MainController:
         self._save_live_rally_record(record, force=True)
         return latest_path, dist_path
 
-    def _build_track_branch(self) -> TrackBranch:
-        branch = self._create_track_branch(self._track_model_path)
-        self.view.append_log(
-            f"[TrackNet] 模型已加载: {branch.device} | 后端 {branch.backend_name} | {Path(self._track_model_path).name}"
-        )
-        return branch
-
-    def _ensure_models_ready(self) -> bool:
+    def _ensure_models_ready(self, continuation: Callable[[], None] | None = None) -> bool:
         if not self._track_model_enabled and not self._pose_model_enabled:
             return True
 
-        self.view.set_progress_busy(True, "正在加载模型")
-        try:
-            if self._track_model_enabled and self._track_branch is None:
-                track_path = self._resolve_model_path(self._track_model_path)
-                if not track_path.is_file():
-                    raise FileNotFoundError(f"球轨迹模型文件不存在: {track_path}")
-                self._track_model_path = str(track_path)
-                self._track_branch = self._build_track_branch()
+        needs_track = self._track_model_enabled and self._track_branch is None
+        needs_pose = self._pose_model_enabled and self._pose_branch is None
+        needs_bst = (
+            self._track_model_enabled
+            and self._pose_model_enabled
+            and self._bst_model is None
+            and not self._bst_model_checked
+        )
+        if not needs_track and not needs_pose and not needs_bst:
+            return True
 
-            if self._pose_model_enabled and self._pose_branch is None:
-                pose_path = self._resolve_model_path(self._pose_model_path)
-                if not pose_path.is_file():
-                    raise FileNotFoundError(f"骨骼模型文件不存在: {pose_path}")
-                self._pose_model_path = str(pose_path)
-                self._pose_branch = self._build_pose_branch()
-
-            if (
-                self._track_model_enabled
-                and self._pose_model_enabled
-                and self._bst_model is None
-                and not self._bst_model_checked
-            ):
-                self._bst_model_checked = True
-                self._bst_model = self._build_bst_model()
-        except Exception as exc:
-            self.view.set_progress_busy(False)
-            message = f"模型加载失败：{exc}"
-            self._set_view_status("error", f"系统状态：{message}")
-            self._show_status_notice(f"{message}。请检查设置中的模型路径后重试。", "error")
-            self.view.append_log(f"[模型] 加载失败: {exc}")
+        if self._model_load_worker is not None:
             return False
 
+        self._track_model_path = str(self._resolve_model_path(self._track_model_path))
+        self._pose_model_path = str(self._resolve_model_path(self._pose_model_path))
+        worker = ModelLoadWorker(
+            track_model_path=self._track_model_path,
+            pose_model_path=self._pose_model_path,
+            bst_model_path=self._default_bst_model_path,
+            bst_device=self._bst_device,
+            load_track=needs_track,
+            load_pose=needs_pose,
+            load_bst=needs_bst,
+        )
+        self._model_load_worker = worker
+        self._model_load_continuation = continuation
+        worker.stageChanged.connect(
+            lambda text, worker=worker: self._on_model_load_stage(worker, text)
+        )
+        worker.finished.connect(
+            lambda worker=worker: self._on_model_load_finished(worker)
+        )
+
+        self._set_running_state()
+        self._set_model_loading_controls(True)
+        self.view.set_progress_busy(True, "准备加载模型")
+        self._set_view_status("loading", "系统状态：正在加载模型")
+        self.view.append_log("[模型] 正在后台加载推理模型...")
+        worker.start()
+        return False
+
+    def _on_model_load_stage(self, worker: ModelLoadWorker, text: str) -> None:
+        if self._model_load_worker is not worker:
+            return
+        stage_text = str(text).strip() or "加载模型"
+        self.view.set_progress_busy(True, stage_text)
+        self._set_view_status("loading", f"系统状态：{stage_text}")
+
+    def _on_model_load_finished(self, worker: ModelLoadWorker) -> None:
+        if self._model_load_worker is not worker:
+            return
+        self._model_load_worker = None
+        continuation = self._model_load_continuation
+        self._model_load_continuation = None
+        self._set_model_loading_controls(False)
         self.view.set_progress_busy(False)
-        return True
 
-    def _create_track_branch(self, model_weight: str) -> TrackBranch:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model_path = Path(model_weight)
-        if model_path.suffix.lower() == ".engine":
-            if device != "cuda":
-                raise RuntimeError(
-                    "TensorRT INT8 engine 需要 CUDA 版 PyTorch；当前环境未检测到可用 CUDA。"
+        if worker.was_cancelled:
+            self._set_idle_state()
+            self._set_view_status("stopped", "系统状态：已取消模型加载")
+            self.view.append_log("[模型] 已取消本次模型加载。")
+            return
+
+        if worker.error_message or worker.result is None:
+            message = f"模型加载失败：{worker.error_message or '未知错误'}"
+            self._set_idle_state()
+            self._set_view_status("error", f"系统状态：{message}")
+            self._show_status_notice(f"{message}。请检查设置中的模型路径后重试。", "error")
+            self.view.append_log(f"[模型] 加载失败: {worker.error_message or '未知错误'}")
+            return
+
+        result = worker.result
+        if "track_branch" in result:
+            self._track_branch = result["track_branch"]
+            self.view.append_log(
+                f"[TrackNet] 模型已加载: {getattr(self._track_branch, 'device', '?')} | "
+                f"后端 {getattr(self._track_branch, 'backend_name', '?')} | "
+                f"{Path(self._track_model_path).name}"
+            )
+        if "pose_branch" in result:
+            self._pose_branch = result["pose_branch"]
+            self.view.append_log(
+                f"[YOLO26s-Pose] 模型已加载: {getattr(self._pose_branch, 'device', '?')} | "
+                f"{Path(self._pose_model_path).name}"
+            )
+        if bool(result.get("bst_checked")):
+            self._bst_model_checked = True
+            self._bst_model = result.get("bst_model")
+            if self._bst_model is not None:
+                self.view.append_log(
+                    f"[BST] stroke model ready | {self._bst_device} | "
+                    f"seq_len {getattr(self._bst_model, 'bst_seq_len', '?')} | "
+                    f"classes {getattr(self._bst_model, 'bst_n_classes', '?')}"
                 )
-            if importlib.util.find_spec("tensorrt") is None:
-                raise RuntimeError(
-                    "TensorRT INT8 engine 需要安装 tensorrt Python 包；当前环境未检测到 tensorrt。"
-                )
-        return TrackBranch(
-            model_weight=str(model_weight),
-            device=device,
-            input_size=(512, 288),
-            score_thr=0.35,
-        )
+        logs = result.get("logs", [])
+        if isinstance(logs, list):
+            for message in logs:
+                self.view.append_log(str(message))
 
-    def _build_pose_branch(self) -> PoseBranch:
-        branch = self._create_pose_branch(self._pose_model_path)
-        self.view.append_log(f"[YOLO26s-Pose] 模型已加载: {branch.device} | {Path(self._pose_model_path).name}")
-        return branch
+        self.view.append_log("[模型] 后台加载完成。")
+        self._set_idle_state()
+        if continuation is not None:
+            continuation()
 
-    def _build_bst_model(self) -> Any | None:
-        if not self._default_bst_model_path.is_file():
-            self.view.append_log(f"[BST] weight not found: {self._default_bst_model_path}")
-            return None
-        try:
-            model = build_bst_model(self._default_bst_model_path)
-            model.to(self._bst_device)
-            model.eval()
-        except Exception as exc:
-            self.view.append_log(f"[BST] failed to load stroke model: {exc}")
-            return None
-        self.view.append_log(
-            f"[BST] stroke model ready | {self._bst_device} | "
-            f"seq_len {getattr(model, 'bst_seq_len', '?')} | classes {getattr(model, 'bst_n_classes', '?')}"
-        )
-        return model
+    def _set_model_loading_controls(self, loading: bool) -> None:
+        setter = getattr(self.view, "set_model_loading_controls", None)
+        if callable(setter):
+            setter(loading)
 
-    def _create_pose_branch(self, model_weight: str) -> PoseBranch:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        return PoseBranch(
-            backend="yolo26s-pose",
-            model_weight=str(model_weight),
-            device=device,
-            conf_thr=0.35,
-            max_persons=POSE_CANDIDATE_LIMIT,
-            yolo_imgsz=POSE_YOLO_IMGSZ,
-            yolo_crop_pose=True,
-            yolo_crop_imgsz=POSE_CROP_IMGSZ,
-            yolo_crop_padding=POSE_CROP_PADDING,
-            yolo_crop_min_box_conf=POSE_CROP_MIN_BOX_CONF,
-            yolo_max_pose_crops=POSE_MAX_CROPS,
-            yolo_court_filter=True,
-            yolo_court_required=False,
-            yolo_court_margin=POSE_COURT_MARGIN_CM,
-        )
+    def _is_model_loading(self) -> bool:
+        return self._model_load_worker is not None
+
+    def _request_model_load_cancel(self) -> None:
+        worker = self._model_load_worker
+        if worker is None:
+            return
+        self._model_load_continuation = None
+        worker.request_cancel()
+        self.view.set_progress_busy(True, "正在取消模型加载")
+        self._set_view_status("loading", "系统状态：正在取消模型加载")
+        self.view.append_log("[模型] 已请求取消，当前模型步骤结束后停止。")
 
     def _bind_events(self) -> None:
-        self.view.btn_analyze.clicked.connect(self.handle_analyze)
+        self.view.btn_analyze.clicked.connect(self.handle_primary_action)
         self.view.btn_reset.clicked.connect(self.handle_reset)
         self.view.btn_preview_mode.clicked.connect(lambda: self.handle_input_mode("video"))
         self.view.btn_camera_mode.clicked.connect(lambda: self.handle_input_mode("camera"))
@@ -2385,6 +2598,24 @@ class MainController:
         if hasattr(self.view, "clear_status_notice"):
             self.view.clear_status_notice()
 
+    def _set_primary_action_state(self, state: str) -> None:
+        setter = getattr(self.view, "set_primary_action_state", None)
+        if callable(setter):
+            setter(state)
+
+    def handle_primary_action(self) -> None:
+        if self._video_paused:
+            self.handle_resume()
+            return
+        if (
+            self._is_model_loading()
+            or self._pending_video_start_ms is not None
+            or self._is_inference_running()
+        ):
+            self.handle_force_stop()
+            return
+        self.handle_analyze()
+
     def _set_idle_state(self) -> None:
         self._analysis_busy = False
         has_video = self._selected_video_path is not None
@@ -2396,6 +2627,7 @@ class MainController:
             can_analyze = has_batch_folder
         else:
             can_analyze = has_video
+        self._set_primary_action_state("start")
         self.view.btn_analyze.setEnabled(can_analyze)
         self.view.btn_reset.setEnabled(True)
         self.view.video_player.btn_select_video.setEnabled(self._input_mode == "video")
@@ -2418,7 +2650,8 @@ class MainController:
     def _set_running_state(self) -> None:
         self._analysis_busy = True
         self._clear_status_notice()
-        self.view.btn_analyze.setEnabled(False)
+        self._set_primary_action_state("running")
+        self.view.btn_analyze.setEnabled(True)
         self.view.btn_reset.setEnabled(True)
         self.view.video_player.btn_select_video.setEnabled(False)
         self.view.btn_refresh_cameras.setEnabled(False)
@@ -2433,6 +2666,14 @@ class MainController:
         self.view.set_model_settings_enabled(False)
         self._set_view_status("loading", "系统状态：正在准备分析...")
 
+    def _set_paused_state(self) -> None:
+        self._analysis_busy = True
+        self.view.set_progress_busy(False)
+        self._set_primary_action_state("resume")
+        self.view.btn_analyze.setEnabled(True)
+        self.view.video_timeline.set_interactive(True)
+        self._set_view_status("stopped", "系统状态：视频已停止")
+
     def _reset_metrics(self) -> None:
         self.view.set_progress_busy(False)
         self.view.reset_analysis()
@@ -2443,7 +2684,7 @@ class MainController:
         self._last_display_frame_time = None
         self._last_metrics_update_time = None
         self._display_fps_ema = 0.0
-        self.view.lbl_realtime_fps.setText("0.0 FPS")
+        self.view.set_runtime_metrics(0.0, 0.0)
 
     def _update_display_fps(self) -> float:
         now = perf_counter()
@@ -2473,6 +2714,9 @@ class MainController:
 
     def handle_input_mode(self, mode: str) -> None:
         if mode not in {"video", "camera", "batch"}:
+            return
+        if self._is_model_loading():
+            self.view.append_log("[模型] 模型加载期间不能切换输入模式，请先停止加载。")
             return
 
         self._stop_workers(clear_pending_seek=True)
@@ -2878,9 +3122,7 @@ class MainController:
 
         self._pending_seek_ms = None
         start_ms = int(self._video_meta.get("position_ms", 0)) if self._video_meta else 0
-        if not self._ensure_models_ready():
-            self._set_idle_state()
-            self._set_view_status("error", "系统状态：模型加载失败，请检查设置")
+        if not self._ensure_models_ready(self.handle_analyze):
             return
 
         latest_court = self._latest_court_prediction_dict()
@@ -2912,7 +3154,7 @@ class MainController:
 
     def _set_court_waiting_state(self) -> None:
         self._set_running_state()
-        self.view.set_progress_busy(True, "正在识别可信球场线...")
+        self.view.set_progress_busy(True, "正在识别球场线")
         self._set_view_status("loading", "系统状态：正在识别可信球场线，视频暂未播放")
 
     def _resume_pending_video_start(self) -> None:
@@ -2944,8 +3186,7 @@ class MainController:
         if not options:
             self.view.append_log("[批量推理] 该文件夹中没有可分析的视频。")
             return
-        if not self._ensure_models_ready():
-            self._set_idle_state()
+        if not self._ensure_models_ready(self._start_batch_inference):
             return
 
         self._stop_workers(clear_pending_seek=True)
@@ -2996,8 +3237,7 @@ class MainController:
         if camera_index is None:
             self.view.append_log("[警告] 请先选择可用摄像头设备。")
             return
-        if not self._ensure_models_ready():
-            self._set_idle_state()
+        if not self._ensure_models_ready(self._start_camera_inference):
             return
 
         self._activate_court_source(("camera", str(camera_index)))
@@ -3046,8 +3286,11 @@ class MainController:
     def _start_playback(self, *, start_ms: int = 0, request_court_prediction: bool = True) -> None:
         if self._selected_video_path is None:
             return
-        if not self._ensure_models_ready():
-            self._set_idle_state()
+        continuation = lambda: self._start_playback(
+            start_ms=start_ms,
+            request_court_prediction=request_court_prediction,
+        )
+        if not self._ensure_models_ready(continuation):
             return
 
         self._stop_workers(clear_pending_seek=False)
@@ -3058,7 +3301,6 @@ class MainController:
             self._reset_court_detection(request_initial_prediction=True)
         self._set_current_rally_record(None)
         self._set_running_state()
-        self.view.video_player.play()
         debug_csv_path = self._make_track_debug_csv_path(Path(self._selected_video_path).stem)
         frame_log_path = self._make_frame_log_jsonl_path(debug_csv_path)
         self.view.append_log(
@@ -3091,11 +3333,15 @@ class MainController:
         self._playback_worker.finished.connect(
             lambda worker=self._playback_worker: self._release_playback_worker(worker)
         )
+        self.view.video_player.play(start_ms=start_ms)
         self._playback_worker.start()
 
     def _on_frame_ready(self, payload: object) -> None:
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or self._video_paused:
             return
+
+        self._video_meta["position_ms"] = max(0, int(payload.get("position_ms", 0)))
+        self._video_meta["frame_id"] = max(0, int(payload.get("frame_id", 0)))
 
         image = payload.get("image")
         court_prediction = self._court_prediction_for_display(payload.get("court"))
@@ -3133,8 +3379,7 @@ class MainController:
         if isinstance(court, dict) and court.get("valid"):
             court_text = f" | Court {float(court.get('confidence', 0.0)):.2f}"
 
-        self.view.lbl_valid_pose.setText(f"{infer_fps:.1f} FPS")
-        self.view.lbl_realtime_fps.setText(f"{self._display_fps_ema:.1f} FPS")
+        self.view.set_runtime_metrics(self._display_fps_ema, infer_fps)
         self._set_view_status(
             "loading",
             f"系统状态：视频分析中 | 人数 {person_count} | 球轨迹置信度 {current_score:.2f}{court_text}",
@@ -3172,8 +3417,7 @@ class MainController:
         if isinstance(court, dict) and court.get("valid"):
             court_text = f" | Court {float(court.get('confidence', 0.0)):.2f}"
 
-        self.view.lbl_valid_pose.setText(f"{infer_fps:.1f} FPS")
-        self.view.lbl_realtime_fps.setText(f"{self._display_fps_ema:.1f} FPS")
+        self.view.set_runtime_metrics(self._display_fps_ema, infer_fps)
         self._set_view_status(
             "loading",
             f"系统状态：摄像头分析中 | 人数 {person_count} | 球轨迹置信度 {current_score:.2f}{court_text}",
@@ -3422,6 +3666,7 @@ class MainController:
 
     def _on_playback_finished(self, payload: object) -> None:
         self.view.set_progress_busy(False)
+        self._video_paused = False
         stopped = bool(payload.get("stopped")) if isinstance(payload, dict) else False
 
         if stopped:
@@ -3432,6 +3677,7 @@ class MainController:
         else:
             self.view.video_player.stop()
             self.view.update_progress(100)
+            self._video_meta["position_ms"] = 0
             final_state = "success"
             final_text = "系统状态：视频分析完成，可查看数据与报告"
             if isinstance(payload, dict):
@@ -3465,6 +3711,8 @@ class MainController:
 
     def _on_playback_failed(self, message: str) -> None:
         self.view.set_progress_busy(False)
+        self._video_paused = False
+        self._video_meta["position_ms"] = 0
         self.view.video_player.stop()
         self.view.append_log(f"[错误] {message}")
         self._set_idle_state()
@@ -3479,6 +3727,10 @@ class MainController:
         if self._playback_worker is not None and self._playback_worker.isRunning():
             self._auto_report_after_stop = False
             self._pending_seek_ms = position_ms
+            self._video_paused = False
+            self._set_primary_action_state("running")
+            self.view.btn_analyze.setEnabled(False)
+            self.view.video_player.pause()
             self._playback_worker.request_stop()
             self.view.append_log(f"[信息] 正在跳转至 {position_ms / 1000:.2f}s")
             return
@@ -3486,7 +3738,30 @@ class MainController:
         self.view.append_log(f"[信息] 预览跳转至 {position_ms / 1000:.2f}s")
         self._start_probe(self._selected_video_path, position_ms)
 
+    def handle_resume(self) -> None:
+        worker = self._playback_worker
+        if worker is None or not worker.isRunning():
+            self._video_paused = False
+            self._set_idle_state()
+            self.handle_analyze()
+            return
+
+        self._video_paused = False
+        self._set_running_state()
+        position_ms = max(0, int(self._video_meta.get("position_ms", 0)))
+        duration_ms = max(0, int(self._video_meta.get("duration_ms", 0)))
+        if duration_ms > 0:
+            self.view.update_progress(min(100, int(position_ms * 100 / duration_ms)))
+        self.view.video_player.play()
+        worker.request_resume()
+        self._set_view_status("loading", "系统状态：视频分析中")
+        self.view.append_log(f"[TrackNet] 从 {position_ms / 1000:.2f}s 继续推理。")
+
     def handle_force_stop(self) -> None:
+        if self._is_model_loading():
+            self._request_model_load_cancel()
+            return
+
         if self._pending_video_start_ms is not None:
             self._cancel_pending_video_start("[Court] 已取消等待球场标定，视频未开始播放。")
             self.view.video_player.stop()
@@ -3499,9 +3774,16 @@ class MainController:
             return
 
         if self._playback_worker is not None and self._playback_worker.isRunning():
-            self._auto_report_after_stop = True
-            self.view.append_log("[信息] 正在停止 TrackNetV3 播放...")
-            self._playback_worker.request_stop()
+            if self._video_paused:
+                return
+            self._auto_report_after_stop = False
+            self._video_paused = True
+            self._playback_worker.request_pause()
+            self.view.video_player.pause()
+            self.view.set_video_state("stopped")
+            self._set_paused_state()
+            position_ms = max(0, int(self._video_meta.get("position_ms", 0)))
+            self.view.append_log(f"[TrackNet] 已在 {position_ms / 1000:.2f}s 停止，可继续推理。")
             return
 
         if self._batch_worker is not None and self._batch_worker.isRunning():
@@ -3515,6 +3797,9 @@ class MainController:
         self.view.append_log("[信息] 没有正在进行的播放任务。")
 
     def handle_reset(self) -> None:
+        if self._is_model_loading():
+            self._request_model_load_cancel()
+            return
         self._stop_workers(clear_pending_seek=True)
         self._reset_court_detection()
         self._selected_video_path = None
@@ -3539,6 +3824,10 @@ class MainController:
         self.view.append_log("[系统] 工作区已重置。")
 
     def _stop_workers(self, *, clear_pending_seek: bool) -> None:
+        self._video_paused = False
+        stop_audio = getattr(self.view.video_player, "stop_audio", None)
+        if callable(stop_audio):
+            stop_audio()
         if clear_pending_seek:
             self._pending_seek_ms = None
             self._pending_video_start_ms = None
@@ -3582,7 +3871,17 @@ class MainController:
         self.view.set_progress_busy(False)
 
     def shutdown(self) -> None:
+        model_worker = self._model_load_worker
+        self._model_load_continuation = None
+        if model_worker is not None:
+            model_worker.request_cancel()
+            if model_worker.isRunning():
+                model_worker.wait()
+            self._model_load_worker = None
         self._stop_workers(clear_pending_seek=True)
+        release_audio = getattr(self.view.video_player, "release_audio", None)
+        if callable(release_audio):
+            release_audio()
         if self._court_service is not None:
             self._court_service.stop()
 

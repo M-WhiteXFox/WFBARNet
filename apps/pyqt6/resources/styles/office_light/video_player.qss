@@ -1,67 +1,64 @@
-/* ============================================================
- *  VIDEO PLAYER  —  视频播放器组件专属样式
- * ============================================================ */
-
-/* --- 占位符 --- */
 QLabel#videoLabel {
-    background-color: #F8F8F8;
-    border: 1px dashed #525252;
-    border-radius: 2px;
-    color: #605E5C;
-    font-size: 15px;
-}
-
-QLabel#videoLabel[state="loaded"] {
-    border: 1px solid #8CCB8C;
-    color: #107C41;
-    background-color: #EAF4EA;
+    background-color: #07100E;
+    border: none;
+    border-radius: 0px;
+    color: #AEBAB6;
+    font-size: 14px;
 }
 
 QLabel#videoPlaceholderTitle {
-    color: #323130;
-    font-size: 18px;
-    font-weight: 600;
+    color: #FFFFFF;
+    font-size: 20px;
+    font-weight: 650;
 }
 
 QLabel#videoPlaceholderHint {
-    color: #605E5C;
+    color: #AEBAB6;
 }
 
-/* --- 时间标签 --- */
+QFrame#videoPlaceholderFrame {
+    background-color: #0D1916;
+    border: none;
+}
+
 QLabel#timeLabel {
-    padding-left: 8px;
-    color: #605E5C;
-    min-width: 108px;
+    color: #30363D;
+    min-width: 112px;
+    font-size: 12px;
+    font-weight: 550;
 }
 
-/* --- 时间轴滑块 --- */
 QSlider#videoTimeline {
-    min-height: 20px;
+    min-height: 22px;
 }
 
 QSlider#videoTimeline::groove:horizontal {
     height: 4px;
-    background: #525252;
+    background: #D8DEE2;
     border: none;
     border-radius: 2px;
 }
 
 QSlider#videoTimeline::sub-page:horizontal {
-    background: #217346;
+    background: #0B8F4D;
     border-radius: 2px;
 }
 
 QSlider#videoTimeline::add-page:horizontal {
-    background: #525252;
+    background: #D8DEE2;
     border-radius: 2px;
 }
 
 QSlider#videoTimeline::handle:horizontal {
-    width: 12px;
-    margin: -4px 0;
-    background: #217346;
-    border-radius: 6px;
+    width: 14px;
+    height: 14px;
+    margin: -5px 0px;
+    background: #0B8F4D;
+    border: 2px solid #FFFFFF;
+    border-radius: 7px;
 }
 
-QSlider#videoTimeline::handle:horizontal:hover   { background: #1B5E20; }
-QSlider#videoTimeline::handle:horizontal:pressed { background: #144A17; }
+QWidget#eventTimelineRail {
+    background-color: #FFFFFF;
+    border: none;
+}

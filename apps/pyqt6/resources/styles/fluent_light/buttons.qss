@@ -88,6 +88,14 @@ QPushButton#btnAnalyze {
 
 QPushButton#btnAnalyze:hover    { background-color: #005A9E; border-color: #005A9E; }
 QPushButton#btnAnalyze:disabled { background-color: #E2E8F0; color: #94A3B8; border-color: #E2E8F0; }
+QPushButton#btnAnalyze[actionState="running"] {
+    background-color: #D13438;
+    border-color: #D13438;
+}
+QPushButton#btnAnalyze[actionState="running"]:hover {
+    background-color: #B62D31;
+    border-color: #B62D31;
+}
 
 /* --- 重置（危险色调） --- */
 QPushButton#btnReset {
